@@ -6,7 +6,9 @@ import Navbar from "../components/Navbar";
 import RecordButton from "../components/RecordButton";
 import SessionTimer from "../components/SessionTimer";
 import TopicDrum from "../components/TopicDrum";
+import SensorSidebar from "../components/SensorSidebar";
 import { useSpeechRecognition, type StyledSegment } from "../hooks/useSpeechRecognition";
+import { useLiveSensor } from "../hooks/useLiveSensor";
 import { useAuth } from "../context/AuthContext";
 
 /** Simulated SLP report — in production Speechmatics + AI */
@@ -141,6 +143,8 @@ export default function Session() {
     error: speechError,
   } = useSpeechRecognition();
 
+  const sensor = useLiveSensor();
+
   const promptText = prompt || "Describe your ideal day.";
 
   const handleRecordingStart = useCallback(() => {
@@ -149,21 +153,24 @@ export default function Session() {
     setReport(null);
     resetTranscript();
     startListening();
-  }, [startListening, resetTranscript]);
+    sensor.start();
+  }, [startListening, resetTranscript, sensor]);
 
   const handleRecordingStop = useCallback(() => {
     setIsRecording(false);
     stopListening();
-  }, [stopListening]);
+    sensor.stop();
+  }, [stopListening, sensor]);
 
   const handleTimerComplete = useCallback(() => {
     setIsRecording(false);
     setIsComplete(true);
     stopListening();
+    sensor.stop();
     const mockReport = generateMockReport(promptText, words, disfluencyLog);
     setReport(mockReport);
     saveSessionData(mockReport.overallClarity);
-  }, [promptText, words, disfluencyLog, stopListening, saveSessionData]);
+  }, [promptText, words, disfluencyLog, stopListening, saveSessionData, sensor]);
 
   const handleTopicSelect = useCallback((topic: string) => {
     setPrompt(topic);
@@ -176,11 +183,14 @@ export default function Session() {
       <div className="relative z-10">
         <Navbar />
 
+        {/* ── Sensor Sidebar ──────────────────────────────────────────────── */}
+        <SensorSidebar sensor={sensor} isRecording={isRecording} />
+
         <main className="pt-24 pb-16 px-4 max-w-3xl mx-auto">
           {/* Back */}
           <button
             onClick={() => navigate("/dashboard")}
-            className="flex items-center gap-1.5 text-sm text-soft-gray hover:text-white transition-colors mb-6"
+            className="flex items-center gap-1.5 text-sm text-soft-gray hover:text-white transition-colors mb-6 cursor-pointer"
           >
             <ArrowLeft className="w-4 h-4" />
             Back to Dashboard
@@ -211,7 +221,7 @@ export default function Session() {
                   {!isRecording && !isComplete && (
                     <button
                       onClick={() => setShowTopicPicker(true)}
-                      className="shrink-0 text-[10px] px-2.5 py-1.5 glass rounded-full text-soft-gray hover:text-white transition-colors"
+                      className="shrink-0 text-[10px] px-2.5 py-1.5 glass rounded-full text-soft-gray hover:text-white transition-colors cursor-pointer"
                     >
                       Change
                     </button>
@@ -312,7 +322,7 @@ export default function Session() {
                     {isRecording && (
                       <button
                         onClick={handleRecordingStop}
-                        className="flex items-center gap-1.5 text-xs text-red-400/60 hover:text-red-400 transition-colors"
+                        className="flex items-center gap-1.5 text-xs text-red-400/60 hover:text-red-400 transition-colors cursor-pointer"
                       >
                         <StopCircle className="w-3.5 h-3.5" />
                         Stop early

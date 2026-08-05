@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider } from "./context/AuthContext";
 import Welcome from "./pages/Welcome";
 import Dashboard from "./pages/Dashboard";
+import Session from "./pages/Session";
 import RecordingSession from "./pages/RecordingSession";
 import SessionScript from "./pages/SessionScript";
 import SessionDebate from "./pages/SessionDebate";
