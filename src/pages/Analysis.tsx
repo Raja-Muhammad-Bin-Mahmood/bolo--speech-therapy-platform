@@ -9,8 +9,11 @@ import {
   Lightbulb,
   RotateCcw,
   Gauge,
+  Radio,
+  Activity,
 } from "lucide-react";
 import Navbar from "../components/Navbar";
+import type { SensorSession } from "../lib/sensorTypes";
 
 // ─── Stat Card ──────────────────────────────────────────────────────────
 
@@ -142,6 +145,26 @@ export default function Analysis() {
 
   const overallScore = data?.overallScore ?? Math.round((clarityScore + fluencyScore) / 2);
 
+  // ── Sensor session data (Phase 1 — raw physics layer) ────────────
+  const sensorSession: SensorSession | null = data?.sensorSession ?? null;
+  const sensorFrameCount = sensorSession?.frames.length ?? 0;
+  const sensorDuration = sensorSession?.totalDuration ?? 0;
+  const isSensorOnly = sensorFrameCount > 0;
+
+  // Compute summary stats from sensor frames
+  const sensorStats = isSensorOnly && sensorSession
+    ? (() => {
+        const frames = sensorSession.frames;
+        const avgRms = frames.reduce((s, f) => s + f.rms, 0) / frames.length;
+        const avgZcr = frames.reduce((s, f) => s + f.zcr, 0) / frames.length;
+        const peakRms = Math.max(...frames.map((f) => f.rms));
+        const peakDeltaEnergy = Math.max(
+          ...frames.map((f) => Math.abs(f.deltaEnergy))
+        );
+        return { avgRms, avgZcr, peakRms, peakDeltaEnergy };
+      })()
+    : null;
+
   // ── Phase 5 new metrics ─────────────────────────────────────────
   const stutters = data?.stutters ?? 0;
   const stammers = data?.stammers ?? 0;
@@ -263,7 +286,83 @@ export default function Analysis() {
           <p className="text-sm text-soft-gray/60">Topic: {topic}</p>
         </motion.div>
 
-        {/* Score Rings */}
+        {/* ── Sensor Data Section (Phase 1) ───────────────────── */}
+        {isSensorOnly && sensorStats && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.05 }}
+            className="glass rounded-2xl p-5 mb-8 border border-neon-purple/20"
+          >
+            <div className="flex items-center gap-2 mb-4">
+              <Radio className="w-4 h-4 text-neon-purple" />
+              <h3 className="font-heading text-sm font-semibold text-white">
+                Raw Sensor Data
+              </h3>
+              <span className="ml-auto text-[10px] text-soft-gray/50 font-mono">
+                {sensorFrameCount.toLocaleString()} frames
+              </span>
+            </div>
+
+            {/* Summary stats */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+              <div className="bg-white/5 rounded-xl p-3 text-center">
+                <p className="text-lg font-bold font-mono text-emerald-300">
+                  {sensorStats.avgRms.toFixed(4)}
+                </p>
+                <p className="text-[9px] text-soft-gray/50 mt-0.5 uppercase tracking-wide">
+                  Avg RMS
+                </p>
+              </div>
+              <div className="bg-white/5 rounded-xl p-3 text-center">
+                <p className="text-lg font-bold font-mono text-blue-300">
+                  {sensorStats.avgZcr.toFixed(4)}
+                </p>
+                <p className="text-[9px] text-soft-gray/50 mt-0.5 uppercase tracking-wide">
+                  Avg ZCR
+                </p>
+              </div>
+              <div className="bg-white/5 rounded-xl p-3 text-center">
+                <p className="text-lg font-bold font-mono text-red-300">
+                  {sensorStats.peakRms.toFixed(4)}
+                </p>
+                <p className="text-[9px] text-soft-gray/50 mt-0.5 uppercase tracking-wide">
+                  Peak RMS
+                </p>
+              </div>
+              <div className="bg-white/5 rounded-xl p-3 text-center">
+                <p className="text-lg font-bold font-mono text-amber-300">
+                  {sensorStats.peakDeltaEnergy.toFixed(4)}
+                </p>
+                <p className="text-[9px] text-soft-gray/50 mt-0.5 uppercase tracking-wide">
+                  Peak Δ Energy
+                </p>
+              </div>
+            </div>
+
+            {/* Duration */}
+            <div className="flex items-center gap-4 text-[10px] text-soft-gray/60">
+              <span className="flex items-center gap-1">
+                <Activity className="w-3 h-3" />
+                Duration: {sensorDuration.toFixed(1)}s
+              </span>
+              <span className="w-px h-3 bg-white/10" />
+              <span>Frame rate: ~{(sensorFrameCount / Math.max(1, sensorDuration)).toFixed(0)} fps</span>
+              <span className="w-px h-3 bg-white/10" />
+              <span>Session: {sensorSession?.sessionId ?? "—"}</span>
+            </div>
+
+            {/* Note for Prompt 2 */}
+            <div className="mt-4 pt-3 border-t border-white/5">
+              <p className="text-[10px] text-soft-gray/40 italic">
+                Sensor buffer ready for Prompt 2 analysis pipeline.
+                Contains {sensorFrameCount.toLocaleString()} ordered frames
+                from {sensorSession?.frames[0]?.timestamp.toFixed(1) ?? "0"}s
+                to {sensorDuration.toFixed(1)}s.
+              </p>
+            </div>
+          </motion.div>
+        )}
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
