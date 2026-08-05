@@ -1,5 +1,5 @@
 import { memo } from "react";
-import type { StutterEvent, StutterEventType } from "../lib/stutterTypes";
+import type { StutterEvent } from "../lib/stutterTypes";
 import { STUTTER_COLORS, STUTTER_LABELS } from "../lib/stutterTypes";
 
 interface StutterBadgeProps {

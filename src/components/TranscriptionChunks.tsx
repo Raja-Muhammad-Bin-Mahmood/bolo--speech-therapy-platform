@@ -1,11 +1,8 @@
-import { useRef, useEffect, useMemo } from "react";
+import { useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { TranscriptChunk } from "../hooks/useSpeechmaticsWS";
 import type { DisfluencyTag } from "../hooks/useSessionAnalysis";
 import type { PauseEvent } from "../lib/pauseDetector";
-import type { StutterEvent } from "../lib/stutterTypes";
-import { STUTTER_COLORS } from "../lib/stutterTypes";
-import { StutterBadge } from "./StutterBadge";
 
 interface TranscriptionChunksProps {
   transcripts: TranscriptChunk[];
@@ -13,8 +10,6 @@ interface TranscriptionChunksProps {
   wordTags?: Map<string, DisfluencyTag>;
   /** Pause events to render as inline badges (sorted by startTime) */
   pauseEvents?: PauseEvent[];
-  /** Stutter events for highlights and badges (from AudioWorklet DSP lane) */
-  stutterEvents?: StutterEvent[];
   /** Safety-net max words per line */
   maxWordsPerLine?: number;
 }
@@ -31,37 +26,16 @@ export default function TranscriptionChunks({
   transcripts,
   wordTags,
   pauseEvents = [],
-  stutterEvents = [],
   maxWordsPerLine = 16,
 }: TranscriptionChunksProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const prevLengthRef = useRef(0);
 
-  // Lookup wordKey → stutter event for fast word coloring
-  const stutterLookup = useMemo(() => {
-    const map = new Map<string, StutterEvent>();
-    for (const evt of stutterEvents) {
-      if (!evt.shouldHighlight) continue;
-      // Key by the matched word's time window (matchedWord text as fallback)
-      const k = `${Math.round(evt.startTime * 1000)}-${Math.round(evt.endTime * 1000)}`;
-      map.set(k, evt);
-    }
-    return map;
-  }, [stutterEvents]);
-
-  // Events with no matched word yet → rendered as inline badges
-  const unmatchedStutter = useMemo(
-    () => stutterEvents.filter((e) => e.shouldHighlight && !e.matchedWord),
-    [stutterEvents]
-  );
-
   const lines = buildLines(
     transcripts,
     wordTags,
     pauseEvents,
-    maxWordsPerLine,
-    stutterLookup,
-    unmatchedStutter
+    maxWordsPerLine
   );
 
   // Auto-scroll to latest
@@ -122,7 +96,6 @@ interface LineWord {
   isFinal: boolean;
   tag: DisfluencyTag | null;
   startTime: number; // seconds — for pause badge placement
-  stutterEvent?: StutterEvent;
 }
 
 const TAG_STYLES: Record<DisfluencyTag, string> = {
