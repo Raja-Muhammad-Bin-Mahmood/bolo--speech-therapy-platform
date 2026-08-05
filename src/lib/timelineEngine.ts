@@ -75,28 +75,6 @@ export type PatternEventType =
   | "hesitation_sequence"
   | "possible_false_start";
 
-// ─── In-progress event candidates ───────────────────────────────────
-
-interface PatternRun {
-  /** Pattern type being tracked */
-  type: PatternEventType;
-  /** Timestamp of the first evidence */
-  startT: number;
-  /** Timestamp of the latest evidence */
-  lastT: number;
-  /** Accumulated evidence items */
-  evidence: EvidenceItem[];
-  /** Whether this run was already emitted (de-dupe) */
-  emitted: boolean;
-}
-
-interface EvidenceItem {
-  type: string;
-  timestamp: number;
-  weight: number;
-  description: string;
-}
-
 // ─── Timeline Engine ────────────────────────────────────────────────
 
 export class TimelineEngine {
@@ -109,16 +87,8 @@ export class TimelineEngine {
   /** Listeners for live updates */
   private _listeners = new Set<(events: StutterCandidate[]) => void>();
 
-  /** Active pattern runs being tracked */
-  private _runs: PatternRun[] = [];
-
   /** De-dupe: last event emit times per type */
   private _lastEmit: Record<string, number> = {};
-
-  /** Activity state */
-  private _inSpeechBurst = false;
-  private _lastSpeechEndT = 0;
-  private _speechStartT = 0;
 
   // ── Feed frames from the worklet ──────────────────────────────────
 
@@ -169,11 +139,7 @@ export class TimelineEngine {
   reset(): void {
     this._frames = [];
     this._events = [];
-    this._runs = [];
     this._lastEmit = {};
-    this._inSpeechBurst = false;
-    this._lastSpeechEndT = 0;
-    this._speechStartT = 0;
   }
 
   // ── Frame buffer management ──────────────────────────────────────
@@ -288,7 +254,7 @@ export class TimelineEngine {
   }
 
   private _emitRepetition(
-    frames: TimelineFrame[], nowT: number, pattern: string
+    frames: TimelineFrame[], _nowT: number, pattern: string
   ): void {
     const startT = frames[0].t;
     const endT = frames[frames.length - 1].t;
@@ -326,7 +292,6 @@ export class TimelineEngine {
     const confidence = this._scoreToConfidence(score);
     if (confidence < 0.5) return; // discard low-confidence
 
-    const diffSeconds = nowT - endT;
     reasons.push(`Confidence is ${confidence >= 0.8 ? "strong" : confidence >= 0.5 ? "moderate" : "low"} based on ${count} burst events.`);
 
     this._emitEvent({
@@ -336,7 +301,7 @@ export class TimelineEngine {
       durationMs: Math.round(gapMs),
       confidence,
       reason: reasons,
-    }, nowT);
+    });
   }
 
   // ── 2. Prolongation detection ────────────────────────────────────
@@ -346,7 +311,7 @@ export class TimelineEngine {
    *
    * Rule: continuous FRICATIVE or VOICED frames lasting > 350ms.
    */
-  private _detectProlongations(window: TimelineFrame[], nowT: number): void {
+  private _detectProlongations(window: TimelineFrame[], _nowT: number): void {
     if (window.length < 2) return;
 
     // Find continuous runs of FRICATIVE or VOICED
@@ -363,13 +328,13 @@ export class TimelineEngine {
           runLabel = f.label;
         } else if (f.label !== runLabel) {
           // Label changed within the run — end the run
-          this._finalizeProlongation(window, runStart, window[i - 1].t, nowT);
+          this._finalizeProlongation(window, runStart, window[i - 1].t);
           runStart = f.t;
           runLabel = f.label;
         }
       } else {
         if (runStart >= 0) {
-          this._finalizeProlongation(window, runStart, window[i - 1].t, nowT);
+          this._finalizeProlongation(window, runStart, window[i - 1].t);
           runStart = -1;
           runLabel = -1;
         }
@@ -378,12 +343,12 @@ export class TimelineEngine {
 
     // Check run at end of window
     if (runStart >= 0 && window.length > 0) {
-      this._finalizeProlongation(window, runStart, window[window.length - 1].t, nowT);
+      this._finalizeProlongation(window, runStart, window[window.length - 1].t);
     }
   }
 
   private _finalizeProlongation(
-    window: TimelineFrame[], startT: number, endT: number, nowT: number
+    window: TimelineFrame[], startT: number, endT: number
   ): void {
     const durMs = (endT - startT) * 1000;
     if (durMs < PROLONG_MIN_MS) return;
@@ -435,7 +400,7 @@ export class TimelineEngine {
       durationMs: Math.round(durMs),
       confidence,
       reason: reasons,
-    }, nowT);
+    });
   }
 
   // ── 3. Block detection ───────────────────────────────────────────
@@ -447,7 +412,7 @@ export class TimelineEngine {
    * low-frequency energy (20-80 Hz) that indicates the vocal tract is positioning
    * but no sound is coming out.
    */
-  private _detectBlocks(window: TimelineFrame[], nowT: number): void {
+  private _detectBlocks(window: TimelineFrame[], _nowT: number): void {
     if (window.length < 2) return;
 
     // Find runs of SILENCE or TENSE_HOLD
@@ -509,7 +474,7 @@ export class TimelineEngine {
                   durationMs: Math.round(durMs),
                   confidence,
                   reason: reasons,
-                }, nowT);
+                });
               }
             }
           }
@@ -530,7 +495,7 @@ export class TimelineEngine {
    * Rule: ≥3 fragments in a 2.5s window, each separated by gaps <= 1s,
    * total span >= 500ms.
    */
-  private _detectHesitationSequences(window: TimelineFrame[], nowT: number): void {
+  private _detectHesitationSequences(window: TimelineFrame[], _nowT: number): void {
     if (window.length < 5) return;
 
     // Find speech fragments (runs of non-SILENCE, non-TENSE_HOLD frames)
@@ -604,7 +569,7 @@ export class TimelineEngine {
       durationMs: Math.round(clusterWindowMs),
       confidence,
       reason: reasons,
-    }, nowT);
+    });
   }
 
   // ── 5. False start detection ─────────────────────────────────────
@@ -613,7 +578,7 @@ export class TimelineEngine {
    * A speech attempt that starts and stops within <500ms, followed by a
    * restart attempt within 1s.
    */
-  private _detectFalseStarts(window: TimelineFrame[], nowT: number): void {
+  private _detectFalseStarts(window: TimelineFrame[], _nowT: number): void {
     if (window.length < 3) return;
 
     // Find short speech bursts (non-silence runs <500ms)
@@ -657,7 +622,7 @@ export class TimelineEngine {
                 durationMs: Math.round(durMs),
                 confidence: Math.min(0.6, confidence),
                 reason: reasons,
-              }, nowT);
+              });
             }
           }
         }
@@ -689,7 +654,7 @@ export class TimelineEngine {
 
   // ── Event emission ───────────────────────────────────────────────
 
-  private _emitEvent(event: StutterCandidate, nowT: number): void {
+  private _emitEvent(event: StutterCandidate): void {
     // De-dupe: no same-type event within DEDUPE_WINDOW_MS
     const lastEmit = this._lastEmit[event.eventType] || 0;
     if (event.startTime - lastEmit < DEDUPE_WINDOW_MS / 1000) return;
