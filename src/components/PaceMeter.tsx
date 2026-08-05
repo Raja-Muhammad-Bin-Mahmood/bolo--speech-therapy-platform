@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import { Gauge, TrendingDown, TrendingUp, Minus } from "lucide-react";
 import type { PaceSnapshot, PaceState, PaceTrend } from "../lib/paceEngine";
 
-export type PaceVariant = "compact" | "full" | "debate";
+export type PaceVariant = "compact" | "full" | "session" | "debate";
 
 interface PaceMeterProps {
   snapshot: PaceSnapshot;
@@ -22,6 +22,9 @@ interface PaceMeterProps {
 function PaceMeterBase({ snapshot, variant = "full", className }: PaceMeterProps) {
   if (variant === "compact") {
     return <CompactPace snapshot={snapshot} className={className} />;
+  }
+  if (variant === "session") {
+    return <SessionPace snapshot={snapshot} className={className} />;
   }
   if (variant === "debate") {
     return <DebatePace snapshot={snapshot} className={className} />;
@@ -203,6 +206,43 @@ function FullPace({ snapshot, className }: { snapshot: PaceSnapshot; className?:
             pause impact {snapshot.pauseImpact}%
           </span>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Session (Unprompted mode — sits left of the neon timer) ────────
+
+function SessionPace({ snapshot, className }: { snapshot: PaceSnapshot; className?: string }) {
+  const color = STATE_COLORS[snapshot.paceState];
+  return (
+    <div className={`glass rounded-2xl p-4 ${className ?? ""}`}>
+      <div className="flex items-center gap-2 mb-2">
+        <Gauge className="w-4 h-4" style={{ color }} />
+        <span className="text-[10px] uppercase tracking-widest text-soft-gray/60">Pace</span>
+        <span
+          className="ml-auto text-[10px] font-mono font-medium px-2 py-0.5 rounded-full"
+          style={{
+            color,
+            backgroundColor: `${color}18`,
+            border: `1px solid ${color}30`,
+          }}
+        >
+          {STATE_LABELS[snapshot.paceState]}
+        </span>
+      </div>
+
+      <p className="font-heading text-2xl font-bold text-white tabular-nums leading-none">
+        {snapshot.rollingWpm > 0 ? snapshot.rollingWpm : "—"}
+        <span className="text-[10px] text-soft-gray/50 ml-1">WPM</span>
+      </p>
+
+      <div className="mt-2.5">
+        <PaceAxis wpm={snapshot.rollingWpm} height="h-1.5" markerSize="w-2.5 h-2.5" />
+      </div>
+
+      <div className="mt-2">
+        <TrendTag trend={snapshot.trend} />
       </div>
     </div>
   );

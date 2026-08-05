@@ -8,11 +8,12 @@ interface ReactiveWaveformProps {
 }
 
 /**
- * Live audio visualizer — draws a continuous horizontal line on a <canvas>,
- * fed by the Web Audio AnalyserNode. RMS is read each animation frame and
- * exponentially smoothed; the line's thickness and Y-axis curve height scale
- * with that amplitude, so it stretches while the user speaks and collapses
- * to a flat baseline when silent.
+ * Subtle live audio visualizer — a single smooth line on a <canvas>.
+ *
+ * Not a random zig-zag and not a busy spectrum: the curve rests on a faint
+ * baseline when silent, then rises into a gentle, slowly-breathing wave whose
+ * height tracks the real mic RMS. Amplitude is exponentially smoothed so it
+ * never snaps, and the phase drift is slow enough to feel calm.
  */
 export default function ReactiveWaveform({
   getAnalyser,
@@ -22,8 +23,16 @@ export default function ReactiveWaveform({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number>(0);
   const smoothRef = useRef(0);
+  const reducedMotionRef = useRef(false);
 
   useEffect(() => {
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    reducedMotionRef.current = mq.matches;
+    const onChange = (e: MediaQueryListEvent) => {
+      reducedMotionRef.current = e.matches;
+    };
+    mq.addEventListener?.("change", onChange);
+
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
@@ -42,7 +51,7 @@ export default function ReactiveWaveform({
 
     let dataBuf: Float32Array | null = null;
 
-    const draw = (time: number) => {
+    const draw = (now: number) => {
       rafRef.current = requestAnimationFrame(draw);
 
       const w = canvas.width;
@@ -64,9 +73,10 @@ export default function ReactiveWaveform({
         rms = Math.sqrt(sum / dataBuf.length);
       }
 
-      // 2. Exponential smoothing → 0–1 amplitude
-      smoothRef.current = smoothRef.current * 0.82 + rms * 0.18;
-      const amp = Math.min(smoothRef.current * 2.6, 1);
+      // 2. Heavily smoothed amplitude → 0–1
+      const target = Math.min(rms * 3.4, 1);
+      smoothRef.current += (target - smoothRef.current) * 0.14;
+      const amp = smoothRef.current;
 
       ctx.clearRect(0, 0, w, h);
       ctx.lineCap = "round";
@@ -76,23 +86,28 @@ export default function ReactiveWaveform({
       ctx.beginPath();
       ctx.moveTo(0, midY);
       ctx.lineTo(w, midY);
-      ctx.strokeStyle = "rgba(255,255,255,0.06)";
+      ctx.strokeStyle = "rgba(255,255,255,0.05)";
       ctx.lineWidth = 1;
       ctx.stroke();
 
-      // 3. Wave path — curve height and thickness scale with amp
-      const segments = 72;
-      const waveAmp = h * 0.22 * amp;
-      const thickness = 1 + amp * 5;
-      const phase = time * 0.002;
+      // Silent → nothing but the baseline (no fake motion)
+      if (amp < 0.004) return;
+
+      // 3. One smooth wave — height scales with voice, drift is slow and gentle
+      const reduced = reducedMotionRef.current;
+      const drift = reduced ? 0 : now * 0.00028;
+      const maxAmp = h * 0.16 * amp;
+      const segments = 128;
+      const envelope = (t: number) =>
+        Math.pow(Math.sin(Math.PI * Math.min(1, Math.max(0, t))), 0.75);
 
       const waveY = (i: number) => {
-        const t = (i / segments) * Math.PI * 2;
-        return (
-          midY +
-          Math.sin(t + phase) * waveAmp * 0.55 +
-          Math.sin(t * 2.3 + phase * 1.7) * waveAmp * 0.45
-        );
+        const t = i / segments;
+        const base =
+          Math.sin(t * Math.PI * 2 * 1.5 + drift) * 0.55 +
+          Math.sin(t * Math.PI * 4 + drift * 1.4) * 0.25 +
+          Math.sin(t * Math.PI * 6 + drift * 2.1) * 0.2;
+        return midY + base * maxAmp * envelope(t);
       };
 
       ctx.beginPath();
@@ -103,38 +118,31 @@ export default function ReactiveWaveform({
         else ctx.lineTo(x, y);
       }
 
-      const grad = ctx.createLinearGradient(
-        0,
-        midY - waveAmp - thickness,
-        0,
-        midY + waveAmp + thickness
-      );
+      const grad = ctx.createLinearGradient(0, midY - maxAmp, 0, midY + maxAmp);
       grad.addColorStop(0, "rgba(109,86,255,0)");
       grad.addColorStop(0.5, "#BD8CFF");
       grad.addColorStop(1, "rgba(109,86,255,0)");
 
       ctx.strokeStyle = grad;
-      ctx.lineWidth = thickness;
-      ctx.shadowColor = `rgba(189,140,255,${0.25 + amp * 0.6})`;
-      ctx.shadowBlur = 4 + amp * 18;
+      ctx.lineWidth = 1.5 + amp * 2;
+      ctx.shadowColor = `rgba(189,140,255,${0.12 + amp * 0.4})`;
+      ctx.shadowBlur = 6 + amp * 10;
       ctx.stroke();
       ctx.shadowBlur = 0;
 
-      // 4. Soft fill under the curve
-      if (amp > 0.02) {
-        ctx.beginPath();
-        for (let i = 0; i <= segments; i++) {
-          const x = (i / segments) * w;
-          const y = waveY(i);
-          if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        }
-        ctx.lineTo(w, midY);
-        ctx.lineTo(0, midY);
-        ctx.closePath();
-        ctx.fillStyle = `rgba(109,86,255,${0.05 + amp * 0.12})`;
-        ctx.fill();
+      // 4. Whisper-soft fill under the curve
+      ctx.beginPath();
+      for (let i = 0; i <= segments; i++) {
+        const x = (i / segments) * w;
+        const y = waveY(i);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
       }
+      ctx.lineTo(w, midY);
+      ctx.lineTo(0, midY);
+      ctx.closePath();
+      ctx.fillStyle = `rgba(109,86,255,${0.03 + amp * 0.05})`;
+      ctx.fill();
     };
 
     rafRef.current = requestAnimationFrame(draw);
@@ -142,6 +150,7 @@ export default function ReactiveWaveform({
     return () => {
       cancelAnimationFrame(rafRef.current);
       ro.disconnect();
+      mq.removeEventListener?.("change", onChange);
     };
   }, [getAnalyser, isActive]);
 

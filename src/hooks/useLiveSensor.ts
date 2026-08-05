@@ -138,5 +138,8 @@ export function useLiveSensor() {
     return () => stop();
   }, [stop]);
 
-  return { ...state, start, stop };
+  /** Returns the live AnalyserNode (null until the mic is ready). */
+  const getAnalyser = useCallback(() => analyserRef.current, []);
+
+  return { ...state, start, stop, getAnalyser };
 }

@@ -4,11 +4,14 @@ import { ArrowLeft, StopCircle, Sparkles, MessageSquare } from "lucide-react";
 import LiquidBackground from "../components/LiquidBackground";
 import Navbar from "../components/Navbar";
 import RecordButton from "../components/RecordButton";
-import SessionTimer from "../components/SessionTimer";
+import NeonTimer from "../components/NeonTimer";
+import ReactiveWaveform from "../components/ReactiveWaveform";
+import PaceMeter from "../components/PaceMeter";
 import TopicDrum from "../components/TopicDrum";
 import SensorSidebar from "../components/SensorSidebar";
 import { useSpeechRecognition, type StyledSegment } from "../hooks/useSpeechRecognition";
 import { useLiveSensor } from "../hooks/useLiveSensor";
+import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
 import { useAuth } from "../context/AuthContext";
 
 /** Simulated SLP report — in production Speechmatics + AI */
@@ -145,16 +148,34 @@ export default function Session() {
 
   const sensor = useLiveSensor();
 
+  // ── Pace engine (left-hand pace rating) ──────────────────────────────
+  const pace = usePaceEngine();
+  const paceSnapshot = usePaceSnapshot(pace.engine);
+
   const promptText = prompt || "Describe your ideal day.";
+
+  // Feed finalized words + pauses into the pace engine as they arrive
+  useEffect(() => {
+    if (!isRecording || words.length === 0) return;
+    const finalWords = words.map((w) => ({
+      word: w.word,
+      text: w.word,
+      startTime: w.startTime,
+      endTime: w.startTime + w.duration,
+      confidence: w.confidence ?? 0.9,
+    }));
+    pace.feed(finalWords, []);
+  }, [words, isRecording, pace]);
 
   const handleRecordingStart = useCallback(() => {
     setIsRecording(true);
     setIsComplete(false);
     setReport(null);
+    pace.reset();
     resetTranscript();
     startListening();
     sensor.start();
-  }, [startListening, resetTranscript, sensor]);
+  }, [startListening, resetTranscript, sensor, pace]);
 
   const handleRecordingStop = useCallback(() => {
     setIsRecording(false);
@@ -285,38 +306,41 @@ export default function Session() {
                       <p className="text-[10px] text-soft-gray/40 text-center">{speechError}</p>
                     )}
 
-                    {/* Waveform */}
-                    <div className="h-16 flex items-center justify-center">
-                      <div className="flex items-end gap-1 h-12" aria-hidden="true">
-                        {Array.from({ length: 7 }, (_, i) => (
-                          <div
-                            key={i}
-                            className="w-[3px] rounded-full"
-                            style={{
-                              height: `${30 + Math.random() * 50}%`,
-                              background: "linear-gradient(to top, rgba(109,86,255,0.4), rgba(189,140,255,0.8))",
-                              animation: isRecording
-                                ? `waveform 1.2s ease-in-out ${i * 0.12}s infinite`
-                                : "none",
-                              transform: isRecording ? undefined : "scaleY(0.3)",
-                            }}
-                          />
-                        ))}
+                    {/* Live recording area — pace rating left, neon timer center, subtle waveform below */}
+                    <div className="w-full flex items-start justify-center gap-6 md:gap-10">
+                      {/* Pace rating — left */}
+                      <div className="hidden sm:block w-40 shrink-0 pt-2">
+                        {isRecording && (
+                          <PaceMeter snapshot={paceSnapshot} variant="session" />
+                        )}
                       </div>
-                    </div>
 
-                    {/* Timer & Record Button */}
-                    <div className="flex flex-col items-center gap-4">
-                      <SessionTimer
-                        duration={60}
-                        isRunning={isRecording}
-                        onComplete={handleTimerComplete}
-                      />
-                      <RecordButton
-                        size="lg"
-                        onStart={handleRecordingStart}
-                        onStop={handleRecordingStop}
-                      />
+                      {/* Timer — center, unboxed, rolls down like an Apple clock */}
+                      <div className="flex flex-col items-center gap-5 flex-1 min-w-0">
+                        <NeonTimer
+                          duration={60}
+                          isRunning={isRecording}
+                          onComplete={handleTimerComplete}
+                        />
+
+                        {/* Subtle reactive waveform — breathes with the voice, rests flat when silent */}
+                        <div className="w-full max-w-md h-16">
+                          <ReactiveWaveform
+                            getAnalyser={sensor.getAnalyser}
+                            isActive={isRecording && sensor.isReady}
+                            className="w-full h-full"
+                          />
+                        </div>
+
+                        <RecordButton
+                          size="lg"
+                          onStart={handleRecordingStart}
+                          onStop={handleRecordingStop}
+                        />
+                      </div>
+
+                      {/* Right spacer — keeps the timer optically centered */}
+                      <div className="hidden sm:block w-40 shrink-0" aria-hidden="true" />
                     </div>
 
                     {isRecording && (
