@@ -8,7 +8,7 @@ import {
   Zap,
   BarChart3,
 } from "lucide-react";
-import type { StutterEvent, StutterSummary, StutterEventType } from "../lib/stutterTypes";
+import type { StutterEvent, StutterSummary } from "../lib/stutterTypes";
 import { STUTTER_COLORS, STUTTER_LABELS } from "../lib/stutterTypes";
 
 interface StutterReviewPanelProps {
@@ -41,6 +41,23 @@ function StutterReviewPanelBase({ events, summary }: StutterReviewPanelProps) {
         return null;
     }
   })();
+
+  const eventTypeIcon = (type: StutterEventType) => {
+    switch (type) {
+      case "repetition":
+        return "🔄";
+      case "prolongation":
+        return "↗";
+      case "block":
+        return "▨";
+      case "tense_block":
+        return "⚡";
+      case "hesitation_sequence":
+        return "…";
+      default:
+        return "·";
+    }
+  };
 
   if (highlighted.length === 0 && summary.uncertain === 0) return null;
 
