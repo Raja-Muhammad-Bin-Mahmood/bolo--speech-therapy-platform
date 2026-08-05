@@ -354,7 +354,7 @@ export class PaceEngine {
       : 0;
 
     // Clarity score (0-100)
-    const clarityScore = this.computeClarity(rollingWpm, currentWpm, pauseImpact, wordCount, cleanInWindow);
+    const clarityScore = this.computeClarity(rollingWpm, currentWpm, pauseImpact, cleanInWindow);
 
     return {
       timestamp: now,
@@ -388,7 +388,6 @@ export class PaceEngine {
     rollingWpm: number,
     currentWpm: number,
     pauseImpact: number,
-    wordCount: number,
     windowWords: FinalWordLike[]
   ): number {
     // Pace stability: distance from 140 WPM

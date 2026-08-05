@@ -103,15 +103,36 @@ const TAG_STYLES: Record<DisfluencyTag, string> = {
 };
 
 const PAUSE_LABELS: Record<PauseEvent["type"], string> = {
-  natural: "⏸",
+  natural: "·",
   thinking: "…",
-  awkward: "⏸",
-  severe: "⏸",
-  hesitation_sequence: "⏸⏸",
+  awkward: "|",
+  severe: "||",
+  hesitation_sequence: "||",
 };
+
+/** Pure sentence markers — rendered as faint separators, NEVER error boxes */
+const SENTENCE_MARKERS = new Set([".", "!", "?", "…"]);
 
 function PauseBadge({ event }: { event: PauseEvent }) {
   if (!event.shouldColor) return null;
+  // Hesitation sequences: grouped, coherent badge with fragment info
+  if (event.type === "hesitation_sequence") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-mono transition-colors duration-200 select-none"
+        style={{
+          color: event.colorToken,
+          backgroundColor: `${event.colorToken}18`,
+          border: `1px solid ${event.colorToken}30`,
+        }}
+        title={event.reason.join(" ")}
+      >
+        <span>{PAUSE_LABELS[event.type]}</span>
+        <span>{(event.durationMs / 1000).toFixed(1)}s</span>
+        <span className="opacity-70">hesitation</span>
+      </span>
+    );
+  }
   return (
     <span
       className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-mono transition-colors duration-200 select-none"
@@ -131,6 +152,16 @@ function PauseBadge({ event }: { event: PauseEvent }) {
 function WordSpan({ word }: { word: LineWord }) {
   const style = word.tag ? TAG_STYLES[word.tag] : null;
   const base = style ?? (word.isFinal ? "text-white/80" : "text-soft-gray/50");
+
+  // Sentence markers (period, comma, ?!…) — render subtly, never as boxes
+  if (SENTENCE_MARKERS.has(word.text.trim())) {
+    return (
+      <span className="text-white/25 font-normal select-none" aria-hidden="true">
+        {word.text}
+      </span>
+    );
+  }
+
   return (
     <span
       className={`inline-block rounded px-1 transition-colors duration-200 ${base} ${

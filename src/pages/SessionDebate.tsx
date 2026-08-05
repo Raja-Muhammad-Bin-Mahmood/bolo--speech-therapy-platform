@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ArrowLeft,
@@ -180,9 +180,12 @@ export default function SessionDebate() {
     } else {
       const finalScore = Math.floor(Math.random() * 30) + 65;
       setScore(finalScore);
+      // Finalize pace report from the shared engine (same engine, all modes)
+      const report = finalize();
+      setPaceReport(report);
       setPhase("result");
     }
-  }, [turn]);
+  }, [turn, finalize]);
 
   return (
     <div className="min-h-screen relative overflow-hidden bg-deep-space">
@@ -304,6 +307,13 @@ export default function SessionDebate() {
                 Turn {turn + 1}/{maxTurns + 1}
               </span>
 
+              {/* Pace meter (compact — shows during speaking) */}
+              {phase === "speaking" && (
+                <div className="w-32 pointer-events-auto">
+                  <PaceMeter snapshot={paceSnapshot} variant="debate" />
+                </div>
+              )}
+
               {/* Mic Button */}
               {phase === "speaking" && (
                 <RecordButton
@@ -383,6 +393,13 @@ export default function SessionDebate() {
                   label="Fluency"
                 />
               </div>
+
+              {/* Pace Under Pressure — from shared engine, debate-specific language */}
+              {paceReport && (
+                <div className="mb-4">
+                  <DebatePaceSummary report={paceReport} />
+                </div>
+              )}
 
               <div className="glass-subtle rounded-2xl p-4 mb-4 text-left">
                 <div className="flex items-center gap-1.5 mb-2">

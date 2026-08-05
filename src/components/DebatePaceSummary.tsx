@@ -11,7 +11,6 @@ interface DebatePaceSummaryProps {
 interface Segment {
   key: string;
   title: string;
-  emoji: string;
   wpm: number;
   state: PaceState;
   description: string;
@@ -22,13 +21,6 @@ const STATE_COLORS: Record<PaceState, string> = {
   ideal: "#34D399",
   fast: "#FBBF24",
   unstable: "#F87171",
-};
-
-const STATE_LABELS: Record<PaceState, string> = {
-  slow: "slow",
-  ideal: "controlled",
-  fast: "rushed",
-  unstable: "erratic",
 };
 
 /**
@@ -110,10 +102,10 @@ function segmentTimeline(report: PaceReport): Segment[] {
   const timeline = report.timeline;
   if (timeline.length === 0) {
     return [
-      { key: "opening", title: "Opening", emoji: "🚀", wpm: 0, state: "ideal", description: "Awaiting your response" },
-      { key: "rebuttal", title: "Rebuttal", emoji: "⚡", wpm: 0, state: "ideal", description: "Awaiting your response" },
-      { key: "counter", title: "Counterexample", emoji: "🧠", wpm: 0, state: "ideal", description: "Awaiting your response" },
-      { key: "closing", title: "Closing", emoji: "🎯", wpm: 0, state: "ideal", description: "Awaiting your response" },
+      { key: "opening", title: "Opening", wpm: 0, state: "ideal", description: "Awaiting your response" },
+      { key: "rebuttal", title: "Rebuttal", wpm: 0, state: "ideal", description: "Awaiting your response" },
+      { key: "counter", title: "Counterexample", wpm: 0, state: "ideal", description: "Awaiting your response" },
+      { key: "closing", title: "Closing", wpm: 0, state: "ideal", description: "Awaiting your response" },
     ];
   }
 
@@ -127,11 +119,11 @@ function segmentTimeline(report: PaceReport): Segment[] {
     quarters[idx].push(entry.snapshot);
   }
 
-  const labels: { key: string; title: string; emoji: string; desc: (w: number) => string }[] = [
-    { key: "opening", title: "Opening", emoji: "🚀", desc: (w) => pacePhrase(w, "opening") },
-    { key: "rebuttal", title: "Rebuttal", emoji: "⚡", desc: (w) => pacePhrase(w, "rebuttal") },
-    { key: "counter", title: "Counterexample", emoji: "🧠", desc: (w) => pacePhrase(w, "counterexample") },
-    { key: "closing", title: "Closing", emoji: "🎯", desc: (w) => pacePhrase(w, "closing") },
+  const labels: { key: string; title: string; desc: (w: number) => string }[] = [
+    { key: "opening", title: "Opening", desc: (w) => pacePhrase(w) },
+    { key: "rebuttal", title: "Rebuttal", desc: (w) => pacePhrase(w) },
+    { key: "counter", title: "Counterexample", desc: (w) => pacePhrase(w) },
+    { key: "closing", title: "Closing", desc: (w) => pacePhrase(w) },
   ];
 
   return labels.map((l, i) => {
@@ -144,7 +136,6 @@ function segmentTimeline(report: PaceReport): Segment[] {
     return {
       key: l.key,
       title: l.title,
-      emoji: l.emoji,
       wpm,
       state,
       description: l.desc(wpm),
@@ -152,7 +143,7 @@ function segmentTimeline(report: PaceReport): Segment[] {
   });
 }
 
-function pacePhrase(wpm: number, phase: string): string {
+function pacePhrase(wpm: number): string {
   if (wpm <= 0) return "No speech yet";
   if (wpm < 120) return "hesitant start";
   if (wpm > 160) return "rushed section";

@@ -30,6 +30,7 @@ function PaceMeterBase({ snapshot, variant = "full", className }: PaceMeterProps
 }
 
 export const PaceMeter = memo(PaceMeterBase);
+export default PaceMeter;
 
 // ─── Shared pieces ───────────────────────────────────────────────────
 

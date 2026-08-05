@@ -161,6 +161,14 @@ export default function Analysis() {
   const paceLabel: string = data?.paceLabel ?? "";
   const reasons: string[] = Array.isArray(data?.reasons) ? data.reasons : [];
 
+  // ── New shared pace engine report ─────────────────────────────────
+  const paceReport = data?.paceReport;
+  const paceReportClarity = paceReport?.clarity ?? 0;
+  const paceReportConsistency = paceReport?.pacingConsistency ?? 0;
+  const paceReportExplanation = paceReport?.explanation ?? "";
+  const paceReportPauseSummary = paceReport?.pauseSummary ?? null;
+  const paceReportLabels = paceReport?.labels ?? null;
+
   const PACE_COLORS: Record<string, string> = {
     green: "#34D399",
     yellow: "#FBBF24",
@@ -446,6 +454,84 @@ export default function Analysis() {
                 : "Keep talking — pace updates as you go.")}
           </p>
         </motion.div>
+
+        {/* Pace Engine Report (shared engine — same in every mode) */}
+        {paceReport && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.29 }}
+            className="glass rounded-2xl p-5 mb-8 border border-neon-purple/10"
+          >
+            <h3 className="font-heading text-sm font-semibold text-white mb-4 flex items-center gap-2">
+              <Gauge className="w-4 h-4 text-neon-purple" />
+              Pacing Analysis
+            </h3>
+
+            {/* Clarity + Consistency */}
+            <div className="grid grid-cols-2 gap-3 mb-4">
+              <div className="glass-subtle rounded-xl p-3 text-center">
+                <p className="text-2xl font-heading font-bold text-emerald-300">
+                  {paceReportClarity}
+                </p>
+                <p className="text-[9px] text-soft-gray/50 mt-0.5 uppercase tracking-wide">
+                  Pace Clarity
+                </p>
+              </div>
+              <div className="glass-subtle rounded-xl p-3 text-center">
+                <p className="text-2xl font-heading font-bold text-electric-violet">
+                  {paceReportConsistency}
+                </p>
+                <p className="text-[9px] text-soft-gray/50 mt-0.5 uppercase tracking-wide">
+                  Consistency
+                </p>
+              </div>
+            </div>
+
+            {/* Pause summary chips */}
+            {paceReportPauseSummary && (
+              <div className="flex flex-wrap gap-1.5 mb-4">
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-400/10 text-amber-300/80">
+                  {paceReportPauseSummary.totalAwkward} awkward
+                </span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-orange-400/10 text-orange-300/80">
+                  {paceReportPauseSummary.totalSevere} severe
+                </span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-[#F59E0B]/10 text-[#F59E0B]/80">
+                  {paceReportPauseSummary.totalHesitationSequences} hesitation clusters
+                </span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-white/5 text-soft-gray/70">
+                  longest {(paceReportPauseSummary.longestHesitationMs / 1000).toFixed(1)}s
+                </span>
+              </div>
+            )}
+
+            {/* Labels */}
+            {paceReportLabels && (
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-4">
+                <div className="glass-subtle rounded-lg px-3 py-2">
+                  <p className="text-[9px] text-soft-gray/50 uppercase tracking-wide">Pace</p>
+                  <p className="text-xs text-white font-medium mt-0.5">{paceReportLabels.pace}</p>
+                </div>
+                <div className="glass-subtle rounded-lg px-3 py-2">
+                  <p className="text-[9px] text-soft-gray/50 uppercase tracking-wide">Pauses</p>
+                  <p className="text-xs text-white font-medium mt-0.5">{paceReportLabels.pause}</p>
+                </div>
+                <div className="glass-subtle rounded-lg px-3 py-2">
+                  <p className="text-[9px] text-soft-gray/50 uppercase tracking-wide">Trend</p>
+                  <p className="text-xs text-white font-medium mt-0.5">{paceReportLabels.trend}</p>
+                </div>
+              </div>
+            )}
+
+            {/* Human explanation */}
+            {paceReportExplanation && (
+              <p className="text-xs text-soft-gray/70 leading-relaxed">
+                {paceReportExplanation}
+              </p>
+            )}
+          </motion.div>
+        )}
 
         {/* Why the score moved */}
         {reasons.length > 0 && (
