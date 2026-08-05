@@ -13,7 +13,10 @@ import { useSpeechmaticsWS } from "../hooks/useSpeechmaticsWS";
 import { useAcousticAnalysis } from "../hooks/useAcousticAnalysis";
 import { useSessionAnalysis, finalizeSessionScore } from "../hooks/useSessionAnalysis";
 import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
+import { useStutterEngine } from "../hooks/useStutterEngine";
+import { fuseStutterEvents, summarizeStutterEvents } from "../lib/stutterFusion";
 import { useAuth } from "../context/AuthContext";
+import type { StutterEvent } from "../lib/stutterTypes";
 
 const FILLER_WORDS = [
   "um", "uh", "ah", "er", "hmm", "like", "you know", "sort of",
@@ -53,6 +56,18 @@ export default function RecordingSession() {
   // ── Fusion + shared scoring (live) ──────────────────────────────────
   const { wordTags, pauseEvents } = useSessionAnalysis(ws.transcripts, acousticEvents);
 
+  // ── Stutter engine (AudioWorklet DSP → conservative fusion) ──────────
+  const stutter = useStutterEngine(
+    ws.transcripts,
+    audio.stutterCandidates,
+    phase === "recording" && audio.isActive
+  );
+
+  // Align the acoustic clock to the ASR lane once Speechmatics is connected
+  useEffect(() => {
+    if (ws.status === "connected") audio.pinClock();
+  }, [ws.status, audio]);
+
   // ── Shared Pace Engine ──────────────────────────────────────────────
   const { engine, feedTranscripts, feedPauses, finalize: finalizePace } = usePaceEngine();
   const paceSnapshot = usePaceSnapshot(engine);
@@ -91,6 +106,9 @@ export default function RecordingSession() {
     analysisLockRef.current = true;
     setTimerRunning(false);
     setPhase("processing");
+
+    // Snapshot stutter candidates BEFORE stopping the mic (stop() clears them)
+    const stutterSnapshot = audio.getStutterCandidates();
 
     // Stop the mic first: no more audio → no more Speechmatics credits.
     audio.stop();
@@ -145,6 +163,24 @@ export default function RecordingSession() {
           ? Math.round(bursts.reduce((a, b) => a + b, 0) / bursts.length)
           : 0;
 
+      // ── Stutter review data (AudioWorklet DSP lane) ─────────────
+      const finalWords = finals
+        .filter((t) => t.isFinal)
+        .flatMap((t) => t.words)
+        .map((w: any) => ({
+          text: w.word || w.text || "",
+          startTime: w.startTime,
+          endTime: w.endTime,
+          confidence: w.confidence ?? 0.9,
+        }))
+        .filter((w) => w.text.length > 0);
+      const fusedStutter = fuseStutterEvents({
+        candidates: stutterSnapshot,
+        words: finalWords,
+      });
+      const stutterEvents: StutterEvent[] = fusedStutter.events;
+      const stutterSummary = summarizeStutterEvents(stutterEvents, finalWords);
+
       const result = {
         clarityScore: Math.round(100 - score.fluencyPenalty - score.clarityPenalty),
         fluencyScore: Math.round(100 - score.pacingPenalty),
@@ -193,6 +229,9 @@ export default function RecordingSession() {
           labels: paceReport.labels,
           explanation: paceReport.explanation,
         },
+        // Stutter engine review data (AudioWorklet DSP lane)
+        stutterEvents,
+        stutterSummary,
       };
 
       saveSessionData(result.clarityScore);
@@ -303,6 +342,7 @@ export default function RecordingSession() {
                     transcripts={ws.transcripts}
                     wordTags={wordTags}
                     pauseEvents={pauseEvents}
+                    stutterEvents={stutter.events}
                   />
                 )}
               </div>
