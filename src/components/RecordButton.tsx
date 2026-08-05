@@ -6,6 +6,8 @@ interface RecordButtonProps {
   onStop?: () => void;
   size?: "sm" | "md" | "lg";
   disabled?: boolean;
+  /** Controlled state — pass it when the parent owns recording state. */
+  recording?: boolean;
 }
 
 export default function RecordButton({
@@ -13,22 +15,25 @@ export default function RecordButton({
   onStop,
   size = "lg",
   disabled = false,
+  recording,
 }: RecordButtonProps) {
-  const [isRecording, setIsRecording] = useState(false);
+  const [internalRecording, setInternalRecording] = useState(false);
+  const isRecording = recording ?? internalRecording;
 
   useEffect(() => {
     return () => {
-      setIsRecording(false);
+      setInternalRecording(false);
     };
   }, []);
 
   const handleClick = () => {
     if (disabled) return;
+    if (recording === undefined) {
+      setInternalRecording((r) => !r);
+    }
     if (isRecording) {
-      setIsRecording(false);
       onStop?.();
     } else {
-      setIsRecording(true);
       onStart?.();
     }
   };
@@ -49,6 +54,7 @@ export default function RecordButton({
     <button
       onClick={handleClick}
       disabled={disabled}
+      aria-pressed={isRecording}
       className={`${sizeMap[size]} rounded-full flex items-center justify-center transition-all duration-300 active:scale-[0.93] relative ${
         disabled ? "opacity-40 cursor-not-allowed" : "cursor-pointer"
       }`}

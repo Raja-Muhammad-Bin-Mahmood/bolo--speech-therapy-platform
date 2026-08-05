@@ -1,0 +1,267 @@
+/**
+ * BOLO — useAnalyserSensor
+ *
+ * Reads RMS, ZCR and ΔEnergy straight from a SHARED AnalyserNode (no second
+ * mic stream — it taps the same audio the app is already recording) and runs
+ * a lightweight tension detector on those SAME values:
+ *
+ *   • STUTTER  — ≥3 tight energy bursts (RMS spikes) with elevated ZCR,
+ *                spaced 60–260ms apart inside an 800ms window.
+ *   • STAMMER  — sustained high RMS + elevated ZCR (fricative / tense hold)
+ *                lasting 200–650ms.
+ *
+ * The meters on the left and the detection feed are one and the same signal —
+ * the visible physics genuinely drive the detector.
+ */
+
+import { useRef, useCallback, useEffect, useState } from "react";
+import type { LiveSensorState } from "./useLiveSensor";
+import type { AcousticEvent } from "./useAcousticAnalysis";
+
+// ─── Live meter state (compatible with SensorSidebar) ───────────────────
+
+const INITIAL: LiveSensorState = {
+  currentRms: 0,
+  currentZcr: 0,
+  currentDeltaEnergy: 0,
+  isActive: false,
+  isReady: false,
+};
+
+// ─── Detection tuning (conservative — false positives are worse than misses)
+
+const RMS_FLOOR = 0.004; // absolute noise-floor floor
+const BURST_RMS_FACTOR = 3.2; // burst peak vs adaptive noise floor
+const BURST_ZCR_MIN = 0.1; // bursts must be noisy (plosive/fricative-like)
+const BURST_MIN_MS = 30;
+const BURST_MAX_MS = 220;
+const GAP_MIN_MS = 60;
+const GAP_MAX_MS = 260;
+const MIN_BURSTS = 3;
+const STUTTER_WINDOW_MS = 800;
+
+const STAMMER_RMS_FACTOR = 2.6; // sustained tension vs noise floor
+const STAMMER_ZCR_MIN = 0.16; // fricative / tight-larynx hold
+const STAMMER_MIN_MS = 200;
+const STAMMER_MAX_MS = 650;
+
+const COOLDOWN_MS = 300; // no two sensor events within 300ms
+const ROLLING_MS = 800; // rolling frame window
+const VOICE_FLOOR = 0.006; // absolute minimum for "speech" RMS
+
+interface SensorFrame {
+  t: number;
+  rms: number;
+  zcr: number;
+  delta: number;
+}
+
+export function useAnalyserSensor(
+  getAnalyser: () => AnalyserNode | null,
+  active: boolean
+) {
+  const [state, setState] = useState<LiveSensorState>(INITIAL);
+  const [events, setEvents] = useState<AcousticEvent[]>([]);
+  const eventsRef = useRef<AcousticEvent[]>([]);
+
+  const rafRef = useRef(0);
+  const frameCountRef = useRef(0);
+  const dataRef = useRef(new Float32Array(0));
+  const startRef = useRef(0);
+  const prevRmsRef = useRef(0);
+  const floorRef = useRef(RMS_FLOOR);
+  const lastEmitRef = useRef(0);
+
+  // Rolling window of recent frames
+  const ringRef = useRef<SensorFrame[]>([]);
+
+  // Burst (stutter) state machine
+  const burstRef = useRef<{ start: number; end: number; durMs: number }[]>([]);
+  const burstStartRef = useRef(0);
+  const inBurstRef = useRef(false);
+
+  // Stammer (sustained tension) state machine
+  const stammerStartRef = useRef(0);
+  const stammerPeakRef = useRef(0);
+
+  // ── Detection core ────────────────────────────────────────────────────
+  const detect = useCallback((t: number, rms: number, zcr: number) => {
+    const floor = Math.max(RMS_FLOOR, floorRef.current);
+    const voiceRms = Math.max(VOICE_FLOOR, floor * 2.2);
+
+    // ── Burst machine (stutter pattern) ─────────────────────────────
+    const inBurst =
+      rms > Math.max(voiceRms * 1.4, floor * BURST_RMS_FACTOR) &&
+      zcr > BURST_ZCR_MIN;
+
+    if (inBurst) {
+      if (!inBurstRef.current) burstStartRef.current = t;
+      inBurstRef.current = true;
+    } else if (inBurstRef.current) {
+      inBurstRef.current = false;
+      const durMs = (t - burstStartRef.current) * 1000;
+
+      if (durMs >= BURST_MIN_MS && durMs <= BURST_MAX_MS) {
+        const bursts = burstRef.current;
+        const last = bursts.length > 0 ? bursts[bursts.length - 1] : null;
+        const gapMs = last ? (burstStartRef.current - last.end) * 1000 : Infinity;
+
+        if (last && gapMs >= GAP_MIN_MS && gapMs <= GAP_MAX_MS) {
+          bursts.push({
+            start: burstStartRef.current,
+            end: t,
+            durMs: Math.round(durMs),
+          });
+
+          if (bursts.length >= MIN_BURSTS) {
+            const spanMs = (t - bursts[0].start) * 1000;
+            if (spanMs <= STUTTER_WINDOW_MS) {
+              emitEvent("stutter", bursts[0].start, t);
+              burstRef.current = [bursts[bursts.length - 1]];
+            }
+          }
+        } else {
+          // Gap too big or first burst — (re)start the pattern
+          if (last && gapMs > GAP_MAX_MS) burstRef.current = [];
+          burstRef.current = [
+            ...burstRef.current,
+            { start: burstStartRef.current, end: t, durMs: Math.round(durMs) },
+          ];
+          if (burstRef.current.length > 6) burstRef.current.shift();
+        }
+      } else {
+        // Run too short/long for a stutter burst — discard the pattern
+        burstRef.current = [];
+      }
+    }
+
+    // ── Stammer machine (sustained tense hold) ──────────────────────
+    const tense = rms > voiceRms * 1.15 && zcr > STAMMER_ZCR_MIN;
+    if (tense) {
+      if (stammerStartRef.current === 0) stammerStartRef.current = t;
+      stammerPeakRef.current = Math.max(stammerPeakRef.current, rms);
+    } else if (stammerStartRef.current > 0) {
+      const durMs = (t - stammerStartRef.current) * 1000;
+      const sustained =
+        stammerPeakRef.current > voiceRms * STAMMER_RMS_FACTOR * 0.6;
+      if (durMs >= STAMMER_MIN_MS && durMs <= STAMMER_MAX_MS && sustained) {
+        emitEvent("stammer", stammerStartRef.current, t);
+      }
+      stammerStartRef.current = 0;
+      stammerPeakRef.current = 0;
+    }
+  }, []);
+
+  // ── Emit with de-dupe ────────────────────────────────────────────────
+  const emitEvent = useCallback(
+    (type: "stutter" | "stammer", start: number, end: number) => {
+      if (end - lastEmitRef.current < COOLDOWN_MS / 1000) return;
+      lastEmitRef.current = end;
+      const evt: AcousticEvent = {
+        type,
+        startTime: start,
+        endTime: end,
+        durationMs: Math.round((end - start) * 1000),
+        confidence: 0.85,
+        acoustic: 0.8,
+      };
+      eventsRef.current = [...eventsRef.current, evt];
+      setEvents(eventsRef.current);
+    },
+    []
+  );
+
+  // ── Main rAF loop ────────────────────────────────────────────────────
+  const tick = useCallback(() => {
+    const analyser = getAnalyser();
+    if (analyser) {
+      const now = performance.now();
+      if (!startRef.current) startRef.current = now;
+      const t = (now - startRef.current) / 1000;
+
+      const buf = dataRef.current;
+      if (buf.length !== analyser.fftSize) {
+        dataRef.current = new Float32Array(analyser.fftSize);
+      }
+      analyser.getFloatTimeDomainData(buf);
+
+      // RMS
+      let sumSq = 0;
+      for (let i = 0; i < buf.length; i++) sumSq += buf[i] * buf[i];
+      const rms = Math.sqrt(sumSq / buf.length);
+
+      // ZCR
+      let zc = 0;
+      for (let i = 1; i < buf.length; i++) {
+        if (buf[i] * buf[i - 1] < 0) zc++;
+      }
+      const zcr = zc / Math.max(1, buf.length - 1);
+
+      // ΔEnergy
+      const delta = prevRmsRef.current > 0 ? rms - prevRmsRef.current : 0;
+      prevRmsRef.current = rms;
+
+      // Adaptive noise floor (tracked only while quiet)
+      if (rms < floorRef.current * 2) {
+        floorRef.current = floorRef.current * 0.95 + rms * 0.05;
+      }
+      floorRef.current = Math.max(RMS_FLOOR, floorRef.current);
+
+      // Rolling window
+      const ring = ringRef.current;
+      ring.push({ t, rms, zcr, delta });
+      while (ring.length > 0 && (t - ring[0].t) * 1000 > ROLLING_MS) {
+        ring.shift();
+      }
+
+      detect(t, rms, zcr);
+
+      // Throttle React updates to ~30fps
+      frameCountRef.current++;
+      if (frameCountRef.current % 2 === 0) {
+        setState({
+          currentRms: Math.min(1, rms * 2.5),
+          currentZcr: Math.min(1, zcr),
+          currentDeltaEnergy: Math.min(1, Math.abs(delta) * 5),
+          isActive: true,
+          isReady: true,
+        });
+      }
+    }
+    rafRef.current = requestAnimationFrame(tick);
+  }, [getAnalyser, detect]);
+
+  // ── Lifecycle ────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!active) {
+      eventsRef.current = [];
+      setEvents([]);
+      ringRef.current = [];
+      burstRef.current = [];
+      burstStartRef.current = 0;
+      inBurstRef.current = false;
+      stammerStartRef.current = 0;
+      stammerPeakRef.current = 0;
+      startRef.current = 0;
+      prevRmsRef.current = 0;
+      floorRef.current = RMS_FLOOR;
+      lastEmitRef.current = 0;
+      frameCountRef.current = 0;
+      setState(INITIAL);
+      return;
+    }
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [active, tick]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => cancelAnimationFrame(rafRef.current);
+  }, []);
+
+  return {
+    ...state,
+    events,
+    getEvents: () => eventsRef.current,
+  };
+}

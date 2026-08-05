@@ -1,15 +1,19 @@
 /**
  * BOLO — RecordingSession (Free Practice)
  *
- * Full speech-analysis experience:
+ * The full Practice Screen + Review flow:
  *   1. Pick a topic → recording starts immediately
  *   2. Mic → AudioWorklet DSP lane (frame classification) + Speechmatics live transcription
  *   3. Live rendering:
- *      - colored transcript (stutters / stammers / blocks / repetitions / prolongations / fillers)
- *      - inline pause badges with the exact time each pause took
+ *      - rolling neon countdown (Apple-clock style digits) in the center
+ *      - a voice-reactive pill-bar waveform just above the timer
+ *      - a live Pace rating on the left
+ *      - glowing mic button at the bottom center (tap to stop)
+ *      - color-coded live transcript (stutters / stammers / blocks / repetitions /
+ *        prolongations / fillers) with inline pause badges
  *      - a live detection feed (each stutter, stammer, block, pause as it fires)
  *      - live score, pace (WPM) and counters
- *   4. Stop → full SLP report on /analysis
+ *   4. Stop → Analyzing overlay → full annotated review on /analysis
  */
 
 import { useState, useCallback, useEffect, useRef, useMemo } from "react";
@@ -17,18 +21,21 @@ import { useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   ArrowLeft,
-  Square,
-  BarChart3,
   Sparkles,
   AlertTriangle,
   RotateCcw,
+  BarChart3,
 } from "lucide-react";
 import Navbar from "../components/Navbar";
 import TopicDrum from "../components/TopicDrum";
 import TranscriptionChunks from "../components/TranscriptionChunks";
-import ReactiveWaveform from "../components/ReactiveWaveform";
-import SessionTimer from "../components/SessionTimer";
+import PillBarsWaveform from "../components/PillBarsWaveform";
+import NeonTimer from "../components/NeonTimer";
+import PaceMeter from "../components/PaceMeter";
+import RecordButton from "../components/RecordButton";
+import SensorSidebar from "../components/SensorSidebar";
 import { useAudioCapture } from "../hooks/useAudioCapture";
+import { useAnalyserSensor } from "../hooks/useAnalyserSensor";
 import { useSpeechmaticsWS } from "../hooks/useSpeechmaticsWS";
 import {
   useAcousticAnalysis,
@@ -39,7 +46,7 @@ import {
   buildTimeline,
   finalizeSessionScore,
 } from "../hooks/useSessionAnalysis";
-import { usePaceEngine } from "../hooks/usePaceEngine";
+import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
 import { useAuth } from "../context/AuthContext";
 
 type Phase = "topic" | "recording" | "processing";
@@ -90,8 +97,45 @@ export default function RecordingSession() {
   const audio = useAudioCapture();
   const ws = useSpeechmaticsWS();
   const acoustic = useAcousticAnalysis(audio.getAnalyser, isRecording);
+  // RMS / ZCR / ΔEnergy lane — same shared analyser, drives stutter/stammer
+  const sensor = useAnalyserSensor(audio.getAnalyser, isRecording);
   const analysis = useSessionAnalysis(ws.transcripts, acoustic.events);
   const pace = usePaceEngine();
+  const paceSnapshot = usePaceSnapshot(pace.engine);
+
+  // ── Fused sensor events feed (stutter/stammer from RMS+ZCR) ─────────
+  const tickerItems = useMemo<TickerItem[]>(() => {
+    const items: TickerItem[] = [];
+    for (const e of acoustic.events) {
+      items.push({
+        key: `a-${e.startTime}-${e.type}`,
+        t: e.startTime,
+        label: ACOUSTIC_LABELS[e.type] ?? e.type,
+        durMs: e.durationMs,
+        color: ACOUSTIC_COLORS[e.type] ?? "#8B93A7",
+      });
+    }
+    for (const e of sensor.events) {
+      items.push({
+        key: `s-${e.startTime}-${e.type}`,
+        t: e.startTime,
+        label: e.type === "stutter" ? "Stutter" : "Stammer",
+        durMs: e.durationMs,
+        color: e.type === "stutter" ? "#F87171" : "#BD8CFF",
+      });
+    }
+    for (const p of analysis.pauseEvents) {
+      if (!p.shouldColor) continue;
+      items.push({
+        key: `p-${p.id}`,
+        t: p.startTime,
+        label: p.type === "hesitation_sequence" ? "Hesitation" : "Pause",
+        durMs: p.durationMs,
+        color: p.colorToken,
+      });
+    }
+    return items.sort((a, b) => a.t - b.t).slice(-16).reverse();
+  }, [acoustic.events, sensor.events, analysis.pauseEvents]);
 
   // Wire PCM → Speechmatics
   useEffect(() => {
@@ -132,31 +176,6 @@ export default function RecordingSession() {
     return () => clearTimeout(t);
   }, [phase, audio.isActive]);
 
-  // ── Live detection feed: stutters, stammers, blocks + scoreable pauses ──
-  const tickerItems = useMemo<TickerItem[]>(() => {
-    const items: TickerItem[] = [];
-    for (const e of acoustic.events) {
-      items.push({
-        key: `a-${e.startTime}-${e.type}`,
-        t: e.startTime,
-        label: ACOUSTIC_LABELS[e.type] ?? e.type,
-        durMs: e.durationMs,
-        color: ACOUSTIC_COLORS[e.type] ?? "#8B93A7",
-      });
-    }
-    for (const p of analysis.pauseEvents) {
-      if (!p.shouldColor) continue;
-      items.push({
-        key: `p-${p.id}`,
-        t: p.startTime,
-        label: p.type === "hesitation_sequence" ? "Hesitation" : "Pause",
-        durMs: p.durationMs,
-        color: p.colorToken,
-      });
-    }
-    return items.sort((a, b) => a.t - b.t).slice(-16).reverse();
-  }, [acoustic.events, analysis.pauseEvents]);
-
   // ── Start: topic selected → mic + Speechmatics immediately ──────────
   const handleTopicSelect = useCallback(
     (topic: string) => {
@@ -181,12 +200,32 @@ export default function RecordingSession() {
     // a ref that clears when `active` flips false).
     const finalTranscripts = ws.snapshotTranscripts();
     const finalAcoustic = acoustic.getEvents();
-    const finalScore = finalizeSessionScore(finalTranscripts, finalAcoustic);
+    // ── Fuse in the RMS/ZCR/ΔEnergy sensor events (stutter/stammer) ──
+    const sensorEvents = sensor.getEvents();
+    const allAcoustic = [...finalAcoustic, ...sensorEvents];
+    const finalScore = finalizeSessionScore(finalTranscripts, allAcoustic);
     const paceReport = pace.finalize();
-    const { taggedWords, pauseEvents } = buildTimeline(
+    const { taggedWords, segments, pauseEvents, wordTags } = buildTimeline(
       finalTranscripts,
-      finalAcoustic
+      allAcoustic
     );
+
+    // Confidence timeline — average word confidence per 2s bucket
+    const lastEnd = taggedWords.length > 0
+      ? Math.max(...taggedWords.map((w) => w.endTime))
+      : 0;
+    const bucket = 2;
+    const buckets = Math.max(1, Math.ceil(lastEnd / bucket));
+    const series = Array.from({ length: buckets }, () => ({ sum: 0, count: 0 }));
+    for (const w of taggedWords) {
+      const idx = Math.min(buckets - 1, Math.floor(w.startTime / bucket));
+      series[idx].sum += w.confidence;
+      series[idx].count++;
+    }
+    const confidenceTimeline = series.map((b, i) => ({
+      t: i * bucket,
+      value: b.count > 0 ? Math.round((b.sum / b.count) * 100) : null,
+    }));
 
     // Filler breakdown
     const fillerCounts: Record<string, number> = {};
@@ -266,10 +305,17 @@ export default function RecordingSession() {
           paceLabel: finalScore.pace.label,
           reasons: finalScore.reasons,
           paceReport,
+          // ── Annotated review payload ──
+          taggedWords,
+          segments,
+          wordTags: Array.from(wordTags.entries()),
+          pauseEvents,
+          confidenceTimeline,
+          avgConfidence: finalScore.avgConfidence,
         },
       });
     }, 900);
-  }, [ws, acoustic, pace, selectedTopic, navigate, saveSessionData]);
+  }, [ws, acoustic, sensor, pace, selectedTopic, navigate, saveSessionData]);
 
   const handleStopRecording = useCallback(() => {
     audio.stop();
@@ -363,7 +409,10 @@ export default function RecordingSession() {
                 <h2 className="font-heading text-lg font-semibold text-white">
                   Speaking Live
                 </h2>
-                <p className="text-xs text-soft-gray/50 mt-1">
+                <p
+                  className="text-xs text-soft-gray/50 mt-1"
+                  aria-live="polite"
+                >
                   {ws.status === "connected"
                     ? "Transcribing — detection engines active"
                     : ws.status === "connecting"
@@ -415,43 +464,92 @@ export default function RecordingSession() {
                 </div>
               )}
 
-              {/* ── Live metric strip ─────────────────────── */}
-              <div className="grid grid-cols-3 md:grid-cols-6 gap-2 mb-3">
-                <MetricChip
-                  label="Score"
-                  value={score.score}
-                  color="#BD8CFF"
-                  accent
-                />
-                <MetricChip
-                  label="Stutters"
-                  value={score.stutters}
-                  color="#F87171"
-                />
-                <MetricChip
-                  label="Stammers"
-                  value={score.stammers}
-                  color="#BD8CFF"
-                />
-                <MetricChip
-                  label="Fillers"
-                  value={score.fillers}
-                  color="#FCD34D"
-                />
-                <MetricChip
-                  label="Pauses"
-                  value={scoreablePauses}
-                  color="#60A5FA"
-                />
-                <MetricChip
-                  label="WPM"
-                  value={score.wpm > 0 ? score.wpm : "—"}
-                  color="#34D399"
-                />
+              {/* ── Practice card ─────────────────────────── */}
+              <div className="glass rounded-3xl p-5 md:p-8 relative overflow-hidden">
+                <div className="absolute inset-0 bg-gradient-to-b from-neon-purple/[0.04] to-transparent pointer-events-none" />
+
+                {/* Live metric strip */}
+                <div className="grid grid-cols-3 md:grid-cols-6 gap-2 mb-6">
+                  <MetricChip
+                    label="Score"
+                    value={score.score}
+                    color="#BD8CFF"
+                    accent
+                  />
+                  <MetricChip
+                    label="Stutters"
+                    value={score.stutters}
+                    color="#F87171"
+                  />
+                  <MetricChip
+                    label="Stammers"
+                    value={score.stammers}
+                    color="#BD8CFF"
+                  />
+                  <MetricChip
+                    label="Fillers"
+                    value={score.fillers}
+                    color="#FCD34D"
+                  />
+                  <MetricChip
+                    label="Pauses"
+                    value={scoreablePauses}
+                    color="#60A5FA"
+                  />
+                  <MetricChip
+                    label="WPM"
+                    value={score.wpm > 0 ? score.wpm : "—"}
+                    color="#34D399"
+                  />
+                </div>
+
+                  {/* Center stage — sensor left, pace right, timer + waveform center */}
+                  <div className="flex items-start justify-center gap-5 md:gap-8">
+                    {/* Sensor meters — LEFT: RMS / ZCR / ΔEnergy drive detection */}
+                    <div className="hidden sm:flex flex-col items-center justify-center w-40 shrink-0 pt-3 glass-subtle rounded-2xl py-4">
+                      <SensorSidebar sensor={sensor} isRecording={isRecording} />
+                    </div>
+
+                    {/* Timer — center, unboxed, rolls down like an Apple clock */}
+                    <div className="flex flex-col items-center gap-4 flex-1 min-w-0">
+                      {/* Waveform — above the timer, breathes with the voice */}
+                      <div className="w-full max-w-md h-14">
+                        <PillBarsWaveform
+                          getAnalyser={audio.getAnalyser}
+                          isActive={audio.isActive}
+                          className="w-full h-full"
+                        />
+                      </div>
+
+                      <NeonTimer
+                        duration={60}
+                        isRunning={isRecording}
+                        onComplete={handleTimerComplete}
+                      />
+
+                      {/* Glowing mic button — bottom center */}
+                      <RecordButton
+                        size="lg"
+                        recording={isRecording}
+                        onStop={handleStopRecording}
+                      />
+
+                      <p className="text-xs text-soft-gray/50 text-center">
+                        {isRecording
+                          ? "Tap to stop — BOLO is analyzing your speech"
+                          : "Starting microphone…"}
+                      </p>
+                    </div>
+
+                    {/* Pace rating — right */}
+                    <div className="hidden sm:block w-40 shrink-0 pt-3">
+                      <PaceMeter snapshot={paceSnapshot} variant="session" />
+                    </div>
+                  </div>
               </div>
 
-              {/* ── Transcription panel ───────────────────── */}
-              <div className="glass rounded-2xl p-3 mb-3 relative overflow-hidden">
+              {/* ── Live transcription (color-coded) ─────── */}
+              <div className="glass rounded-2xl p-3 mt-4 relative overflow-hidden">
                 <div className="flex items-center justify-between px-1 pb-1.5">
                   <span className="text-[10px] uppercase tracking-wider text-soft-gray/50 font-medium">
                     Live Transcript
@@ -470,7 +568,7 @@ export default function RecordingSession() {
               </div>
 
               {/* ── Live detection feed ───────────────────── */}
-              <div className="glass-subtle rounded-xl px-3 py-2.5 mb-3">
+              <div className="glass-subtle rounded-xl px-3 py-2.5 mt-3">
                 <p className="text-[10px] uppercase tracking-wider text-soft-gray/50 font-medium mb-1.5">
                   Detection Feed
                 </p>
@@ -504,65 +602,12 @@ export default function RecordingSession() {
                   </div>
                 )}
               </div>
-
-              {/* ── Waveform ──────────────────────────────── */}
-              <div className="h-14 mb-4">
-                <ReactiveWaveform
-                  getAnalyser={audio.getAnalyser}
-                  isActive={audio.isActive}
-                  className="w-full h-full"
-                />
-              </div>
-
-              {/* ── Timer + Stop ──────────────────────────── */}
-              <div className="flex flex-col items-center gap-3 pb-4">
-                <SessionTimer
-                  duration={60}
-                  isRunning={isRecording}
-                  onComplete={handleTimerComplete}
-                />
-                {isRecording ? (
-                  <motion.button
-                    initial={{ scale: 0.9, opacity: 0 }}
-                    animate={{ scale: 1, opacity: 1 }}
-                    whileHover={{ scale: 1.04 }}
-                    whileTap={{ scale: 0.95 }}
-                    onClick={handleStopRecording}
-                    className="flex items-center gap-2.5 bg-destructive hover:bg-red-600 text-white text-sm font-medium px-8 py-4 rounded-full transition-all duration-200 shadow-[0_0_25px_rgba(255,80,80,0.35)] cursor-pointer"
-                  >
-                    <Square className="w-4 h-4 fill-white" />
-                    Stop Recording
-                  </motion.button>
-                ) : (
-                  <div className="flex items-center gap-2.5 text-sm text-soft-gray/50">
-                    <div className="flex gap-1">
-                      <div
-                        className="w-2 h-2 rounded-full bg-neon-purple animate-bounce"
-                        style={{ animationDelay: "0ms" }}
-                      />
-                      <div
-                        className="w-2 h-2 rounded-full bg-neon-purple animate-bounce"
-                        style={{ animationDelay: "150ms" }}
-                      />
-                      <div
-                        className="w-2 h-2 rounded-full bg-neon-purple animate-bounce"
-                        style={{ animationDelay: "300ms" }}
-                      />
-                    </div>
-                    Connecting to microphone…
-                  </div>
-                )}
-                <div className="flex items-center gap-1.5 text-[10px] text-soft-gray/40">
-                  <GaugeDot color="#34D399" />
-                  {score.pace.label}
-                </div>
-              </div>
             </div>
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* ─── Processing Phase ────────────────────────────── */}
+      {/* ─── Processing (Analyzing) Phase ─────────────────── */}
       <AnimatePresence>
         {phase === "processing" && (
           <motion.div
@@ -597,9 +642,12 @@ export default function RecordingSession() {
               </motion.div>
 
               <h2 className="font-heading text-xl font-bold text-white mb-2">
-                Building Your SLP Report
+                Analyzing Your Speech
               </h2>
-              <p className="text-sm text-soft-gray/60 max-w-xs mx-auto">
+              <p
+                className="text-sm text-soft-gray/60 max-w-xs mx-auto"
+                aria-live="polite"
+              >
                 {resultRef.current
                   ? `${resultRef.current.stutters} stutters · ${resultRef.current.stammers} stammers · ${resultRef.current.pauses} pauses detected — scoring fluency, pace and clarity…`
                   : "Scoring fluency, pace and clarity…"}
@@ -656,16 +704,5 @@ function MetricChip({
         {label}
       </p>
     </div>
-  );
-}
-
-// ─── Small colored dot (pace label) ────────────────────────────────────
-
-function GaugeDot({ color }: { color: string }) {
-  return (
-    <span
-      className="inline-block w-1.5 h-1.5 rounded-full"
-      style={{ backgroundColor: color }}
-    />
   );
 }

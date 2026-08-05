@@ -1,4 +1,5 @@
 import { useLocation, useNavigate } from "react-router-dom";
+import { useMemo } from "react";
 import { motion } from "framer-motion";
 import {
   ArrowLeft,
@@ -209,6 +210,104 @@ export default function Analysis() {
   ];
   // Where the current WPM sits on the 0–300 pace axis
   const pacePositionPct = Math.min(100, Math.max(0, (wpm / 300) * 100));
+
+  // ── Annotated review payload (from the practice session) ──────────
+  const taggedWords: Array<{
+    word: string;
+    startTime: number;
+    endTime: number;
+    confidence: number;
+    utterance: number;
+    tag: string | null;
+    fused: number;
+  }> = Array.isArray(data?.taggedWords) ? data.taggedWords : [];
+  const pauseEvents: Array<{
+    id: string;
+    type: string;
+    startTime: number;
+    endTime: number;
+    durationMs: number;
+    shouldColor: boolean;
+    colorToken: string;
+    reason: string[];
+  }> = Array.isArray(data?.pauseEvents) ? data.pauseEvents : [];
+  const confidenceTimeline: Array<{ t: number; value: number | null }> =
+    Array.isArray(data?.confidenceTimeline) ? data.confidenceTimeline : [];
+  const avgConfidence = data?.avgConfidence ?? 0;
+
+  const TAG_STYLES: Record<string, string> = {
+    filler: "text-amber-300/90 bg-amber-300/10",
+    block: "text-orange-300/90 bg-orange-400/10",
+    repetition: "text-red-300/90 bg-red-400/10",
+    prolongation: "text-pink-300/90 bg-pink-400/10",
+    stutter: "text-red-300/90 bg-red-500/10",
+    stammer: "text-[#BD8CFF]/90 bg-[#BD8CFF]/10",
+  };
+
+  const PAUSE_LABELS: Record<string, string> = {
+    natural: "·",
+    thinking: "…",
+    awkward: "|",
+    severe: "||",
+    hesitation_sequence: "||",
+  };
+
+  const TAG_LABELS: Record<string, string> = {
+    filler: "Filler",
+    block: "Block",
+    repetition: "Repetition",
+    prolongation: "Prolongation",
+    stutter: "Stutter",
+    stammer: "Stammer",
+  };
+
+  // Pause events sorted by start time
+  const sortedPauses = [...pauseEvents].sort((a, b) => a.startTime - b.startTime);
+
+  // Reconstruct the annotated transcript by merging tagged words with
+  // scoreable pause badges (same approach as the live view).
+  const annotatedItems = useMemo(() => {
+    const items: Array<
+      | { kind: "word"; word: string; tag: string | null; startTime: number }
+      | { kind: "pause"; event: (typeof pauseEvents)[number] }
+    > = taggedWords.map((w) => ({
+      kind: "word" as const,
+      word: w.word,
+      tag: w.tag,
+      startTime: w.startTime,
+    }));
+    for (const p of sortedPauses) {
+      if (!p.shouldColor) continue;
+      const pauseEndMs = p.endTime * 1000;
+      let inserted = false;
+      for (let idx = 0; idx < items.length; idx++) {
+        const item = items[idx];
+        if (item.kind !== "word") continue;
+        const wStartMs = item.startTime * 1000;
+        if (wStartMs >= pauseEndMs) {
+          items.splice(idx, 0, { kind: "pause", event: p });
+          inserted = true;
+          break;
+        }
+      }
+      if (!inserted) {
+        items.push({ kind: "pause", event: p });
+      }
+    }
+    return items;
+  }, [taggedWords, sortedPauses]);
+
+  // Count disfluency types from tags for a clean legend
+  const tagCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const w of taggedWords) {
+      if (!w.tag) continue;
+      counts[w.tag] = (counts[w.tag] ?? 0) + 1;
+    }
+    return counts;
+  }, [taggedWords]);
+
+  const hasAnnotatedTranscript = taggedWords.length > 0;
 
   // Generate a coach's note
   const getCoachNote = () => {
@@ -700,6 +799,145 @@ export default function Analysis() {
                     </div>
                   );
                 })}
+            </div>
+          </motion.div>
+        )}
+
+        {/* ── Annotated Transcript (review) ─────────────────── */}
+        {hasAnnotatedTranscript && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.32 }}
+            className="glass rounded-2xl p-5 mb-8 border border-neon-purple/10"
+          >
+            <div className="flex items-center gap-2 mb-3">
+              <MessageSquare className="w-4 h-4 text-neon-purple" />
+              <h3 className="font-heading text-sm font-semibold text-white">
+                Annotated Transcript
+              </h3>
+              <span className="ml-auto text-[10px] text-soft-gray/50">
+                {taggedWords.length} words
+              </span>
+            </div>
+
+            {/* Legend */}
+            {Object.keys(tagCounts).length > 0 && (
+              <div className="flex flex-wrap gap-1.5 mb-3">
+                {Object.entries(tagCounts).map(([tag, count]) => (
+                  <span
+                    key={tag}
+                    className={`text-[10px] px-2 py-0.5 rounded-full ${TAG_STYLES[tag] ?? "text-soft-gray/60 bg-white/5"}`}
+                  >
+                    {TAG_LABELS[tag] ?? tag}: {count}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {/* Reconstructed annotated transcript */}
+            <div className="bg-white/5 rounded-xl p-4 max-h-64 overflow-y-auto leading-relaxed text-sm">
+              {annotatedItems.length === 0 ? (
+                <p className="text-xs text-soft-gray/50">
+                  No annotated words yet — complete a session to see your
+                  color-coded transcript.
+                </p>
+              ) : (
+                <p className="text-white/80 leading-relaxed">
+                  {annotatedItems.map((item, i) =>
+                    item.kind === "pause" ? (
+                      <span
+                        key={`p-${i}`}
+                        className="inline-flex items-center gap-1 mx-1 rounded px-1.5 py-0.5 text-[10px] font-mono align-middle"
+                        style={{
+                          color: item.event.colorToken,
+                          backgroundColor: `${item.event.colorToken}18`,
+                          border: `1px solid ${item.event.colorToken}30`,
+                        }}
+                        title={item.event.reason.join(" ")}
+                      >
+                        {PAUSE_LABELS[item.event.type] ?? "·"}
+                        {(item.event.durationMs / 1000).toFixed(1)}s
+                      </span>
+                    ) : (
+                      <span
+                        key={`w-${i}`}
+                        className={`inline-block rounded px-1 mr-0.5 transition-colors ${
+                          item.tag
+                            ? `${TAG_STYLES[item.tag] ?? ""} underline decoration-dotted underline-offset-2`
+                            : ""
+                        }`}
+                        title={item.tag ? TAG_LABELS[item.tag] : undefined}
+                      >
+                        {item.word}
+                      </span>
+                    )
+                  )}
+                </p>
+              )}
+            </div>
+
+            <p className="text-[10px] text-soft-gray/40 mt-3">
+              Colored words = detected disfluency (filler, block, repetition,
+              prolongation, stutter, stammer). Badges = pauses with duration.
+            </p>
+          </motion.div>
+        )}
+
+        {/* ── Confidence Timeline ─────────────────────────── */}
+        {confidenceTimeline.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.34 }}
+            className="glass rounded-2xl p-5 mb-8 border border-neon-purple/10"
+          >
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="font-heading text-sm font-semibold text-white flex items-center gap-2">
+                <Activity className="w-4 h-4 text-neon-purple" />
+                Confidence Timeline
+              </h3>
+              <span className="text-xs text-soft-gray/50">
+                Avg{" "}
+                <span className="font-mono font-semibold text-white">
+                  {Math.round(avgConfidence * 100)}%
+                </span>
+              </span>
+            </div>
+
+            <div className="flex items-end gap-1 h-24 mb-2">
+              {confidenceTimeline.map((point, i) => {
+                const heightPct = point.value === null ? 4 : Math.max(6, point.value);
+                const color =
+                  point.value === null
+                    ? "rgba(255,255,255,0.08)"
+                    : point.value >= 80
+                      ? "#34D399"
+                      : point.value >= 60
+                        ? "#FBBF24"
+                        : "#F87171";
+                return (
+                  <div
+                    key={i}
+                    className="flex-1 flex flex-col items-center justify-end gap-1 min-w-0"
+                    title={point.value === null ? "No speech" : `${point.value}% confidence`}
+                  >
+                    <div
+                      className="w-full rounded-t transition-all duration-500"
+                      style={{
+                        height: `${heightPct}%`,
+                        backgroundColor: color,
+                        opacity: 0.9,
+                      }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+            <div className="flex justify-between text-[9px] text-soft-gray/40">
+              <span>0s</span>
+              <span>Speech confidence over time (2s buckets)</span>
+              <span>~{Math.max(...confidenceTimeline.map((p) => p.t + 2))}s</span>
             </div>
           </motion.div>
         )}
