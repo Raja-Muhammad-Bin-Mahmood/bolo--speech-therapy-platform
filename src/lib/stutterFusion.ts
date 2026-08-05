@@ -120,10 +120,10 @@ export function fuseStutterEvents(input: FuseInput): FuseResult {
       // Direct overlap
       const ratio = overlapRatio(evt.startTime, evt.endTime, w.startTime, w.endTime);
       let score = ratio;
-      // Events occurring just BEFORE a word onset (block/tense) attach to it
+      // Events occurring just BEFORE a word onset (block/tense/false_start) attach to it
       if (
         score < 0.3 &&
-        (evt.eventType === "block" || evt.eventType === "tense_block") &&
+        (evt.eventType === "block" || evt.eventType === "tense_block" || evt.eventType === "possible_false_start") &&
         w.startTime >= evt.endTime - 0.05 &&
         w.startTime <= evt.endTime + 0.25
       ) {
@@ -158,7 +158,7 @@ export function fuseStutterEvents(input: FuseInput): FuseResult {
   }
 
   // ── Stage 3: dedupe overlapping events (keep stronger) ───────────
-  const events = dedupe(prelim.filter((e) => e.shouldHighlight || e.eventType === "uncertain"));
+  const events = dedupe(prelim.filter((e) => e.shouldHighlight || e.eventType === "uncertain" || e.eventType === "possible_false_start"));
 
   // ── Stage 4: specificity wins over hesitation_sequence ────────────
   const specificTypes: StutterEventType[] = [
@@ -166,6 +166,7 @@ export function fuseStutterEvents(input: FuseInput): FuseResult {
     "prolongation",
     "block",
     "tense_block",
+    "possible_false_start",
   ];
   const specific = events.filter((e) => specificTypes.includes(e.eventType));
   const finalEvents = events.filter((e) => {
@@ -280,6 +281,7 @@ export function summarizeStutterEvents(
     blocks: count("block"),
     tenseBlocks: count("tense_block"),
     hesitationSequences: count("hesitation_sequence"),
+    possibleFalseStarts: count("possible_false_start"),
     uncertain,
     longestMs,
     avgConfidence,

@@ -1,9 +1,13 @@
 /**
  * BOLO — useStutterEngine
  *
- * Consumes raw AudioWorklet candidates + Speechmatics transcripts and
- * produces fused StutterEvents with annotations for live rendering
- * and a summary for the review panel.
+ * Consumes timeline engine events (from the acoustic lane) + Speechmatics
+ * transcripts and produces fused StutterEvents with annotations for live
+ * rendering and a summary for the review panel.
+ *
+ * The timeline engine runs pattern detection on classified frames from the
+ * AudioWorklet. This hook fuses those acoustic events with finalized
+ * Speechmatics word timestamps for the UI.
  */
 import { useMemo } from "react";
 import type { StutterCandidate, StutterEvent, StutterSummary } from "../lib/stutterTypes";
@@ -20,7 +24,7 @@ export function useStutterEngine(
   summary: StutterSummary;
 } {
   return useMemo(() => {
-    if (!active && transcripts.length === 0) {
+    if (!active && transcripts.length === 0 && candidates.length === 0) {
       return { events: [], annotations: new Map(), summary: emptySummary() };
     }
 
@@ -61,6 +65,7 @@ function emptySummary(): StutterSummary {
     blocks: 0,
     tenseBlocks: 0,
     hesitationSequences: 0,
+    possibleFalseStarts: 0,
     uncertain: 0,
     longestMs: 0,
     avgConfidence: 0,

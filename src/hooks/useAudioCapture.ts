@@ -1,5 +1,6 @@
 import { useRef, useCallback, useEffect, useState } from "react";
-import type { StutterCandidate } from "../lib/stutterTypes";
+import type { StutterCandidate, TimelineFrame } from "../lib/stutterTypes";
+import { TimelineEngine } from "../lib/timelineEngine";
 
 interface AudioCaptureState {
   level: number; // 0–1 normalized RMS
@@ -9,19 +10,22 @@ interface AudioCaptureState {
   stutterSupported: boolean;
   /** Candidates since the session started (session-relative time, updated live). */
   stutterCandidates: StutterCandidate[];
+  /** Latest classified frame from the telemetry worklet (for debugging). */
+  latestFrame: TimelineFrame | null;
   onAudioData: ((buffer: Float32Array) => void) | null;
 }
 
 /**
  * Captures mic audio via AudioContext.
  *
- * PRIMARY lane: AudioWorklet-based processing:
- *   - Runs stutter DSP off the main thread.
+ * PRIMARY lane: AudioWorklet-based processing (bolo-telemetry-processor):
+ *   - Runs physics-based DSP off the main thread.
+ *   - Classifies every 20ms frame into phonetic categories.
  *   - Forwards PCM chunks to the Speechmatics WebSocket callback.
- *   - Posts candidate stutter events.
+ *   - TimelineEngine (main thread) detects patterns from classified frames.
  *
  * FALLBACK: ScriptProcessorNode (when AudioWorklet unsupported).
- *   - PCM streaming only, no stutter detection.
+ *   - PCM streaming only, no telemetry detection.
  *
  * Provides RMS level (for SiriLine / ReactiveWaveform) via a shared AnalyserNode.
  */
@@ -32,6 +36,7 @@ export function useAudioCapture() {
     stream: null,
     stutterSupported: false,
     stutterCandidates: [],
+    latestFrame: null,
     onAudioData: null,
   });
 
@@ -52,8 +57,12 @@ export function useAudioCapture() {
   const smoothRef = useRef(0);
   const dataRef = useRef(new Float32Array(0));
 
-  // PCM forwarding
+  // PCM forwarding to Speechmatics
   const onAudioDataRef = useRef<((buffer: Float32Array) => void) | null>(null);
+
+  // ── Timeline Engine (main-thread pattern detector) ─────────────────────
+  const timelineEngineRef = useRef<TimelineEngine | null>(null);
+  const timelineEventsRef = useRef<StutterCandidate[]>([]);
 
   // ── Stutter clock alignment ──────────────────────────────────────────
   // asrT0 = worklet-relative time when the first PCM chunk was forwarded
@@ -93,16 +102,25 @@ export function useAudioCapture() {
       analyserRef.current = analyser;
       dataRef.current = new Float32Array(analyser.fftSize);
 
+      // Create TimelineEngine for pattern detection
+      const engine = new TimelineEngine();
+      timelineEngineRef.current = engine;
+
+      // Subscribe to engine events
+      const unsub = engine.subscribe((events) => {
+        timelineEventsRef.current = events;
+      });
+
       // ── Try AudioWorklet ─────────────────────────────────────
       let workletUsed = false;
       try {
         const url = new URL(
-          "/audio/stutter-detector.worklet.js",
+          "/audio/telemetry-processor.worklet.js",
           window.location.origin
         );
         await ctx.audioWorklet.addModule(url.href);
 
-        const workletNode = new AudioWorkletNode(ctx, "bolo-stutter-detector", {
+        const workletNode = new AudioWorkletNode(ctx, "bolo-telemetry-processor", {
           numberOfInputs: 1,
           numberOfOutputs: 0,
           channelCount: 1,
@@ -115,8 +133,8 @@ export function useAudioCapture() {
 
           if (msg.type === "pcm") {
             self.current._handlePcmMessage(msg);
-          } else if (msg.type === "candidate" && msg.evt) {
-            self.current._handleCandidateMessage(msg.evt);
+          } else if (msg.type === "frame" && msg.frame) {
+            self.current._handleFrameMessage(msg.frame);
           }
         };
 
@@ -125,12 +143,13 @@ export function useAudioCapture() {
         stutterSupportedRef.current = true;
         workletUsed = true;
 
-        console.log("🎧 AudioWorklet lane ACTIVE — stutter DSP on audio thread");
+        console.log("🎧 Telemetry worklet ACTIVE — physics-based frame classification on audio thread");
       } catch (workletErr) {
         console.warn(
           "AudioWorklet unavailable — falling back to ScriptProcessorNode:",
           workletErr
         );
+        unsub(); // clean up engine subscription since we won't get frames
       }
 
       // ── Fallback: ScriptProcessorNode for PCM ────────────────
@@ -180,7 +199,11 @@ export function useAudioCapture() {
   // ══════════════════════════════════════════════════════════════════
 
   // eslint-disable-next-line @typescript-eslint/no-this-alias
-  const self = useRef({ _handlePcmMessage() {}, _handleCandidateMessage() {} });
+  const self = useRef({
+    _handlePcmMessage(_msg: { t: number; buffer: Float32Array }) {},
+    _handleFrameMessage(_frame: TimelineFrame) {},
+  });
+
   self.current._handlePcmMessage = (msg: { t: number; buffer: Float32Array }) => {
     // Pin clock on first PCM after pinClock() was called
     if (pinPendingRef.current) {
@@ -210,28 +233,25 @@ export function useAudioCapture() {
     }
   };
 
-  self.current._handleCandidateMessage = (evt: StutterCandidate) => {
-    const asrT0 = asrT0Ref.current;
+  self.current._handleFrameMessage = (frame: TimelineFrame) => {
+    // Update live frame state for UI
+    setState((prev) => ({ ...prev, latestFrame: frame }));
 
-    if (asrT0 === null) {
-      // Clock not yet aligned — stash for later
-      pendingCandidatesRaw.current.push({ evt, rawStart: evt.startTime });
-      return;
+    // Feed frame into the timeline engine for pattern detection
+    const engine = timelineEngineRef.current;
+    if (engine) {
+      const asrT0 = asrT0Ref.current;
+      if (asrT0 !== null) {
+        // Convert worklet timestamp to session-relative time
+        const sessionT = frame.t - asrT0;
+        if (sessionT >= 0) {
+          engine.pushFrame({ ...frame, t: sessionT });
+        }
+      } else {
+        // Clock not pinned yet — feed raw timestamp, engine uses relative offsets
+        engine.pushFrame(frame);
+      }
     }
-
-    const sessionStart = evt.startTime - asrT0;
-    if (sessionStart < 0) return; // before ASR started — drop
-
-    const candidate: StutterCandidate = {
-      ...evt,
-      startTime: sessionStart,
-      endTime: evt.endTime - asrT0,
-    };
-    candidatesRef.current = [...candidatesRef.current, candidate];
-    setState((prev) => ({
-      ...prev,
-      stutterCandidates: [...candidatesRef.current],
-    }));
   };
 
   // ── Pin clock to ASR-ready moment ─────────────────────────────────
@@ -254,6 +274,14 @@ export function useAudioCapture() {
     return candidatesRef.current.map((c) => ({ ...c }));
   }, []);
 
+  const getTimelineEngine = useCallback((): TimelineEngine | null => {
+    return timelineEngineRef.current;
+  }, []);
+
+  const getTimelineEvents = useCallback((): StutterCandidate[] => {
+    return [...timelineEventsRef.current];
+  }, []);
+
   // ── Stop ──────────────────────────────────────────────────────────
   const stop = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
@@ -265,6 +293,13 @@ export function useAudioCapture() {
     ctxRef.current?.close();
 
     streamRef.current?.getTracks().forEach((t) => t.stop());
+
+    // Reset the timeline engine
+    if (timelineEngineRef.current) {
+      timelineEngineRef.current.reset();
+      timelineEngineRef.current = null;
+    }
+    timelineEventsRef.current = [];
 
     streamRef.current = null;
     ctxRef.current = null;
@@ -285,6 +320,7 @@ export function useAudioCapture() {
       stream: null,
       stutterSupported: false,
       stutterCandidates: [],
+      latestFrame: null,
       onAudioData: null,
     });
     smoothRef.current = 0;
@@ -301,6 +337,8 @@ export function useAudioCapture() {
     setOnAudioData,
     getAnalyser,
     getStutterCandidates,
+    getTimelineEngine,
+    getTimelineEvents,
     pinClock,
   };
 }

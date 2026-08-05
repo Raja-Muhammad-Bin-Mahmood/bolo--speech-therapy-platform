@@ -3,9 +3,49 @@
  *
  * ONE event model used by every surface: live transcript, script mode,
  * free speech mode, debate mode, review screen, charts and summary cards.
- * The local audio lane (AudioWorklet) posts CANDIDATES; the fusion layer
- * turns them into StutterEvents bound to finalized Speechmatics words.
+ * The local audio lane (AudioWorklet) posts feature FRAMES; the timeline
+ * engine produces CANDIDATES; the fusion layer turns them into StutterEvents
+ * bound to finalized Speechmatics words.
  */
+
+// ─── Frame labels (from the AudioWorklet DSP lane) ───────────────────────
+
+export type FrameLabel =
+  | "SILENCE"
+  | "BREATH"
+  | "FRICATIVE"
+  | "VOICED"
+  | "PLOSIVE_BURST"
+  | "TENSE_HOLD"
+  | "UNKNOWN";
+
+/** A single classified frame from the AudioWorklet (every 10ms). */
+export interface TimelineFrame {
+  /** Seconds since session start (worklet-relative). */
+  t: number;
+  /** Root mean square energy of the frame. */
+  rms: number;
+  /** Change in RMS energy vs the previous frame. */
+  deltaEnergy: number;
+  /** Zero crossing rate (0–1). */
+  zcr: number;
+  /** Spectral flatness (0–1): 0=tonal, 1=noise-like. */
+  spectralFlatness: number;
+  /** Voice activity detection probability (0–1). */
+  vad: number;
+  /** Normalized energy in the 20–80 Hz range. */
+  lowFreqEnergy: number;
+  /** Classified frame label. */
+  label: number;  // enum index matching LABEL const in both worklet and engine
+  /** Human-readable label name. */
+  labelName: FrameLabel;
+  /** Current adaptive noise floor estimate. */
+  rollingNoiseFloor: number;
+  /** RMS / rollingNoiseFloor ratio. */
+  speechRatio: number;
+  /** Whether the VAD state machine considers this "in speech". */
+  voiced: boolean;
+}
 
 // ─── Event types ─────────────────────────────────────────────────────────
 
@@ -15,6 +55,7 @@ export type StutterEventType =
   | "block"
   | "tense_block"
   | "hesitation_sequence"
+  | "possible_false_start"
   | "uncertain";
 
 export type StutterSeverity = "low" | "medium" | "high";
@@ -57,7 +98,8 @@ export const STUTTER_COLORS: Record<StutterEventType, string> = {
   prolongation: "#818CF8", // blue-violet
   block: "#E879F9", // red-violet
   tense_block: "#FB7185", // red / magenta
-  hesitation_sequence: "#FBBF24", // amber-violet → amber
+  hesitation_sequence: "#FBBF24", // amber
+  possible_false_start: "#F472B6", // pink
   uncertain: "#8B93A7", // neutral gray
 };
 
@@ -67,6 +109,7 @@ export const STUTTER_LABELS: Record<StutterEventType, string> = {
   block: "Block",
   tense_block: "Tense start",
   hesitation_sequence: "Hesitation",
+  possible_false_start: "False start",
   uncertain: "Uncertain",
 };
 
@@ -96,6 +139,7 @@ export interface StutterSummary {
   blocks: number;
   tenseBlocks: number;
   hesitationSequences: number;
+  possibleFalseStarts: number;
   /** Events kept below the highlight threshold (uncertain) — counted separately */
   uncertain: number;
   /** Longest event duration in ms */
