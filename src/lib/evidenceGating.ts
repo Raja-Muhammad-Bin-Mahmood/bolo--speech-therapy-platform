@@ -11,11 +11,16 @@
  * Feed and the Review Screen. Only the transcript rendering is filtered —
  * weak/uncertain events are suppressed, the transcript stays readable,
  * alignment is preserved and no placeholder words are ever invented.
+ *
+ * Attribution follows the mission rule: an event is attached to the FIRST
+ * word whose window [word.start − 600ms, word.end + 200ms] fits it
+ * (pre-onset attachment, never overlap-only, never drifting).
  */
 import type { AcousticEvent } from "../hooks/useAcousticAnalysis";
 import type { RecoveredAnnotation } from "./recoveryTypes";
 import type { FeedEvent } from "./feedEvents";
 import type { ScoredEvent } from "./evidenceFusion";
+import { attributedWordIndex, type WordLike } from "./evidenceFusion";
 
 /** A transcript-visible tag decision: keep the tag or downgrade to plain word. */
 export type TagVerdict =
@@ -28,16 +33,26 @@ export type TagVerdict =
  *
  * `scored` is the per-event fusion verdict keyed by `${start.toFixed(3)}-${type}`;
  * an event with no verdict is treated as NOT visible (conservative default).
+ * The event must ALSO be attributed to THIS word via the pre-onset first-word
+ * window — a visible event that belongs to a different word never tags here.
  */
 export function visibleTagFor(
   type: string,
   startTime: number,
-  scored: ScoredEvent[]
+  scored: ScoredEvent[],
+  words?: WordLike[]
 ): TagVerdict {
   const key = `${startTime.toFixed(3)}-${type}`;
   const s = scored.find((x) => x.key === key);
   if (!s) return { keep: false };
-  return s.visible ? { keep: true, type: s.event.type } : { keep: false };
+  if (!s.visible) return { keep: false };
+  if (words && words.length > 0) {
+    const idx = attributedWordIndex(s.event, words);
+    if (idx < 0) return { keep: false };
+    const w = words[idx];
+    if (Math.abs(w.startTime - startTime) > 0.001) return { keep: false };
+  }
+  return { keep: true, type: s.event.type };
 }
 
 /**
@@ -95,18 +110,26 @@ export function visibleFeedEventsFor(
 /**
  * Review-screen helper: should a tagged word KEEP its visible disfluency
  * color? The word keeps its tag only when a visible scored event of the
- * same type overlaps it. Used by the review transcript so the same fusion
- * gate applies everywhere (visible annotations / suppressed candidates are
- * still listed in the evidence panel below).
+ * same type is attributed to it (pre-onset first-word window). Used by the
+ * review transcript so the same fusion gate applies everywhere.
  */
 export function visibleTagForWord(
   word: { startTime: number; endTime: number; tag?: string | null },
-  scored: ScoredEvent[]
+  scored: ScoredEvent[],
+  words?: WordLike[]
 ): boolean {
   if (!word.tag) return false;
   if (scored.length === 0) return true; // no fusion data → keep as-is
+  const wordList = words ?? [];
   for (const s of scored) {
     if (!s.visible || s.event.type !== word.tag) continue;
+    if (wordList.length > 0) {
+      const idx = attributedWordIndex(s.event, wordList);
+      if (idx < 0) continue;
+      if (Math.abs(wordList[idx].startTime - word.startTime) > 0.001) continue;
+      return true;
+    }
+    // Fallback (no word list): timestamp overlap
     const intersect =
       Math.max(0, Math.min(word.endTime, s.event.endTime) - Math.max(word.startTime, s.event.startTime));
     if (intersect > 0) return true;

@@ -1,28 +1,52 @@
 /**
- * BOLO — Confidence & Evidence Fusion Layer
+ * BOLO — Confidence & Evidence Fusion Layer (strict attribution)
  *
  * Sits between the raw acoustic detector and the transcript annotation
  * layer. The base detector is NOT touched: every raw event still reaches
  * the Detection Feed and the Review Screen. This layer ONLY decides
- * whether an event may ALSO become a visible transcript annotation.
+ * whether an event may ALSO become a visible transcript annotation and
+ * WHICH Speechmatics word owns it.
  *
- * Core rule: no single acoustic cue creates a visible annotation.
- * Every raw event collects weighted evidence; weak or mixed evidence
- * stays internal / feed-only.
+ * Core rules (mission):
+ *   - no single acoustic cue creates a visible annotation
+ *   - multiple independent signals must agree
+ *   - visible-confidence threshold is 0.80; medium starts at 0.50
+ *   - attribution is PRE-ONSET, not overlap-only:
+ *       word.start − 600ms … word.end + 200ms
+ *     the FIRST appropriate word owns the event — events never drift to
+ *     later words just because timestamps are closer
+ *   - classification (repetition / prolongation / block / hesitation /
+ *     uncertain) is only assigned when evidence is strong — weak or mixed
+ *     evidence stays `uncertain` (feed/review only)
+ *   - breaths, sniffs, natural pauses and emphasis never render visibly
  *
  * Evidence bands (spec):
- *   0.00–0.39  internal   — kept in logs, never rendered
- *   0.40–0.59  feed       — detection feed only
- *   0.60–0.79  medium     — visible only if independent signals agree
- *   0.80–1.00  strong     — visible annotation
+ *   0.00–0.49  internal/feed — kept in logs + feed, never rendered
+ *   0.50–0.79  medium        — visible only if 3+ independent signals agree
+ *   0.80–1.00  strong        — visible when 2+ independent signals agree
  *
- * The 9 developer sliders map 1:1 onto EvidenceWeights so the team can
- * tune false positives away live — no reload, no rebuild.
+ * The developer sliders map 1:1 onto EvidenceWeights so the team can tune
+ * false positives away live — no reload, no rebuild.
  */
 
 import type { AcousticEvent, AcousticEventType } from "../hooks/useAcousticAnalysis";
 import type { PauseEvent } from "./pauseDetector";
 import type { FeedEvent } from "./feedEvents";
+
+// ─── Spec hard numbers (mission) ─────────────────────────────────────────
+
+export const FUSION_SPEC = {
+  /** Visible-confidence threshold — only ≥ this may render. */
+  VISIBLE_CONFIDENCE: 0.8,
+  /** Medium-confidence threshold — below this the event is feed/internal only. */
+  MEDIUM_CONFIDENCE: 0.5,
+  /** Pre-onset attachment: word start minus 600ms … */
+  PRE_ONSET_ATTACH_S: 0.6,
+  /** … through word end plus 200ms. */
+  POST_ONSET_ATTACH_S: 0.2,
+  /** Timestamp overlap tolerance (±200ms). */
+  TIMESTAMP_TOLERANCE_S: 0.2,
+} as const;
 
 // ─── Tunable weights (live developer panel) ─────────────────────────────
 
@@ -45,6 +69,8 @@ export interface EvidenceWeights {
   recoveryQualityWeight: number;
   /** Weight of the local speaker-cadence baseline signal (0–2). */
   cadenceBaselineWeight: number;
+  /** Weight of the breath/sniff/short-noise suppressor (0–1). */
+  noisePenalty: number;
 }
 
 export const DEFAULT_EVIDENCE_WEIGHTS: EvidenceWeights = {
@@ -53,10 +79,11 @@ export const DEFAULT_EVIDENCE_WEIGHTS: EvidenceWeights = {
   prolongationWeight: 1.0,
   pausePenalty: 0.35,
   lexicalVetoPenalty: 0.3,
-  minVisibleScore: 0.6,
+  minVisibleScore: 0.8, // spec: visible-confidence threshold
   lookaheadMs: 600,
   recoveryQualityWeight: 1.0,
   cadenceBaselineWeight: 1.0,
+  noisePenalty: 0.8,
 };
 
 export const EVIDENCE_WEIGHT_META: Record<
@@ -68,16 +95,31 @@ export const EVIDENCE_WEIGHT_META: Record<
   prolongationWeight: { label: "Prolongation Weight", min: 0, max: 2, step: 0.05, hint: "Scales acoustic evidence for prolongations" },
   pausePenalty: { label: "Pause Penalty", min: 0, max: 1, step: 0.01, hint: "Suppresses events inside natural/thinking pauses" },
   lexicalVetoPenalty: { label: "Lexical Veto Penalty", min: 0, max: 1, step: 0.01, hint: "Suppresses filler words & mid-word dips" },
-  minVisibleScore: { label: "Minimum Visible Score", min: 0.4, max: 0.9, step: 0.01, hint: "Floor for any visible annotation" },
+  minVisibleScore: { label: "Minimum Visible Score", min: 0.4, max: 0.9, step: 0.01, hint: "Floor for any visible annotation (spec default 0.80)" },
   lookaheadMs: { label: "Lookahead Window", min: 100, max: 1200, step: 25, hint: "How far to look for smooth speech resumption (ms)" },
   recoveryQualityWeight: { label: "Recovery Quality Weight", min: 0, max: 2, step: 0.05, hint: "Weight of the recovery-after-event signal" },
   cadenceBaselineWeight: { label: "Cadence Baseline Weight", min: 0, max: 2, step: 0.05, hint: "Weight of the local speaker-cadence signal" },
+  noisePenalty: { label: "Noise Penalty", min: 0, max: 1, step: 0.01, hint: "Suppresses breath/sniff-like and short non-disfluent events" },
 };
 
 // ─── Verdict / output types ─────────────────────────────────────────────
 
 export type EvidenceBand = "internal" | "feed" | "medium" | "strong";
 export type RecoveryLabel = "strong" | "moderate" | "weak" | "none";
+
+/**
+ * Mission classification taxonomy. A SPECIFIC classification is only ever
+ * assigned when the evidence is strong — otherwise the event is `uncertain`
+ * (feed + review only, never a specific visible label).
+ */
+export type RefinedEventType =
+  | "repetition"
+  | "prolongation"
+  | "block"
+  | "hesitation_sequence"
+  | "uncertain";
+
+export type AttachmentPosition = "pre_onset" | "onset" | "inside" | "trailing" | "none";
 
 export interface EvidenceBreakdown {
   /** 0..1 — acoustic magnitude × duration × per-type weight */
@@ -94,6 +136,8 @@ export interface EvidenceBreakdown {
   pausePenaltyHit: number;
   /** 0..1 — how hard the lexical veto hit (0 = no hit) */
   lexicalVetoHit: number;
+  /** 0..1 — how hard the breath/sniff/short-noise penalty hit (0 = no hit) */
+  noisePenaltyHit: number;
 }
 
 export interface ScoredEvent {
@@ -112,12 +156,18 @@ export interface ScoredEvent {
   lexicalVetoApplied: boolean;
   recoveryLabel: RecoveryLabel;
   breakdown: EvidenceBreakdown;
-  /** Speechmatics word the event best aligns with (if any) */
+  /** Speechmatics word the event is ATTACHED to (pre-onset first-word rule) */
   matchedWord?: string;
-  /** 0..1 — alignment strength with the matched word */
+  /** 0..1 — attachment strength with the matched word */
   matchConfidence: number;
-  /** Number of independent signals that agreed (for medium-band visibility) */
+  /** Number of independent signals that agreed (multi-evidence requirement) */
   agreement: number;
+  /** Mission classification — specific ONLY when evidence is strong */
+  refinedType: RefinedEventType;
+  /** Where the event sits relative to its word */
+  attachmentPosition: AttachmentPosition;
+  /** Why this word owns the event (logged for the debugging requirement) */
+  attachmentReason: string;
 }
 
 // ─── Lexical context (weak signals only — never a hard decision) ─────────
@@ -191,57 +241,103 @@ function typeFactor(type: AcousticEventType, w: EvidenceWeights): number {
   }
 }
 
-/** Best word match by timestamp overlap; silent blocks attach to the next onset. */
-function findBestWord(
+/**
+ * WORD ATTRIBUTION — pre-onset, first-word, no drift (mission-critical).
+ *
+ * A stutter usually happens BEFORE the lexical word is finalized
+ * ("s-s-s-" then "slap"). Instead of requiring overlap, each finalized
+ * word owns events inside
+ *     [word.start − 600ms, word.end + 200ms]
+ * The FIRST word (chronological) whose window fits the event owns it —
+ * events never drift to later words just because timestamps are closer.
+ */
+function findAttributedWord(
   evt: AcousticEvent,
   words: WordLike[]
-): { word?: WordLike; confidence: number; position: "onset" | "inside" | "trailing" | "none" } {
-  if (words.length === 0) return { confidence: 0, position: "none" };
-  const evtDur = evt.endTime - evt.startTime;
-  let best: WordLike | null = null;
-  let bestScore = 0;
-  for (const w of words) {
-    const intersect = Math.max(0, Math.min(w.endTime, evt.endTime) - Math.max(w.startTime, evt.startTime));
-    let score = evtDur > 0 ? intersect / evtDur : 0;
-    // Silent block ending right before a word onset attaches to that word
-    if (
-      evt.type === "block" &&
-      score < 0.15 &&
-      w.startTime >= evt.endTime - 0.05 &&
-      w.startTime <= evt.endTime + 0.25
-    ) {
-      score = 0.5;
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      best = w;
-    }
+): { word?: WordLike; position: AttachmentPosition; confidence: number; reason: string } {
+  if (words.length === 0) {
+    return { position: "none", confidence: 0, reason: "no finalized words yet" };
   }
-  if (!best || bestScore < 0.15) {
-    // No real word overlap — a weak transcript anchor
-    const near = words.find(
-      (w) => Math.abs(w.startTime - evt.startTime) < 0.3 || Math.abs(w.endTime - evt.endTime) < 0.3
+  const evtDur = Math.max(0.001, evt.endTime - evt.startTime);
+  const { PRE_ONSET_ATTACH_S, POST_ONSET_ATTACH_S } = FUSION_SPEC;
+
+  for (const w of words) {
+    const inWindow =
+      evt.startTime >= w.startTime - PRE_ONSET_ATTACH_S &&
+      evt.endTime <= w.endTime + POST_ONSET_ATTACH_S;
+    if (!inWindow) continue;
+
+    const overlap = Math.max(
+      0,
+      Math.min(w.endTime, evt.endTime) - Math.max(w.startTime, evt.startTime)
     );
-    return near
-      ? { word: near, confidence: 0.2, position: "inside" }
-      : { confidence: 0, position: "none" };
+    const preGap = w.startTime - evt.endTime; // >0 when the event ends before the word
+
+    // 1) Direct overlap — event covers the word or sits inside it.
+    if (overlap > 0) {
+      const wd = Math.max(0.001, w.endTime - w.startTime);
+      const relStart = (evt.startTime - w.startTime) / wd;
+      const position: AttachmentPosition =
+        relStart <= 0.3 ? "onset" : relStart >= 0.75 ? "trailing" : "inside";
+      const ratio = Math.min(1, overlap / evtDur);
+      return {
+        word: w,
+        position,
+        confidence: 0.5 + 0.5 * ratio,
+        reason: "timestamp overlap",
+      };
+    }
+
+    // 2) Pre-onset — the event ends shortly before (or exactly at) the onset.
+    if (preGap >= -0.05 && preGap <= PRE_ONSET_ATTACH_S) {
+      const proximity = 1 - preGap / PRE_ONSET_ATTACH_S; // 1 when flush with onset
+      return {
+        word: w,
+        position: "pre_onset",
+        confidence: 0.35 + 0.65 * proximity,
+        reason: "pre-onset attachment",
+      };
+    }
   }
 
-  const wd = best.endTime - best.startTime;
-  const relStart = wd > 0 ? (evt.startTime - best.startTime) / wd : 0;
-  const position: "onset" | "inside" | "trailing" =
-    relStart <= 0.3 ? "onset" : relStart >= 0.75 ? "trailing" : "inside";
-  return { word: best, confidence: clamp01(bestScore), position };
+  return { position: "none", confidence: 0, reason: "no word within attachment window" };
 }
 
-function lexicalSignal(word: WordLike, _evt: AcousticEvent, position: "onset" | "inside" | "trailing" | "none"): number {
+/**
+ * Export the pre-onset first-word attribution index for shared consumers
+ * (visible word tags, review transcript, recovery assignment). Returns the
+ * index of the FIRST word whose attachment window
+ *     [word.start − 600ms, word.end + 200ms]
+ * fits the event, or -1 when no word owns it. Events never drift to later
+ * words just because timestamps are closer.
+ */
+export function attributedWordIndex(
+  evt: { startTime: number; endTime: number },
+  words: WordLike[]
+): number {
+  const { PRE_ONSET_ATTACH_S, POST_ONSET_ATTACH_S } = FUSION_SPEC;
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (
+      evt.startTime >= w.startTime - PRE_ONSET_ATTACH_S &&
+      evt.endTime <= w.endTime + POST_ONSET_ATTACH_S
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function lexicalSignal(word: WordLike, position: AttachmentPosition): number {
   // Filler / connector word → weak lexical support
   const clean = word.text.toLowerCase().replace(/[^a-z']/g, "");
   if (LEXICAL_SOFT_WORDS.has(clean)) return 0.25;
-  // Event lands INSIDE a word that continues → weak support (internal dip)
+  // Struggle BEFORE the word onset (incl. silent blocks) — the strong case
+  if (position === "pre_onset" || position === "onset") return 1;
+  // Event lands INSIDE a word that continues → weak support (internal dip =
+  // emphasis / natural vowel shape — "really" spoken normally)
   if (position === "inside") return 0.45;
   if (position === "trailing") return 0.6;
-  if (position === "onset") return 1; // onset struggle — the strong case
   return 0.2;
 }
 
@@ -256,6 +352,34 @@ function pausePenaltySignal(evt: AcousticEvent, pauses: PauseEvent[]): number {
     if (!overlaps) continue;
     const strength = p.type === "natural" ? 1 : 0.75;
     hit = Math.max(hit, strength);
+  }
+  return hit;
+}
+
+/**
+ * Breath / sniff / short-noise discriminator. A real disfluency is a
+ * PATTERN of multiple cues; a single fricative-like sound, a single short
+ * delayed onset or a single energy dip is not enough to be visible.
+ */
+function noisePenaltySignal(evt: AcousticEvent, position: AttachmentPosition): number {
+  let hit = 0;
+  const dur = evt.durationMs;
+  // Fricative-like micro-events too short to be a real stutter pattern —
+  // the shape of a sniff / breath noise.
+  if ((evt.type === "stutter" || evt.type === "stammer") && dur < 300 && evt.acoustic < 0.6) {
+    hit = Math.max(hit, 0.8);
+  }
+  // A single short delayed onset is not a block.
+  if (evt.type === "block" && dur < 250) {
+    hit = Math.max(hit, 0.7);
+  }
+  // A prolongation below the spec's 350ms floor is not a prolongation.
+  if (evt.type === "prolongation" && dur < 350) {
+    hit = Math.max(hit, 0.6);
+  }
+  // No word anchor at all — the event sits in a gap (breath between words).
+  if (position === "none") {
+    hit = Math.max(hit, 0.5);
   }
   return hit;
 }
@@ -291,9 +415,23 @@ function cadenceSignal(evt: AcousticEvent, words: WordLike[]): number {
 
 function bandFromScore(score: number): EvidenceBand {
   if (score < 0.4) return "internal";
-  if (score < 0.6) return "feed";
-  if (score < 0.8) return "medium";
+  if (score < FUSION_SPEC.MEDIUM_CONFIDENCE) return "feed";
+  if (score < FUSION_SPEC.VISIBLE_CONFIDENCE) return "medium";
   return "strong";
+}
+
+/** Mission taxonomy — a specific classification requires STRONG evidence. */
+const MISSION_MAP: Record<AcousticEventType, RefinedEventType> = {
+  repetition: "repetition",
+  prolongation: "prolongation",
+  block: "block",
+  stutter: "repetition", // repeated onset shape (s-s-s-)
+  stammer: "prolongation", // sustained sound (ssssss)
+};
+
+function refineType(evt: AcousticEvent, band: EvidenceBand): RefinedEventType {
+  if (band !== "strong") return "uncertain";
+  return MISSION_MAP[evt.type] ?? "uncertain";
 }
 
 /**
@@ -323,9 +461,9 @@ export function scoreEvent(
     onsetShape = clamp01((evt.confidence - 0.5) * 2);
   }
 
-  // ── 3) Transcript support + lexical context ────────────────────
-  const match = findBestWord(evt, words);
-  const lexical = match.word ? lexicalSignal(match.word, evt, match.position) : 0.15;
+  // ── 3) Transcript support + lexical context (PRE-ONSET attribution) ──
+  const match = findAttributedWord(evt, words);
+  const lexical = match.word ? lexicalSignal(match.word, match.position) : 0.15;
   const transcriptSupport = clamp01(match.confidence * lexical);
 
   // ── 4) Recovery quality (look-ahead for smooth resumption) ──────
@@ -351,35 +489,41 @@ export function scoreEvent(
       lexicalVetoApplied = true;
     }
   }
+  const noiseHit = noisePenaltySignal(evt, match.position);
 
-  // ── Weighted fusion ─────────────────────────────────────────────
+  // ── Weighted fusion (rebalanced: no single cue can reach the floor) ──
   const pos =
-    0.4 * acousticSignal +
-    0.1 * onsetShape +
-    0.1 * transcriptSupport +
-    0.15 * weights.recoveryQualityWeight * rec.quality +
+    0.35 * acousticSignal +
+    0.15 * onsetShape +
+    0.15 * transcriptSupport +
+    0.2 * weights.recoveryQualityWeight * rec.quality +
     0.15 * weights.cadenceBaselineWeight * cadence;
 
-  const penalty = weights.pausePenalty * pauseHit + weights.lexicalVetoPenalty * lexicalVetoHit;
+  const penalty =
+    weights.pausePenalty * pauseHit +
+    weights.lexicalVetoPenalty * lexicalVetoHit +
+    weights.noisePenalty * noiseHit;
   const evidenceScore = clamp01(pos - penalty);
 
   // ── Band + visibility ───────────────────────────────────────────
   const band = bandFromScore(evidenceScore);
 
-  // Independent-signal agreement (medium band needs agreement to go visible)
+  // Independent-signal agreement (multi-evidence requirement):
+  //   strong band → needs ≥ 2 signals; medium band → needs ≥ 3.
   let agreement = 0;
   if (transcriptSupport >= 0.5) agreement++;
   if (onsetShape >= 0.5) agreement++;
   if (rec.quality >= 0.5) agreement++;
   if (acousticSignal >= 0.6) agreement++;
+  if (cadence >= 0.5) agreement++;
 
-  let visible: boolean;
+  let visible = false;
   if (evidenceScore < weights.minVisibleScore) {
     visible = false;
   } else if (band === "strong") {
-    visible = true;
-  } else if (band === "medium") {
     visible = agreement >= 2;
+  } else if (band === "medium") {
+    visible = agreement >= 3;
   } else {
     visible = false;
   }
@@ -392,8 +536,11 @@ export function scoreEvent(
     if (evidenceScore < weights.minVisibleScore) {
       reasons.push(`Below minimum visible score (${(weights.minVisibleScore * 100).toFixed(0)}%)`);
     }
-    if (band === "medium" && evidenceScore >= weights.minVisibleScore && agreement < 2) {
-      reasons.push("Medium evidence but independent signals disagree — feed only");
+    if (band === "strong" && agreement < 2) {
+      reasons.push("Strong magnitude but independent signals disagree — feed only");
+    }
+    if (band === "medium" && agreement < 3) {
+      reasons.push("Medium evidence — needs 3+ independent signals to render");
     }
     if (pauseHit > 0) {
       reasons.push(pauseHit >= 1 ? "Inside a natural sentence-boundary pause" : "Inside a short thinking pause");
@@ -404,6 +551,9 @@ export function scoreEvent(
           ? `Lexical veto: "${match.word.text}" is a connector/filler`
           : "Event landed inside a word that continued smoothly"
       );
+    }
+    if (noiseHit > 0) {
+      reasons.push("Looks like a breath/sniff or a single short non-disfluent cue");
     }
     if (rec.label === "none" || rec.label === "weak") {
       reasons.push("Weak recovery — speech did not resume promptly");
@@ -429,10 +579,14 @@ export function scoreEvent(
       cadenceBaseline: cadence,
       pausePenaltyHit: pauseHit,
       lexicalVetoHit,
+      noisePenaltyHit: noiseHit,
     },
     matchedWord: match.word?.text,
     matchConfidence: match.confidence,
     agreement,
+    refinedType: refineType(evt, band),
+    attachmentPosition: match.position,
+    attachmentReason: match.reason,
   };
 }
 

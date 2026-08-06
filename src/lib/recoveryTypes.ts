@@ -68,6 +68,11 @@ export function bandFromConfidence(c: number): ConfidenceBand {
 /** ±200ms timestamp overlap tolerance (spec) */
 export const TIMESTAMP_TOLERANCE_S = 0.2;
 
+/** Pre-onset attribution: word start minus 600ms (mission spec) */
+export const PRE_ONSET_ATTACH_S = 0.6;
+/** Pre-onset attribution: word end plus 200ms (mission spec) */
+export const POST_ONSET_S = 0.2;
+
 // ─── Spec hard numbers: extraction window ─────────────────────────────────
 
 export const PREROLL_S = 0.25; // 200–300ms preroll before the event
@@ -148,10 +153,13 @@ export interface RecoveredAssignment {
 }
 
 /**
- * Attach each "attached" annotation to its single best-matching word span by
- * timestamp overlap (±200ms tolerance; silent blocks attach to the following
- * word). "Recovered"/"unresolved" annotations have no lexical word and are
- * returned as standalone tokens for the renderer to insert inline.
+ * Attach each "attached" annotation to its word span using the mission's
+ * PRE-ONSET first-word window:
+ *     [word.start − 600ms, word.end + 200ms]
+ * The FIRST word whose window fits the annotation owns it (annotations never
+ * drift to later words just because timestamps are closer). "Recovered" /
+ * "unresolved" annotations have no lexical word and are returned as
+ * standalone tokens for the renderer to insert inline.
  */
 export function assignRecoveredToSpans<T extends TimedSpan>(
   recs: RecoveredAnnotation[],
@@ -167,32 +175,16 @@ export function assignRecoveredToSpans<T extends TimedSpan>(
       continue;
     }
     let bestIdx = -1;
-    let bestScore = 0;
     for (let i = 0; i < spans.length; i++) {
       const s = spans[i];
-      const overlap = Math.max(
-        0,
-        Math.min(s.endTime, rec.endTime) - Math.max(s.startTime, rec.startTime)
-      );
-      const proximity = Math.abs(s.startTime - rec.startTime);
-      let score = overlap;
-      // Silent block that ends right before a word onset attaches to that word
-      if (
-        rec.type === "block" &&
-        s.startTime >= rec.endTime - 0.05 &&
-        s.startTime <= rec.endTime + TIMESTAMP_TOLERANCE_S
-      ) {
-        score = Math.max(score, 0.05);
-      }
-      if (overlap <= 0 && proximity <= TIMESTAMP_TOLERANCE_S) {
-        score = Math.max(score, 0.02);
-      }
-      if (score > bestScore) {
-        bestScore = score;
-        bestIdx = i;
-      }
+      const inWindow =
+        rec.startTime >= s.startTime - PRE_ONSET_ATTACH_S &&
+        rec.endTime <= s.endTime + POST_ONSET_S;
+      if (!inWindow) continue;
+      bestIdx = i; // FIRST matching span — pre-onset first-word rule
+      break;
     }
-    if (bestIdx >= 0 && bestScore >= 0.02) {
+    if (bestIdx >= 0) {
       attachedBySpan[bestIdx] = rec;
     } else {
       standalone.push(rec);

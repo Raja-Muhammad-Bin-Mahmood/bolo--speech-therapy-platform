@@ -330,6 +330,17 @@ export default function Analysis() {
     );
   }, [rawFusionEvents, taggedWords, sortedPauses, weights]);
 
+  // Word list for attribution-aware review gating (pre-onset first-word rule).
+  const reviewWords = useMemo(
+    () =>
+      taggedWords.map((w) => ({
+        text: w.word,
+        startTime: w.startTime,
+        endTime: w.endTime,
+      })),
+    [taggedWords]
+  );
+
   // Reconstruct the annotated transcript by merging tagged words with
   // scoreable pause badges (same approach as the live view) + recovery
   // annotations (Stage 3).
@@ -987,7 +998,7 @@ export default function Analysis() {
                         )}
                         <span
                           className={`inline-block rounded px-1 transition-colors ${
-                            item.tag && visibleTagForWord(item, scored)
+                            item.tag && visibleTagForWord(item, scored, reviewWords)
                               ? `${TAG_STYLES[item.tag] ?? ""} underline decoration-dotted underline-offset-2`
                               : ""
                           }`}

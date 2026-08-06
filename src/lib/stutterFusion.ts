@@ -112,27 +112,26 @@ export function fuseStutterEvents(input: FuseInput): FuseResult {
   }
 
   // ── Stage 2: bind to words ────────────────────────────────────────
+  // Mission rule: PRE-ONSET first-word attachment — the FIRST word whose
+  // window [word.start − 600ms, word.end + 200ms] fits the event owns it.
+  // Events never drift to later words just because timestamps are closer.
   for (const evt of prelim) {
     let best: FinalWord | null = null;
     let bestScore = 0;
 
     for (const w of words) {
-      // Direct overlap
+      const inWindow =
+        evt.startTime >= w.startTime - 0.6 &&
+        evt.endTime <= w.endTime + 0.2;
+      if (!inWindow) continue;
+      // Direct overlap is the strongest anchor
       const ratio = overlapRatio(evt.startTime, evt.endTime, w.startTime, w.endTime);
-      let score = ratio;
-      // Events occurring just BEFORE a word onset (block/tense/false_start) attach to it
-      if (
-        score < 0.3 &&
-        (evt.eventType === "block" || evt.eventType === "tense_block" || evt.eventType === "possible_false_start") &&
-        w.startTime >= evt.endTime - 0.05 &&
-        w.startTime <= evt.endTime + 0.25
-      ) {
-        score = 0.6;
-      }
+      const score = ratio > 0 ? ratio : 0.5; // pre-onset within window
       if (score > bestScore) {
         bestScore = score;
         best = w;
       }
+      if (best) break; // FIRST appropriate word owns the event — no drift
     }
 
     if (best && bestScore >= 0.3) {

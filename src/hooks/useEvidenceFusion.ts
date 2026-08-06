@@ -6,6 +6,8 @@
  *     (the base detector output is NEVER modified — we only read it)
  *   • reports the live verdicts to the developer tuning panel
  *   • builds the gated word-tags for the visible transcript
+ *   • writes structured fusion logs (candidate / word / decision) so the
+ *     team can always answer "why was this shown or suppressed?"
  *
  * Slider changes in the dev panel flow through the context and take
  * effect on the very next render — no reload, no rebuild.
@@ -18,14 +20,19 @@ import type { DisfluencyTag } from "./useSessionAnalysis";
 import {
   scoreAcousticEvents,
   wordsFromTranscripts,
+  attributedWordIndex,
   type EvidenceWeights,
   type ScoredEvent,
+  type WordLike,
 } from "../lib/evidenceFusion";
+import { logFusionBatch, type LoggableScored } from "../lib/fusionLog";
 import { useEvidenceTuning } from "../context/EvidenceTuningContext";
 
 export interface FusionGates {
   /** Full fusion verdicts (feed, review and dev panel all use these). */
   scored: ScoredEvent[];
+  /** Deduped finalized words — used by attribution-aware renderers. */
+  words: WordLike[];
 }
 
 /**
@@ -42,7 +49,7 @@ export function useEvidenceFusion(
   return useMemo(() => {
     const words = wordsFromTranscripts(transcripts);
     const scored = scoreAcousticEvents(acousticEvents, { words, pauses }, weights);
-    return { scored };
+    return { scored, words };
   }, [transcripts, acousticEvents, pauses, weights]);
 }
 
@@ -68,23 +75,56 @@ export function useLiveEvidenceFusion(
     if (gates.scored.length > 0) reportScored(gates.scored);
   }, [gates.scored, reportScored]);
 
+  // Structured fusion log (bounded ring, console-mirrored). Logs every
+  // finalized word + every scored candidate with its attachment decision,
+  // suppression reason and visible/hidden result. Idempotent (words deduped
+  // by key; candidates carry stable keys).
+  useEffect(() => {
+    if (gates.scored.length === 0 && gates.words.length === 0) return;
+    const scored: LoggableScored[] = gates.scored.map((s) => ({
+      key: s.key,
+      event: {
+        type: s.event.type,
+        startTime: s.event.startTime,
+        endTime: s.event.endTime,
+        durationMs: s.event.durationMs,
+        confidence: s.event.confidence,
+      },
+      evidenceScore: s.evidenceScore,
+      band: s.band,
+      refinedType: s.refinedType,
+      matchedWord: s.matchedWord,
+      attachmentPosition: s.attachmentPosition,
+      attachmentReason: s.attachmentReason,
+      visible: s.visible,
+      suppressionReasons: s.suppressionReasons,
+      agreement: s.agreement,
+    }));
+    logFusionBatch(gates.words, scored);
+  }, [gates.scored, gates.words]);
+
   return gates;
 }
 
 /**
  * Build the gated tag map for finalized words: wordKey → tag.
- * Contains ONLY tags that passed the fusion layer — a suppressed event's
+ * Contains ONLY tags that passed the fusion layer AND are attributed to
+ * that exact word (pre-onset first-word window) — a suppressed event's
  * key is simply absent, so the word renders as a plain word. This is a
  * drop-in for the raw analysis.wordTags used by the transcript renderers.
  */
 export function buildVisibleTags(
   transcripts: TranscriptChunk[],
-  scored: ScoredEvent[]
+  scored: ScoredEvent[],
+  words?: WordLike[]
 ): Map<string, DisfluencyTag> {
   const out = new Map<string, DisfluencyTag>();
   if (scored.length === 0) return out;
 
   const visible = scored.filter((s) => s.visible);
+  if (visible.length === 0) return out;
+
+  const wordList: WordLike[] = words ?? wordsFromTranscripts(transcripts);
 
   for (const chunk of transcripts) {
     if (!chunk.isFinal) continue;
@@ -92,15 +132,25 @@ export function buildVisibleTags(
       const ww = w as { text?: string; word?: string; startTime: number; endTime: number };
       const key = `${Math.round(ww.startTime * 1000)}-${Math.round(ww.endTime * 1000)}`;
 
-      // Strongest visible event overlapping this word
+      // Strongest visible event ATTRIBUTED to this word (pre-onset window).
       let best: ScoredEvent | null = null;
       for (const s of visible) {
-        const intersect =
-          Math.max(0, Math.min(ww.endTime, s.event.endTime) - Math.max(ww.startTime, s.event.startTime));
-        if (intersect <= 0) continue;
+        const idx = attributedWordIndex(s.event, wordList);
+        if (idx < 0) continue;
+        if (Math.abs(wordList[idx].startTime - ww.startTime) > 0.001) continue;
         if (!best || s.evidenceScore > best.evidenceScore) best = s;
       }
-      if (best) out.set(key, best.event.type as DisfluencyTag);
+      if (best) {
+        // Map the mission classification back onto the render vocabulary.
+        // `hesitation_sequence` never comes from a single detector event
+        // (no acoustic type maps to it), so fall back to the raw type.
+        const refined = best.refinedType;
+        const tag: DisfluencyTag =
+          refined === "uncertain" || refined === "hesitation_sequence"
+            ? best.event.type
+            : refined;
+        out.set(key, tag);
+      }
     }
   }
   return out;
