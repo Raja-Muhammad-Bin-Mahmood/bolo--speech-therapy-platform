@@ -12,6 +12,7 @@ import {
   useCallback,
   useContext,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -39,6 +40,15 @@ export function EvidenceTuningProvider({ children }: { children: ReactNode }) {
   const [weights, setWeights] = useState<EvidenceWeights>(DEFAULT_EVIDENCE_WEIGHTS);
   const [recent, setRecent] = useState<ScoredEvent[]>([]);
 
+  // Signature guard for reportScored: skips the setState entirely when the
+  // incoming batch is identical to the last one we merged. This keeps the
+  // telemetry write idempotent — the same events arriving on consecutive
+  // renders (or from a render-phase call) can never schedule a redundant
+  // provider update, which is what tripped React's "Cannot update a
+  // component while rendering a different component" warning.
+  const lastReportedRef = useRef("");
+  const pendingRef = useRef<ScoredEvent[]>([]);
+
   const setWeight = useCallback((key: keyof EvidenceWeights, value: number) => {
     setWeights((prev) => ({ ...prev, [key]: value }));
   }, []);
@@ -49,13 +59,24 @@ export function EvidenceTuningProvider({ children }: { children: ReactNode }) {
 
   const reportScored = useCallback((scored: ScoredEvent[]) => {
     if (scored.length === 0) return;
-    setRecent((prev) => {
-      const merged = new Map<string, ScoredEvent>();
-      // Newest first
-      for (const s of scored) merged.set(s.key, s);
-      for (const p of prev) if (!merged.has(p.key)) merged.set(p.key, p);
-      return [...merged.values()].slice(0, MAX_RECENT);
-    });
+
+    // Batch identity: sorted stable keys. New events (new timestamps) change
+    // the signature; identical events short-circuit to avoid redundant renders.
+    const signature = scored
+      .map((s) => s.key)
+      .sort()
+      .join("|");
+    if (signature === lastReportedRef.current) return;
+    lastReportedRef.current = signature;
+
+    // Merge with the previous batch (keeps a rolling window, newest first).
+    const merged = new Map<string, ScoredEvent>();
+    for (const s of scored) merged.set(s.key, s);
+    for (const p of pendingRef.current) if (!merged.has(p.key)) merged.set(p.key, p);
+
+    const next = [...merged.values()].slice(0, MAX_RECENT);
+    pendingRef.current = next;
+    setRecent(next);
   }, []);
 
   const clearRecent = useCallback(() => setRecent([]), []);
