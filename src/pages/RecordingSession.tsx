@@ -34,6 +34,7 @@ import NeonTimer from "../components/NeonTimer";
 import PaceMeter from "../components/PaceMeter";
 import RecordButton from "../components/RecordButton";
 import SensorSidebar from "../components/SensorSidebar";
+import TelemetryPanel from "../components/TelemetryPanel";
 import { useAudioCapture } from "../hooks/useAudioCapture";
 import { useAnalyserSensor } from "../hooks/useAnalyserSensor";
 import { useSpeechmaticsWS } from "../hooks/useSpeechmaticsWS";
@@ -396,6 +397,11 @@ export default function RecordingSession() {
           >
             {/* Glass overlay */}
             <div className="fixed inset-0 bg-deep-space/40 backdrop-blur-[2px]" />
+
+            {/* Developer telemetry rail — LEFT edge: live ΔE / ZCR / RMS
+                meters + detection counters. Same physics that drive the
+                stutter/stammer detector. Coexists with the main UI. */}
+            <TelemetryPanel sensor={sensor} isRecording={isRecording} />
 
             <div className="relative z-10 flex flex-col min-h-full pt-16 pb-8 px-4 md:px-8 max-w-3xl mx-auto">
               {/* ── Header ─────────────────────────────────── */}

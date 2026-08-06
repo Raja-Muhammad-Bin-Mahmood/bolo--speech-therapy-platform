@@ -6,7 +6,9 @@
  * a lightweight tension detector on those SAME values:
  *
  *   • STUTTER  — ≥3 tight energy bursts (RMS spikes) with elevated ZCR,
- *                spaced 60–260ms apart inside an 800ms window.
+ *                spaced 60–260ms apart inside an 800ms window. A sudden ΔE
+ *                spike (plosive onset, acoustic rule PLOSIVE_BURST) also
+ *                registers as a burst.
  *   • STAMMER  — sustained high RMS + elevated ZCR (fricative / tense hold)
  *                lasting 200–650ms.
  *
@@ -18,12 +20,22 @@ import { useRef, useCallback, useEffect, useState } from "react";
 import type { LiveSensorState } from "./useLiveSensor";
 import type { AcousticEvent } from "./useAcousticAnalysis";
 
-// ─── Live meter state (compatible with SensorSidebar) ───────────────────
+// ─── Live meter state (compatible with SensorSidebar / TelemetryPanel) ───
 
-const INITIAL: LiveSensorState = {
+interface AnalyserSensorState extends LiveSensorState {
+  /** Unscaled values exposed for the developer telemetry rail. */
+  rawRms: number;
+  rawZcr: number;
+  rawDeltaEnergy: number;
+}
+
+const INITIAL: AnalyserSensorState = {
   currentRms: 0,
   currentZcr: 0,
   currentDeltaEnergy: 0,
+  rawRms: 0,
+  rawZcr: 0,
+  rawDeltaEnergy: 0,
   isActive: false,
   isReady: false,
 };
@@ -60,7 +72,7 @@ export function useAnalyserSensor(
   getAnalyser: () => AnalyserNode | null,
   active: boolean
 ) {
-  const [state, setState] = useState<LiveSensorState>(INITIAL);
+  const [state, setState] = useState<AnalyserSensorState>(INITIAL);
   const [events, setEvents] = useState<AcousticEvent[]>([]);
   const eventsRef = useRef<AcousticEvent[]>([]);
 
@@ -85,72 +97,84 @@ export function useAnalyserSensor(
   const stammerPeakRef = useRef(0);
 
   // ── Detection core ────────────────────────────────────────────────────
-  const detect = useCallback((t: number, rms: number, zcr: number) => {
-    const floor = Math.max(RMS_FLOOR, floorRef.current);
-    const voiceRms = Math.max(VOICE_FLOOR, floor * 2.2);
+  const detect = useCallback(
+    (t: number, rms: number, zcr: number, delta: number) => {
+      const floor = Math.max(RMS_FLOOR, floorRef.current);
+      const voiceRms = Math.max(VOICE_FLOOR, floor * 2.2);
 
-    // ── Burst machine (stutter pattern) ─────────────────────────────
-    const inBurst =
-      rms > Math.max(voiceRms * 1.4, floor * BURST_RMS_FACTOR) &&
-      zcr > BURST_ZCR_MIN;
+      // ── Burst machine (stutter pattern) ─────────────────────────────
+      // A burst is a loud, noisy onset — OR a sudden ΔE spike (plosive
+      // onset, acoustic rule PLOSIVE_BURST).
+      const inBurst =
+        (rms > Math.max(voiceRms * 1.4, floor * BURST_RMS_FACTOR) &&
+          zcr > BURST_ZCR_MIN) ||
+        delta > floor * 3; // PLOSIVE_BURST: ΔE > 3 × E_floor
 
-    if (inBurst) {
-      if (!inBurstRef.current) burstStartRef.current = t;
-      inBurstRef.current = true;
-    } else if (inBurstRef.current) {
-      inBurstRef.current = false;
-      const durMs = (t - burstStartRef.current) * 1000;
+      if (inBurst) {
+        if (!inBurstRef.current) burstStartRef.current = t;
+        inBurstRef.current = true;
+      } else if (inBurstRef.current) {
+        inBurstRef.current = false;
+        const durMs = (t - burstStartRef.current) * 1000;
 
-      if (durMs >= BURST_MIN_MS && durMs <= BURST_MAX_MS) {
-        const bursts = burstRef.current;
-        const last = bursts.length > 0 ? bursts[bursts.length - 1] : null;
-        const gapMs = last ? (burstStartRef.current - last.end) * 1000 : Infinity;
+        if (durMs >= BURST_MIN_MS && durMs <= BURST_MAX_MS) {
+          const bursts = burstRef.current;
+          const last = bursts.length > 0 ? bursts[bursts.length - 1] : null;
+          const gapMs = last
+            ? (burstStartRef.current - last.end) * 1000
+            : Infinity;
 
-        if (last && gapMs >= GAP_MIN_MS && gapMs <= GAP_MAX_MS) {
-          bursts.push({
-            start: burstStartRef.current,
-            end: t,
-            durMs: Math.round(durMs),
-          });
+          if (last && gapMs >= GAP_MIN_MS && gapMs <= GAP_MAX_MS) {
+            bursts.push({
+              start: burstStartRef.current,
+              end: t,
+              durMs: Math.round(durMs),
+            });
 
-          if (bursts.length >= MIN_BURSTS) {
-            const spanMs = (t - bursts[0].start) * 1000;
-            if (spanMs <= STUTTER_WINDOW_MS) {
-              emitEvent("stutter", bursts[0].start, t);
-              burstRef.current = [bursts[bursts.length - 1]];
+            if (bursts.length >= MIN_BURSTS) {
+              const spanMs = (t - bursts[0].start) * 1000;
+              if (spanMs <= STUTTER_WINDOW_MS) {
+                emitEvent("stutter", bursts[0].start, t);
+                burstRef.current = [bursts[bursts.length - 1]];
+              }
             }
+          } else {
+            // Gap too big or first burst — (re)start the pattern
+            if (last && gapMs > GAP_MAX_MS) burstRef.current = [];
+            burstRef.current = [
+              ...burstRef.current,
+              {
+                start: burstStartRef.current,
+                end: t,
+                durMs: Math.round(durMs),
+              },
+            ];
+            if (burstRef.current.length > 6) burstRef.current.shift();
           }
         } else {
-          // Gap too big or first burst — (re)start the pattern
-          if (last && gapMs > GAP_MAX_MS) burstRef.current = [];
-          burstRef.current = [
-            ...burstRef.current,
-            { start: burstStartRef.current, end: t, durMs: Math.round(durMs) },
-          ];
-          if (burstRef.current.length > 6) burstRef.current.shift();
+          // Run too short/long for a stutter burst — discard the pattern
+          burstRef.current = [];
         }
-      } else {
-        // Run too short/long for a stutter burst — discard the pattern
-        burstRef.current = [];
       }
-    }
 
-    // ── Stammer machine (sustained tense hold) ──────────────────────
-    const tense = rms > voiceRms * 1.15 && zcr > STAMMER_ZCR_MIN;
-    if (tense) {
-      if (stammerStartRef.current === 0) stammerStartRef.current = t;
-      stammerPeakRef.current = Math.max(stammerPeakRef.current, rms);
-    } else if (stammerStartRef.current > 0) {
-      const durMs = (t - stammerStartRef.current) * 1000;
-      const sustained =
-        stammerPeakRef.current > voiceRms * STAMMER_RMS_FACTOR * 0.6;
-      if (durMs >= STAMMER_MIN_MS && durMs <= STAMMER_MAX_MS && sustained) {
-        emitEvent("stammer", stammerStartRef.current, t);
+      // ── Stammer machine (sustained tense hold) ──────────────────────
+      const tense = rms > voiceRms * 1.15 && zcr > STAMMER_ZCR_MIN;
+      if (tense) {
+        if (stammerStartRef.current === 0) stammerStartRef.current = t;
+        stammerPeakRef.current = Math.max(stammerPeakRef.current, rms);
+      } else if (stammerStartRef.current > 0) {
+        const durMs = (t - stammerStartRef.current) * 1000;
+        const sustained =
+          stammerPeakRef.current > voiceRms * STAMMER_RMS_FACTOR * 0.6;
+        if (durMs >= STAMMER_MIN_MS && durMs <= STAMMER_MAX_MS && sustained) {
+          emitEvent("stammer", stammerStartRef.current, t);
+        }
+        stammerStartRef.current = 0;
+        stammerPeakRef.current = 0;
       }
-      stammerStartRef.current = 0;
-      stammerPeakRef.current = 0;
-    }
-  }, []);
+    },
+    []
+  );
 
   // ── Emit with de-dupe ────────────────────────────────────────────────
   const emitEvent = useCallback(
@@ -214,7 +238,7 @@ export function useAnalyserSensor(
         ring.shift();
       }
 
-      detect(t, rms, zcr);
+      detect(t, rms, zcr, delta);
 
       // Throttle React updates to ~30fps
       frameCountRef.current++;
@@ -223,6 +247,9 @@ export function useAnalyserSensor(
           currentRms: Math.min(1, rms * 2.5),
           currentZcr: Math.min(1, zcr),
           currentDeltaEnergy: Math.min(1, Math.abs(delta) * 5),
+          rawRms: rms,
+          rawZcr: zcr,
+          rawDeltaEnergy: delta,
           isActive: true,
           isReady: true,
         });
