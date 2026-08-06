@@ -49,8 +49,10 @@ import {
 } from "../hooks/useSessionAnalysis";
 import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
 import { useStutterRecovery } from "../hooks/useStutterRecovery";
+import { useLiveEvidenceFusion, buildVisibleTags } from "../hooks/useEvidenceFusion";
 import { useAuth } from "../context/AuthContext";
 import { toFeedEvents } from "../lib/feedEvents";
+import { visibleRecoveredFor, visibleFeedEventsFor } from "../lib/evidenceGating";
 
 type Phase = "topic" | "recording" | "processing";
 
@@ -122,6 +124,37 @@ export default function RecordingSession() {
   const feedEvents = useMemo(
     () => toFeedEvents([...acoustic.events, ...sensor.events]),
     [acoustic.events, sensor.events]
+  );
+
+  // ── Evidence Fusion Layer: scores every raw event and gates what may
+  // become a VISIBLE transcript annotation. The base detector output is
+  // never modified — raw events still reach the Detection Feed below and
+  // the full review on /analysis. ─────────────────────────────────────
+  const allAcoustic = useMemo(
+    () => [...acoustic.events, ...sensor.events],
+    [acoustic.events, sensor.events]
+  );
+  const fusion = useLiveEvidenceFusion(ws.transcripts, allAcoustic, analysis.pauseEvents);
+
+  // Gated word-tags for the visible transcript (suppressed events render
+  // as plain words). The Review Screen still receives the full raw tags.
+  const gatedWordTags = useMemo(
+    () => buildVisibleTags(ws.transcripts, fusion.scored),
+    [ws.transcripts, fusion.scored]
+  );
+
+  // Recovery annotations whose source event passed the fusion layer.
+  // Suppressed annotations stay in the feed + review, not the transcript.
+  const gatedRecovered = useMemo(
+    () => visibleRecoveredFor(recovery.annotations, fusion.scored),
+    [recovery.annotations, fusion.scored]
+  );
+
+  // Inline transcript chips: only visible events. The Detection Feed
+  // (tickerItems below) still renders EVERY raw event — it is separate.
+  const gatedFeedForTranscript = useMemo(
+    () => visibleFeedEventsFor(feedEvents, fusion.scored),
+    [feedEvents, fusion.scored]
   );
 
   // ── Fused sensor events feed (stutter/stammer from RMS+ZCR) ─────────
@@ -596,10 +629,10 @@ export default function RecordingSession() {
                 </div>
                 <TranscriptionChunks
                   transcripts={ws.transcripts}
-                  wordTags={analysis.wordTags}
+                  wordTags={gatedWordTags}
                   pauseEvents={analysis.pauseEvents}
-                  events={feedEvents}
-                  recovered={recovery.annotations}
+                  events={gatedFeedForTranscript}
+                  recovered={gatedRecovered}
                 />
               </div>
 

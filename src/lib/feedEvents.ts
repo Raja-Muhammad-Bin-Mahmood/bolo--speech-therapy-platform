@@ -23,6 +23,15 @@ export interface FeedEvent {
   startTime: number;
   endTime: number;
   durationMs: number;
+  /**
+   * Evidence-fusion metadata (added by the fusion layer; purely additive).
+   * The Detection Feed always shows EVERY raw event — these fields only
+   * label how the fusion layer treated it for the transcript.
+   */
+  band?: "internal" | "feed" | "medium" | "strong";
+  suppressed?: boolean;
+  visible?: boolean;
+  evidenceScore?: number;
 }
 
 export const FEED_LABELS: Record<AcousticEventType, string> = {

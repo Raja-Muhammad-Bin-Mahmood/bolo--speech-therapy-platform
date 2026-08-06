@@ -14,6 +14,7 @@ import {
   Activity,
 } from "lucide-react";
 import Navbar from "../components/Navbar";
+import EvidenceReviewPanel from "../components/EvidenceReviewPanel";
 import type { SensorSession } from "../lib/sensorTypes";
 import FeedChip from "../components/FeedChip";
 import StutterSpan from "../components/StutterSpan";
@@ -26,6 +27,9 @@ import {
   buildRecoveredItems,
 } from "../lib/recoveryRender";
 import type { RecoveredAnnotation } from "../lib/recoveryTypes";
+import { scoreAcousticEvents, type ScoredEvent } from "../lib/evidenceFusion";
+import { useEvidenceTuning } from "../context/EvidenceTuningContext";
+import { visibleTagForWord } from "../lib/evidenceGating";
 
 // ─── Stat Card ──────────────────────────────────────────────────────────
 

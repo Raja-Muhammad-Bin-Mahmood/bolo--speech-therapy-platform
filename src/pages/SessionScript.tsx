@@ -16,7 +16,9 @@ import { useAcousticAnalysis } from "../hooks/useAcousticAnalysis";
 import { useScriptMatcher, ScriptMetrics } from "../hooks/useScriptMatcher";
 import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
 import { useStutterRecovery } from "../hooks/useStutterRecovery";
+import { useLiveEvidenceFusion } from "../hooks/useEvidenceFusion";
 import { toFeedEvents } from "../lib/feedEvents";
+import { visibleRecoveredFor, visibleFeedEventsFor } from "../lib/evidenceGating";
 
 export default function SessionScript() {
   const navigate = useNavigate();
@@ -61,6 +63,25 @@ export default function SessionScript() {
     transcripts: ws.transcripts,
     events: acousticEvents,
   });
+
+  // ── Evidence Fusion Layer (same gate as Free Speech + Debate): scores
+  // every raw acoustic event and only lets strong evidence become a
+  // visible annotation. Script alignment, scoring and pacing are untouched.
+  const fusion = useLiveEvidenceFusion(
+    ws.transcripts,
+    acousticEvents,
+    scriptMetrics.pauseEvents
+  );
+  const gatedRecovered = useMemo(
+    () => visibleRecoveredFor(recovery.annotations, fusion.scored),
+    [recovery.annotations, fusion.scored]
+  );
+  // Inline transcript chips: only visible events. The Detection Feed is
+  // a separate surface and keeps every raw event.
+  const gatedFeedForTranscript = useMemo(
+    () => visibleFeedEventsFor(feedEvents, fusion.scored),
+    [feedEvents, fusion.scored]
+  );
 
   // ── Shared Pace Engine (compact mode) ──────────────────────────────
   const { engine, feedTranscripts, feedPauses } = usePaceEngine();
@@ -372,8 +393,8 @@ export default function SessionScript() {
                   tokenStates={scriptMetrics.tokenStates}
                   activeIndex={scriptMetrics.activeTokenIndex}
                   pauseMarkers={scriptMetrics.pauseMarkers}
-                  feedEvents={feedEvents}
-                  recovered={recovery.annotations}
+                  feedEvents={gatedFeedForTranscript}
+                  recovered={gatedRecovered}
                 />
               </div>
             </div>

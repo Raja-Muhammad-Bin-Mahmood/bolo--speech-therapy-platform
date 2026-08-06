@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ArrowLeft,
@@ -14,8 +14,22 @@ import DebateStage from "../components/DebateStage";
 import RecordButton from "../components/RecordButton";
 import PaceMeter from "../components/PaceMeter";
 import DebatePaceSummary from "../components/DebatePaceSummary";
+import { useAudioCapture } from "../hooks/useAudioCapture";
+import { useSpeechmaticsWS } from "../hooks/useSpeechmaticsWS";
+import { useAcousticAnalysis, type AcousticEventType } from "../hooks/useAcousticAnalysis";
+import { useAnalyserSensor } from "../hooks/useAnalyserSensor";
 import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
+import { useLiveEvidenceFusion } from "../hooks/useEvidenceFusion";
+import { useSessionAnalysis } from "../hooks/useSessionAnalysis";
 import type { PaceReport } from "../lib/paceEngine";
+
+const DISFLUENCY_COLORS: Record<AcousticEventType, string> = {
+  block: "#FDBA74",
+  repetition: "#FCA5A5",
+  prolongation: "#F9A8D4",
+  stutter: "#F87171",
+  stammer: "#BD8CFF",
+};
 
 // ─── AI Debate Topics ────────────────────────────────────────────────────
 
@@ -144,9 +158,50 @@ export default function SessionDebate() {
   const [ambientAudio, setAmbientAudio] = useState(false);
   const [paceReport, setPaceReport] = useState<PaceReport | null>(null);
 
+  // ── Speech + detection pipeline (same fusion logic as every mode) ──
+  const isSpeaking = phase === "speaking";
+  const audio = useAudioCapture();
+  const ws = useSpeechmaticsWS();
+  const acoustic = useAcousticAnalysis(audio.getAnalyser, isSpeaking);
+  const sensor = useAnalyserSensor(audio.getAnalyser, isSpeaking);
+  const analysis = useSessionAnalysis(ws.transcripts, [
+    ...acoustic.events,
+    ...sensor.events,
+  ]);
+
+  // Wire PCM → Speechmatics
+  useEffect(() => {
+    audio.setOnAudioData(ws.sendAudio);
+  }, [audio, ws.sendAudio]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      audio.stop();
+      ws.disconnect();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Evidence Fusion Layer: scores every raw event, gates what is
+  // visible in the debate transcript strip. Dev panel tunes live. ──
+  const allAcoustic = useMemo(
+    () => [...acoustic.events, ...sensor.events],
+    [acoustic.events, sensor.events]
+  );
+  const fusion = useLiveEvidenceFusion(
+    ws.transcripts,
+    allAcoustic,
+    analysis.pauseEvents
+  );
+  const visibleEvents = useMemo(
+    () => fusion.scored.filter((s) => s.visible).slice(-6),
+    [fusion.scored]
+  );
+
   // ── Shared Pace Engine (Debate mode = same engine, different display) ──
   const { engine, finalize } = usePaceEngine();
-  const paceSnapshot = usePaceSnapshot(phase === "speaking" ? engine : null);
+  const paceSnapshot = usePaceSnapshot(isSpeaking ? engine : null);
 
   const currentTopic = selectedTopic
     ? DEBATE_TOPICS.find((t) => t.topic === selectedTopic) || DEBATE_TOPICS[topicIndex]
@@ -166,15 +221,21 @@ export default function SessionDebate() {
 
   const handleRecordingStart = useCallback(() => {
     setIsRecording(true);
-  }, []);
+    audio.start();
+    ws.connect();
+  }, [audio, ws]);
 
   const handleRecordingStop = useCallback(() => {
     setIsRecording(false);
+    audio.stop();
+    ws.disconnect();
     if (turn < maxTurns) {
       setPhase("listening");
       setTimeout(() => {
         setTurn((t) => t + 1);
         setIsRecording(true);
+        audio.start();
+        ws.connect();
         setPhase("speaking");
       }, 2500);
     } else {
@@ -185,7 +246,7 @@ export default function SessionDebate() {
       setPaceReport(report);
       setPhase("result");
     }
-  }, [turn, finalize]);
+  }, [turn, finalize, audio, ws]);
 
   return (
     <div className="min-h-screen relative overflow-hidden bg-deep-space">
@@ -273,6 +334,33 @@ export default function SessionDebate() {
               </div>
             </div>
           </div>
+
+          {/* Strong-annotation strip — evidence-passing events only */}
+          {isSpeaking && visibleEvents.length > 0 && (
+            <div className="absolute top-32 left-1/2 -translate-x-1/2 pointer-events-none">
+              <div className="flex flex-wrap justify-center gap-1.5 max-w-md">
+                {visibleEvents.map((s) => (
+                  <span
+                    key={s.key}
+                    className="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-mono select-none"
+                    style={{
+                      color: DISFLUENCY_COLORS[s.event.type],
+                      backgroundColor: `${DISFLUENCY_COLORS[s.event.type]}18`,
+                      border: `1px solid ${DISFLUENCY_COLORS[s.event.type]}30`,
+                    }}
+                    title={`${s.event.type} · ${(s.evidenceScore * 10).toFixed(1)}/10 · ${s.event.durationMs}ms`}
+                  >
+                    <span
+                      className="w-1.5 h-1.5 rounded-full"
+                      style={{ backgroundColor: DISFLUENCY_COLORS[s.event.type] }}
+                    />
+                    {s.event.type}
+                    {(s.event.durationMs / 1000).toFixed(1)}s
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Ambient floating transcript captions */}
           <AnimatePresence>
