@@ -10,7 +10,7 @@
  * Slider changes in the dev panel flow through the context and take
  * effect on the very next render — no reload, no rebuild.
  */
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import type { AcousticEvent } from "./useAcousticAnalysis";
 import type { TranscriptChunk } from "./useSpeechmaticsWS";
 import type { PauseEvent } from "../lib/pauseDetector";
@@ -59,8 +59,12 @@ export function useLiveEvidenceFusion(
   const { weights, reportScored } = useEvidenceTuning();
   const gates = useEvidenceFusion(transcripts, acousticEvents, pauses, weights);
 
-  // Report to the dev panel (deduped in the context)
-  useMemo(() => {
+  // Report to the dev panel (deduped in the context).
+  // Must run in an effect, NOT during render — calling reportScored inside
+  // a useMemo would setState on EvidenceTuningProvider mid-render and trip
+  // React's "Cannot update a component while rendering a different component"
+  // warning.
+  useEffect(() => {
     if (gates.scored.length > 0) reportScored(gates.scored);
   }, [gates.scored, reportScored]);
 

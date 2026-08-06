@@ -28,6 +28,7 @@ import {
 } from "../lib/recoveryRender";
 import type { RecoveredAnnotation } from "../lib/recoveryTypes";
 import { scoreAcousticEvents, type ScoredEvent } from "../lib/evidenceFusion";
+import type { PauseEvent } from "../lib/pauseDetector";
 import { useEvidenceTuning } from "../context/EvidenceTuningContext";
 import { visibleTagForWord } from "../lib/evidenceGating";
 
@@ -236,16 +237,9 @@ export default function Analysis() {
     tag: string | null;
     fused: number;
   }> = Array.isArray(data?.taggedWords) ? data.taggedWords : [];
-  const pauseEvents: Array<{
-    id: string;
-    type: string;
-    startTime: number;
-    endTime: number;
-    durationMs: number;
-    shouldColor: boolean;
-    colorToken: string;
-    reason: string[];
-  }> = Array.isArray(data?.pauseEvents) ? data.pauseEvents : [];
+  const pauseEvents: PauseEvent[] = Array.isArray(data?.pauseEvents)
+    ? (data.pauseEvents as PauseEvent[])
+    : [];
   const confidenceTimeline: Array<{ t: number; value: number | null }> =
     Array.isArray(data?.confidenceTimeline) ? data.confidenceTimeline : [];
   const avgConfidence = data?.avgConfidence ?? 0;
@@ -308,6 +302,34 @@ export default function Analysis() {
   // Pause events sorted by start time
   const sortedPauses = [...pauseEvents].sort((a, b) => a.startTime - b.startTime);
 
+  // ── Evidence Fusion Layer (review) ─────────────────────────────────
+  // Recomputed from the raw acoustic events carried on the session with
+  // the SAME engine every mode uses, so review verdicts always agree with
+  // what the live view gated. The Evidence Review Panel below shows ALL
+  // evidence: visible annotations + hidden suppressed candidates.
+  const { weights } = useEvidenceTuning();
+  const rawFusionEvents = useMemo(() => {
+    const a: unknown = data?.acousticEvents ?? [];
+    const s: unknown = data?.sensorEvents ?? [];
+    return [
+      ...(Array.isArray(a) ? a : []),
+      ...(Array.isArray(s) ? s : []),
+    ] as any[];
+  }, [data]);
+  const scored: ScoredEvent[] = useMemo(() => {
+    if (rawFusionEvents.length === 0) return [];
+    const words = taggedWords.map((w) => ({
+      text: w.word,
+      startTime: w.startTime,
+      endTime: w.endTime,
+    }));
+    return scoreAcousticEvents(
+      rawFusionEvents as any[],
+      { words, pauses: sortedPauses },
+      weights
+    );
+  }, [rawFusionEvents, taggedWords, sortedPauses, weights]);
+
   // Reconstruct the annotated transcript by merging tagged words with
   // scoreable pause badges (same approach as the live view) + recovery
   // annotations (Stage 3).
@@ -318,16 +340,18 @@ export default function Analysis() {
           word: string;
           tag: string | null;
           startTime: number;
+          endTime: number;
           events?: FeedEvent[];
           recovered?: RecoveredAnnotation | null;
         }
-      | { kind: "pause"; event: (typeof pauseEvents)[number] }
+      | { kind: "pause"; event: PauseEvent }
       | { kind: "recovered"; rec: RecoveredAnnotation }
     > = taggedWords.map((w) => ({
       kind: "word" as const,
       word: w.word,
       tag: w.tag,
       startTime: w.startTime,
+      endTime: w.endTime,
     }));
 
     // Attach existing detector events to their overlapping words by timestamp
@@ -963,7 +987,7 @@ export default function Analysis() {
                         )}
                         <span
                           className={`inline-block rounded px-1 transition-colors ${
-                            item.tag
+                            item.tag && visibleTagForWord(item, scored)
                               ? `${TAG_STYLES[item.tag] ?? ""} underline decoration-dotted underline-offset-2`
                               : ""
                           }`}
@@ -1049,6 +1073,9 @@ export default function Analysis() {
             </div>
           </motion.div>
         )}
+
+        {/* ── Evidence Fusion Review ─────────────────────────── */}
+        <EvidenceReviewPanel scored={scored} />
 
         {/* Coach's Note */}
         <motion.div
