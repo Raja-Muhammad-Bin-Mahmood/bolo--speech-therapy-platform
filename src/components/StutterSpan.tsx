@@ -7,13 +7,15 @@
  *
  * This is the ONE component used identically in Script, Free Speech and
  * Debate modes. It reuses the existing feed color system (no new color
- * schemes), never breaks transcript alignment, and renders a soft,
- * conservative placeholder when the recovered fragment is uncertain.
+ * schemes) and never breaks transcript alignment. Unresolved fragments
+ * (nothing confidently recovered) are suppressed from the transcript —
+ * they are never invented words; the Detection Feed and review panel
+ * still surface them.
  *
  * Provenance-aware:
  *   - attached   → Speechmatics word + stuttered prefix span
  *   - recovered  → local Wav2Vec2 fragment + stuttered prefix span
- *   - unresolved → soft placeholder (never an invented word)
+ *   - unresolved → suppressed from transcript (never an invented word)
  */
 import type { RecoveredAnnotation } from "../lib/recoveryTypes";
 import type { AcousticEventType } from "../hooks/useAcousticAnalysis";
@@ -70,21 +72,11 @@ export default function StutterSpan({
     );
   }
 
-  // ── Unresolved — conservative placeholder, never an invented word ──
+  // ── Unresolved — nothing confident was recovered. Suppressed from the
+  // transcript: no invented word, no placeholder chip. The Detection Feed
+  // and review panel still show the raw event, so nothing is lost. ──
   if (annotation.status === "unresolved") {
-    return (
-      <span
-        className="stutter-annotation inline-flex items-center gap-0.5 align-middle mx-0.5 opacity-80"
-        title={`${annotation.reason} · ${confidencePct}% confidence`}
-      >
-        <span
-          className="rounded px-1.5 py-px text-[10px] font-mono select-none border border-dashed"
-          style={bandStyle}
-        >
-          {annotation.placeholder}
-        </span>
-      </span>
-    );
+    return null;
   }
 
   // ── Attached — stuttered prefix + the Speechmatics base word ──
