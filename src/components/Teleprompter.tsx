@@ -3,8 +3,11 @@ import { motion } from "framer-motion";
 import type { TokenState, TokenDetail, DisfluencyKind } from "../hooks/useScriptMatcher";
 import type { PauseEvent } from "../lib/pauseDetector";
 import type { FeedEvent } from "../lib/feedEvents";
+import type { RecoveredAnnotation } from "../lib/recoveryTypes";
 import { assignEventsToSpans } from "../lib/feedEvents";
+import { buildRecoveredItems } from "../lib/recoveryRender";
 import FeedChip from "./FeedChip";
+import StutterSpan from "./StutterSpan";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -31,6 +34,11 @@ interface TeleprompterProps {
    * visualizes these; the script pointer, scoring and matcher are untouched.
    */
   feedEvents?: FeedEvent[];
+  /**
+   * Recovery annotations (Stage 3) — the stuttered prefix + base word,
+   * or a conservative placeholder. Same annotation logic as Free Speech.
+   */
+  recovered?: RecoveredAnnotation[];
 }
 
 // ─── Phoneme Highlighter ────────────────────────────────────────────────
@@ -151,6 +159,7 @@ export default function Teleprompter({
   activeIndex,
   pauseMarkers = [],
   feedEvents = [],
+  recovered = [],
 }: TeleprompterProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -197,6 +206,26 @@ export default function Teleprompter({
     }
     return map;
   }, [feedEvents, tokenDetails, tokens, hasDetails]);
+
+  // Map recovery annotations onto matched script tokens by timestamp (Stage 3).
+  const tokenRecoveryMap = useMemo(() => {
+    const map = new Map<number, RecoveredAnnotation>();
+    if (recovered.length === 0 || !hasDetails) return map;
+    const spans: { startTime: number; endTime: number }[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+      const d = tokenDetails![i];
+      spans.push({
+        startTime: d?.startTime ?? -1,
+        endTime: d?.endTime ?? -1,
+      });
+    }
+    const assignment = buildRecoveredItems(recovered, spans);
+    for (let i = 0; i < assignment.attachedByIndex.length; i++) {
+      const rec = assignment.attachedByIndex[i];
+      if (rec) map.set(i, rec);
+    }
+    return map;
+  }, [recovered, tokenDetails, tokens, hasDetails]);
 
   // ── Speech-driven scroll: center the active token ─────────────────
   useEffect(() => {
@@ -342,6 +371,7 @@ export default function Teleprompter({
 
             // Check if there's a pause marker before this token
             const pauseEvt = pauseMap.get(i);
+            const recoveryRec = tokenRecoveryMap.get(i);
 
             return (
               <span key={`token-${i}`} className="group inline">
@@ -360,6 +390,11 @@ export default function Teleprompter({
                       {(pauseEvt.durationMs / 1000).toFixed(1)}s
                     </span>
                   </span>
+                )}
+
+                {/* Recovery annotation (Stage 3) rendered BEFORE the word */}
+                {recoveryRec && (
+                  <StutterSpan annotation={recoveryRec} className="mr-0.5" />
                 )}
 
                 {/* Token word with tooltip */}

@@ -4,8 +4,11 @@ import type { TranscriptChunk } from "../hooks/useSpeechmaticsWS";
 import type { DisfluencyTag } from "../hooks/useSessionAnalysis";
 import type { PauseEvent } from "../lib/pauseDetector";
 import type { FeedEvent } from "../lib/feedEvents";
+import type { RecoveredAnnotation } from "../lib/recoveryTypes";
 import { assignEventsToSpans } from "../lib/feedEvents";
+import { buildRecoveredItems } from "../lib/recoveryRender";
 import FeedChip from "./FeedChip";
+import StutterSpan from "./StutterSpan";
 
 interface TranscriptionChunksProps {
   transcripts: TranscriptChunk[];
@@ -19,6 +22,12 @@ interface TranscriptionChunksProps {
    * visualizes these; it never creates new events.
    */
   events?: FeedEvent[];
+  /**
+   * Recovery annotations (Stage 3). Attached ones wrap the stuttered prefix
+   * + base word; recovered/unresolved ones insert inline fragments or
+   * conservative placeholders. Never duplicates, never invents words.
+   */
+  recovered?: RecoveredAnnotation[];
   /** Safety-net max words per line */
   maxWordsPerLine?: number;
 }
@@ -36,6 +45,7 @@ export default function TranscriptionChunks({
   wordTags,
   pauseEvents = [],
   events = [],
+  recovered = [],
   maxWordsPerLine = 16,
 }: TranscriptionChunksProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -46,6 +56,7 @@ export default function TranscriptionChunks({
     wordTags,
     pauseEvents,
     events,
+    recovered,
     maxWordsPerLine
   );
 
@@ -89,6 +100,8 @@ export default function TranscriptionChunks({
             {line.items.map((item, wi) =>
               item.kind === "pause" ? (
                 <PauseBadge key={wi} event={item.event} />
+              ) : item.kind === "recovered" ? (
+                <StutterSpan key={`r-${item.rec.id}`} annotation={item.rec} />
               ) : (
                 <WordSpan key={wi} word={item.word} />
               )
@@ -109,6 +122,8 @@ interface LineWord {
   startTime: number; // seconds — for pause badge placement
   /** Existing detector events mapped onto this word (feed-style chips) */
   events?: FeedEvent[];
+  /** Recovery annotation attached to this word (Stage 3) */
+  recovered?: RecoveredAnnotation | null;
 }
 
 const TAG_STYLES: Record<DisfluencyTag, string> = {
@@ -181,6 +196,31 @@ function WordSpan({ word }: { word: LineWord }) {
     );
   }
 
+  // Recovery annotation (Stage 3): wrap the stuttered prefix + base word.
+  // The base word keeps its Speechmatics text — alignment is preserved.
+  if (word.recovered) {
+    return (
+      <span className="inline-flex items-center gap-1 align-middle">
+        <StutterSpan annotation={word.recovered} />
+        <span
+          className={`inline-block rounded px-1 transition-colors duration-200 ${base} ${
+            word.tag ? "underline decoration-dotted underline-offset-2" : ""
+          }`}
+          title={word.tag ? undefined : undefined}
+        >
+          {word.text}
+        </span>
+        {feedEvents.length > 0 && (
+          <span className="inline-flex items-center gap-0.5">
+            {feedEvents.map((evt) => (
+              <FeedChip key={evt.id} event={evt} />
+            ))}
+          </span>
+        )}
+      </span>
+    );
+  }
+
   return (
     <span className="inline-flex items-center gap-1 align-middle">
       <span
@@ -205,13 +245,15 @@ function WordSpan({ word }: { word: LineWord }) {
 
 type LineItem =
   | { kind: "word"; word: LineWord }
-  | { kind: "pause"; event: PauseEvent };
+  | { kind: "pause"; event: PauseEvent }
+  | { kind: "recovered"; rec: RecoveredAnnotation };
 
 function buildLines(
   transcripts: TranscriptChunk[],
   wordTags: Map<string, DisfluencyTag> | undefined,
   pauseEvents: PauseEvent[],
   events: FeedEvent[],
+  recovered: RecoveredAnnotation[],
   maxWordsPerLine: number
 ): { id: string; items: LineItem[] }[] {
   const lines: { id: string; items: LineItem[] }[] = [];
@@ -245,12 +287,16 @@ function buildLines(
   // Renderer-only: no new events, no re-classification.
   const eventAssignments = assignEventsToSpans(events, wordSpans);
 
-  // Attach mapped events to each word item (parallel to wordSpans)
+  // Map recovery annotations onto the same word spans (Stage 3).
+  const recoveredAssignment = buildRecoveredItems(recovered, wordSpans);
+
+  // Attach mapped events + recovery annotations to each word item (parallel to wordSpans)
   let spanIdx = 0;
   for (const [, items] of grouped) {
     for (const item of items) {
       if (item.kind === "word") {
         item.word.events = eventAssignments[spanIdx] ?? [];
+        item.word.recovered = recoveredAssignment.attachedByIndex[spanIdx] ?? null;
         spanIdx++;
       }
     }
@@ -290,6 +336,28 @@ function buildLines(
       if (!inserted && lines.length > 0) {
         lines[lines.length - 1].items.push({ kind: "pause", event: p });
       }
+    }
+  }
+
+  // ── Inject standalone recovery tokens (recovered / unresolved) inline ──
+  for (const rec of recoveredAssignment.standalone) {
+    const recTime = rec.startTime;
+    let inserted = false;
+    for (const line of lines) {
+      for (let idx = 0; idx < line.items.length; idx++) {
+        const item = line.items[idx];
+        if (item.kind !== "word") continue;
+        const wStart = (item.word as LineWord).startTime;
+        if (wStart >= recTime) {
+          line.items.splice(idx, 0, { kind: "recovered", rec });
+          inserted = true;
+          break;
+        }
+      }
+      if (inserted) break;
+    }
+    if (!inserted && lines.length > 0) {
+      lines[lines.length - 1].items.push({ kind: "recovered", rec });
     }
   }
 

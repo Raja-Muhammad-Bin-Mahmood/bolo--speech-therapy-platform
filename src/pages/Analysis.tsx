@@ -16,11 +16,16 @@ import {
 import Navbar from "../components/Navbar";
 import type { SensorSession } from "../lib/sensorTypes";
 import FeedChip from "../components/FeedChip";
+import StutterSpan from "../components/StutterSpan";
 import {
   toFeedEvents,
   assignEventsToSpans,
   type FeedEvent,
 } from "../lib/feedEvents";
+import {
+  buildRecoveredItems,
+} from "../lib/recoveryRender";
+import type { RecoveredAnnotation } from "../lib/recoveryTypes";
 
 // ─── Stat Card ──────────────────────────────────────────────────────────
 
@@ -264,6 +269,12 @@ export default function Analysis() {
     return toFeedEvents(fromTags);
   }, [data, taggedWords]);
 
+  // ── Stage 3: recovery annotations (carried on the session) ──────────
+  const recoveredAnnotations: RecoveredAnnotation[] = useMemo(
+    () => (Array.isArray(data?.recoveredAnnotations) ? data.recoveredAnnotations : []),
+    [data]
+  );
+
   const TAG_STYLES: Record<string, string> = {
     filler: "text-amber-300/90 bg-amber-300/10",
     block: "text-orange-300/90 bg-orange-400/10",
@@ -294,7 +305,8 @@ export default function Analysis() {
   const sortedPauses = [...pauseEvents].sort((a, b) => a.startTime - b.startTime);
 
   // Reconstruct the annotated transcript by merging tagged words with
-  // scoreable pause badges (same approach as the live view).
+  // scoreable pause badges (same approach as the live view) + recovery
+  // annotations (Stage 3).
   const annotatedItems = useMemo(() => {
     const items: Array<
       | {
@@ -303,8 +315,10 @@ export default function Analysis() {
           tag: string | null;
           startTime: number;
           events?: FeedEvent[];
+          recovered?: RecoveredAnnotation | null;
         }
       | { kind: "pause"; event: (typeof pauseEvents)[number] }
+      | { kind: "recovered"; rec: RecoveredAnnotation }
     > = taggedWords.map((w) => ({
       kind: "word" as const,
       word: w.word,
@@ -322,6 +336,15 @@ export default function Analysis() {
       const it = items[i];
       if (it.kind === "word") {
         it.events = assignments[i] ?? [];
+      }
+    }
+
+    // Attach recovery annotations to their overlapping words (Stage 3)
+    const recAssignment = buildRecoveredItems(recoveredAnnotations, wordSpans);
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (it.kind === "word") {
+        it.recovered = recAssignment.attachedByIndex[i] ?? null;
       }
     }
 
@@ -343,8 +366,24 @@ export default function Analysis() {
         items.push({ kind: "pause", event: p });
       }
     }
+
+    // Insert standalone recovery annotations inline by timestamp
+    for (const rec of recAssignment.standalone) {
+      let inserted = false;
+      for (let idx = 0; idx < items.length; idx++) {
+        const item = items[idx];
+        if (item.kind !== "word") continue;
+        if (item.startTime >= rec.startTime) {
+          items.splice(idx, 0, { kind: "recovered", rec });
+          inserted = true;
+          break;
+        }
+      }
+      if (!inserted) items.push({ kind: "recovered", rec });
+    }
+
     return items;
-  }, [taggedWords, sortedPauses, feedEvents]);
+  }, [taggedWords, sortedPauses, feedEvents, recoveredAnnotations]);
 
   // Count disfluency types from tags for a clean legend
   const tagCounts = useMemo(() => {
@@ -908,11 +947,16 @@ export default function Analysis() {
                         {PAUSE_LABELS[item.event.type] ?? "·"}
                         {(item.event.durationMs / 1000).toFixed(1)}s
                       </span>
+                    ) : item.kind === "recovered" ? (
+                      <StutterSpan key={`r-${item.rec.id}`} annotation={item.rec} />
                     ) : (
                       <span
                         key={`w-${i}`}
                         className="inline-flex items-center gap-1 align-middle mr-1"
                       >
+                        {item.recovered && (
+                          <StutterSpan annotation={item.recovered} className="mr-0.5" />
+                        )}
                         <span
                           className={`inline-block rounded px-1 transition-colors ${
                             item.tag

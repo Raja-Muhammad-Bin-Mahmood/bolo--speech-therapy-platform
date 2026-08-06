@@ -60,6 +60,13 @@ export function useAudioCapture() {
   // PCM forwarding to Speechmatics
   const onAudioDataRef = useRef<((buffer: Float32Array) => void) | null>(null);
 
+  // Raw PCM tap for the recovery ring buffer (worklet clock, same stream
+  // that feeds Speechmatics — so timestamps share one clock).
+  const onPcmRef = useRef<((msg: { t: number; buffer: Float32Array }) => void) | null>(null);
+  // Worklet-clock anchor: (workletT, wallNow) of the most recent message,
+  // used to extrapolate a smooth "now" on the worklet/stream clock.
+  const clockAnchorRef = useRef<{ workletT: number; wallNow: number } | null>(null);
+
   // ── Timeline Engine (main-thread pattern detector) ─────────────────────
   const timelineEngineRef = useRef<TimelineEngine | null>(null);
   const timelineEventsRef = useRef<StutterCandidate[]>([]);
@@ -205,6 +212,14 @@ export function useAudioCapture() {
   });
 
   self.current._handlePcmMessage = (msg: { t: number; buffer: Float32Array }) => {
+    // Anchor the worklet clock for the shared-stream-time extrapolator
+    clockAnchorRef.current = { workletT: msg.t, wallNow: performance.now() };
+
+    // Tap raw PCM for the recovery ring buffer (before the ASR forward)
+    if (onPcmRef.current) {
+      onPcmRef.current({ t: msg.t, buffer: new Float32Array(msg.buffer) });
+    }
+
     // Pin clock on first PCM after pinClock() was called
     if (pinPendingRef.current) {
       asrT0Ref.current = msg.t;
@@ -234,6 +249,9 @@ export function useAudioCapture() {
   };
 
   self.current._handleFrameMessage = (frame: TimelineFrame) => {
+    // Frames arrive every ~10ms — a finer anchor for the stream clock
+    clockAnchorRef.current = { workletT: frame.t, wallNow: performance.now() };
+
     // Update live frame state for UI
     setState((prev) => ({ ...prev, latestFrame: frame }));
 
@@ -267,6 +285,35 @@ export function useAudioCapture() {
     },
     []
   );
+
+  /** Register a raw PCM tap (worklet clock) — used by the recovery ring buffer. */
+  const setOnPcm = useCallback(
+    (cb: ((msg: { t: number; buffer: Float32Array }) => void) | null) => {
+      onPcmRef.current = cb;
+    },
+    []
+  );
+
+  /**
+   * Shared session clock: current time on the SAME timeline Speechmatics
+   * word timestamps use (worklet clock − ASR pin offset). Returns null until
+   * the clock is pinned (Speechmatics connected) — callers fall back to a
+   * wall-clock base until then. The value is smooth (extrapolated from the
+   * latest worklet anchor), so the detector's hop gating is unaffected.
+   */
+  const getStreamTime = useCallback((): number | null => {
+    const anchor = clockAnchorRef.current;
+    const asrT0 = asrT0Ref.current;
+    if (!anchor || asrT0 === null) return null;
+    const estWorklet = anchor.workletT + (performance.now() - anchor.wallNow) / 1000;
+    const sessionT = estWorklet - asrT0;
+    return sessionT >= 0 ? sessionT : null;
+  }, []);
+
+  /** Worklet time of the first PCM chunk after pinClock() (stream t=0). */
+  const getAsrT0 = useCallback((): number | null => {
+    return asrT0Ref.current;
+  }, []);
 
   const getAnalyser = useCallback(() => analyserRef.current, []);
 
@@ -308,6 +355,8 @@ export function useAudioCapture() {
     workletNodeRef.current = null;
     scriptRef.current = null;
     onAudioDataRef.current = null;
+    onPcmRef.current = null;
+    clockAnchorRef.current = null;
     asrT0Ref.current = null;
     pinPendingRef.current = false;
     pendingCandidatesRaw.current = [];
@@ -335,6 +384,9 @@ export function useAudioCapture() {
     start,
     stop,
     setOnAudioData,
+    setOnPcm,
+    getStreamTime,
+    getAsrT0,
     getAnalyser,
     getStutterCandidates,
     getTimelineEngine,

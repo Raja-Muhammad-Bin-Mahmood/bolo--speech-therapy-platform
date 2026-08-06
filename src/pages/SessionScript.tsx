@@ -15,6 +15,7 @@ import { useSpeechmaticsWS } from "../hooks/useSpeechmaticsWS";
 import { useAcousticAnalysis } from "../hooks/useAcousticAnalysis";
 import { useScriptMatcher, ScriptMetrics } from "../hooks/useScriptMatcher";
 import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
+import { useStutterRecovery } from "../hooks/useStutterRecovery";
 import { toFeedEvents } from "../lib/feedEvents";
 
 export default function SessionScript() {
@@ -51,6 +52,15 @@ export default function SessionScript() {
     ws.transcripts,
     acousticEvents
   );
+
+  // ── Stage 3: Event-triggered recovery (annotate stuttered script words) ──
+  const recovery = useStutterRecovery({
+    active: isRecording && ws.status === "connected",
+    getStreamTime: audio.getStreamTime,
+    setOnPcm: audio.setOnPcm,
+    transcripts: ws.transcripts,
+    events: acousticEvents,
+  });
 
   // ── Shared Pace Engine (compact mode) ──────────────────────────────
   const { engine, feedTranscripts, feedPauses } = usePaceEngine();
@@ -363,6 +373,7 @@ export default function SessionScript() {
                   activeIndex={scriptMetrics.activeTokenIndex}
                   pauseMarkers={scriptMetrics.pauseMarkers}
                   feedEvents={feedEvents}
+                  recovered={recovery.annotations}
                 />
               </div>
             </div>

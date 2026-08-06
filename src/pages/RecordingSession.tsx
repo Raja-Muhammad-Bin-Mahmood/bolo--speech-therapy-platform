@@ -48,6 +48,7 @@ import {
   finalizeSessionScore,
 } from "../hooks/useSessionAnalysis";
 import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
+import { useStutterRecovery } from "../hooks/useStutterRecovery";
 import { useAuth } from "../context/AuthContext";
 import { toFeedEvents } from "../lib/feedEvents";
 
@@ -104,6 +105,17 @@ export default function RecordingSession() {
   const analysis = useSessionAnalysis(ws.transcripts, acoustic.events);
   const pace = usePaceEngine();
   const paceSnapshot = usePaceSnapshot(pace.engine);
+
+  // ── Stage 3: Event-triggered recovery (hold → ring buffer → fallback) ──
+  // Speechmatics stays the primary transcript; this ONLY annotates detector
+  // events that Speechmatics normalized away (slap → sssssslap, boy → b-b-boy).
+  const recovery = useStutterRecovery({
+    active: isRecording && ws.status === "connected",
+    getStreamTime: audio.getStreamTime,
+    setOnPcm: audio.setOnPcm,
+    transcripts: ws.transcripts,
+    events: [...acoustic.events, ...sensor.events],
+  });
 
   // Existing detector events in the Detection Feed vocabulary — the same
   // list the Detection Feed renders, mapped onto finalized transcript words.
@@ -273,6 +285,9 @@ export default function RecordingSession() {
         ? Math.round((taggedWords.length / burstCount) * 10) / 10
         : 0;
 
+    // ── Final recovery snapshot: carry annotations to the review screen ──
+    const recoverySnapshot = recovery.annotations;
+
     const stutters = finalScore.stutters;
     const stammers = finalScore.stammers;
     const disfluentWords = taggedWords.filter((w) => w.tag).length;
@@ -324,10 +339,12 @@ export default function RecordingSession() {
           // ── Existing detector events (feed + transcript must agree) ──
           acousticEvents: finalAcoustic,
           sensorEvents,
+          // ── Recovery annotations (Stage 3) for the annotated review ──
+          recoveredAnnotations: recoverySnapshot,
         },
       });
     }, 900);
-  }, [ws, acoustic, sensor, pace, selectedTopic, navigate, saveSessionData]);
+  }, [ws, acoustic, sensor, pace, selectedTopic, navigate, saveSessionData, recovery.annotations]);
 
   const handleStopRecording = useCallback(() => {
     audio.stop();
@@ -582,6 +599,7 @@ export default function RecordingSession() {
                   wordTags={analysis.wordTags}
                   pauseEvents={analysis.pauseEvents}
                   events={feedEvents}
+                  recovered={recovery.annotations}
                 />
               </div>
 
