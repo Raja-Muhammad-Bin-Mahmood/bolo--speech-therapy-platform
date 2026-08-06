@@ -1,0 +1,119 @@
+/**
+ * BOLO — Shared "Detection Feed" vocabulary + transcript mapping
+ *
+ * The Detection Feed (live practice screen) renders detector events as
+ * colored chips. These SAME event objects — and ONLY these — are mapped
+ * onto finalized transcript words so the feed and the transcript always
+ * agree. This module holds the vocabulary (labels/colors) and the pure
+ * timestamp-overlap mapping. It performs NO detection, NO re-classification
+ * and NO threshold/confidence changes — it only visualizes events that
+ * already exist.
+ */
+
+import type { AcousticEvent, AcousticEventType } from "../hooks/useAcousticAnalysis";
+
+// ─── Feed vocabulary (identical to the Detection Feed chips) ─────────────
+
+export interface FeedEvent {
+  id: string;
+  type: AcousticEventType;
+  label: string;
+  color: string;
+  /** seconds (session clock — same clock as Speechmatics words) */
+  startTime: number;
+  endTime: number;
+  durationMs: number;
+}
+
+export const FEED_LABELS: Record<AcousticEventType, string> = {
+  block: "Block",
+  repetition: "Repeat",
+  prolongation: "Prolong",
+  stutter: "Stutter",
+  stammer: "Stammer",
+};
+
+export const FEED_COLORS: Record<AcousticEventType, string> = {
+  block: "#FDBA74",
+  repetition: "#FCA5A5",
+  prolongation: "#F9A8D4",
+  stutter: "#F87171",
+  stammer: "#BD8CFF",
+};
+
+/** Convert raw detector events into the feed vocabulary (no filtering). */
+export function toFeedEvents(events: AcousticEvent[]): FeedEvent[] {
+  return events.map((e, i) => ({
+    id: `evt-${e.type}-${e.startTime.toFixed(3)}-${i}`,
+    type: e.type,
+    label: FEED_LABELS[e.type] ?? e.type,
+    color: FEED_COLORS[e.type] ?? "#8B93A7",
+    startTime: e.startTime,
+    endTime: e.endTime,
+    durationMs: e.durationMs,
+  }));
+}
+
+// ─── Timestamp mapping (renderer-only; never creates events) ─────────────
+
+export interface TimedSpan {
+  startTime: number;
+  endTime: number;
+}
+
+/** Fraction of the EVENT that falls inside the span (0..1). */
+function eventOverlapRatio(evt: FeedEvent, span: TimedSpan): number {
+  const evtDur = evt.endTime - evt.startTime;
+  if (evtDur <= 0) return 0;
+  const intersect =
+    Math.min(span.endTime, evt.endTime) - Math.max(span.startTime, evt.startTime);
+  return intersect > 0 ? intersect / evtDur : 0;
+}
+
+const MIN_OVERLAP_RATIO = 0.15;
+
+/**
+ * Attach each feed event to its single best-matching word/span by timestamp
+ * overlap, so each event appears on exactly one word (no duplicates).
+ * Events that end just before a word onset (silent blocks) attach to that
+ * following word. Returns one array per span (parallel to `spans`).
+ *
+ * Purely additive and stable: as events and finalized words grow, an
+ * existing word's annotations are never removed or reassigned.
+ */
+export function assignEventsToSpans<T extends TimedSpan>(
+  events: FeedEvent[],
+  spans: T[]
+): FeedEvent[][] {
+  const out: FeedEvent[][] = spans.map(() => []);
+  if (events.length === 0 || spans.length === 0) return out;
+
+  for (const evt of events) {
+    let bestIdx = -1;
+    let bestRatio = 0;
+    for (let i = 0; i < spans.length; i++) {
+      const ratio = eventOverlapRatio(evt, spans[i]);
+      if (ratio > bestRatio) {
+        bestRatio = ratio;
+        bestIdx = i;
+      }
+    }
+    if (bestRatio >= MIN_OVERLAP_RATIO) {
+      out[bestIdx].push(evt);
+      continue;
+    }
+    // Silent block that ends right before a word onset attaches to that word
+    if (evt.type === "block") {
+      for (let i = 0; i < spans.length; i++) {
+        const s = spans[i];
+        if (s.startTime >= evt.endTime - 0.05 && s.startTime <= evt.endTime + 0.25) {
+          out[i].push(evt);
+          break;
+        }
+      }
+    }
+  }
+
+  for (const list of out) list.sort((a, b) => a.startTime - b.startTime);
+  return out;
+}

@@ -28,6 +28,10 @@ export interface TokenDetail {
   state: TokenState;
   /** If matched with a disfluency, the kind (for coloring) */
   disfluency?: DisfluencyKind;
+  /** Timestamps of the finalized word that matched this token (seconds).
+   *  Informational only — the script engine ignores these entirely. */
+  startTime?: number;
+  endTime?: number;
 }
 
 export interface ScriptMetrics {
@@ -274,7 +278,11 @@ export function useScriptMatcher(
           fw.endTime,
           acousticEventsRef.current
         );
-        const detail: TokenDetail = { state: "matched" };
+        const detail: TokenDetail = {
+          state: "matched",
+          startTime: fw.startTime,
+          endTime: fw.endTime,
+        };
         if (ae) {
           detail.disfluency = ae.type as DisfluencyKind;
           // Count disfluency type
@@ -316,7 +324,11 @@ export function useScriptMatcher(
             fw.endTime,
             acousticEventsRef.current
           );
-          const detail: TokenDetail = { state: "matched" };
+          const detail: TokenDetail = {
+            state: "matched",
+            startTime: fw.startTime,
+            endTime: fw.endTime,
+          };
           if (ae) {
             detail.disfluency = ae.type as DisfluencyKind;
             if (ae.type === "stutter") stutterCountRef.current++;

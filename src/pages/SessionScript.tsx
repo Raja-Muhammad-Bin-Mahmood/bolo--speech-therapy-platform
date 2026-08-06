@@ -15,6 +15,7 @@ import { useSpeechmaticsWS } from "../hooks/useSpeechmaticsWS";
 import { useAcousticAnalysis } from "../hooks/useAcousticAnalysis";
 import { useScriptMatcher, ScriptMetrics } from "../hooks/useScriptMatcher";
 import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
+import { toFeedEvents } from "../lib/feedEvents";
 
 export default function SessionScript() {
   const navigate = useNavigate();
@@ -35,6 +36,13 @@ export default function SessionScript() {
   const { events: acousticEvents } = useAcousticAnalysis(
     audio.getAnalyser,
     isRecording
+  );
+
+  // Existing detector events in the Detection Feed vocabulary — these are
+  // mapped onto the script words by timestamp (informational only).
+  const feedEvents = useMemo(
+    () => toFeedEvents(acousticEvents),
+    [acousticEvents]
   );
 
   // Real-time word alignment against the passage (now with acoustic fusion)
@@ -354,6 +362,7 @@ export default function SessionScript() {
                   tokenStates={scriptMetrics.tokenStates}
                   activeIndex={scriptMetrics.activeTokenIndex}
                   pauseMarkers={scriptMetrics.pauseMarkers}
+                  feedEvents={feedEvents}
                 />
               </div>
             </div>

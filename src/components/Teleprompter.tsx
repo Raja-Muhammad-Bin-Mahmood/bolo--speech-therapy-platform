@@ -2,6 +2,9 @@ import { useMemo, useRef, useEffect } from "react";
 import { motion } from "framer-motion";
 import type { TokenState, TokenDetail, DisfluencyKind } from "../hooks/useScriptMatcher";
 import type { PauseEvent } from "../lib/pauseDetector";
+import type { FeedEvent } from "../lib/feedEvents";
+import { assignEventsToSpans } from "../lib/feedEvents";
+import FeedChip from "./FeedChip";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -22,6 +25,12 @@ interface TeleprompterProps {
   activeIndex?: number;
   /** Pause markers to show between tokens */
   pauseMarkers?: { tokenIndex: number; event: PauseEvent }[];
+  /**
+   * Existing detector events (the SAME list the Detection Feed renders).
+   * Mapped onto matched script tokens by timestamp — the renderer only
+   * visualizes these; the script pointer, scoring and matcher are untouched.
+   */
+  feedEvents?: FeedEvent[];
 }
 
 // ─── Phoneme Highlighter ────────────────────────────────────────────────
@@ -141,6 +150,7 @@ export default function Teleprompter({
   tokenStates,
   activeIndex,
   pauseMarkers = [],
+  feedEvents = [],
 }: TeleprompterProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -148,6 +158,9 @@ export default function Teleprompter({
   const lastTimeRef = useRef<number>(0);
   const lastActiveIndexRef = useRef<number>(-1);
   const tokenRefs = useRef<(HTMLSpanElement | null)[]>([]);
+
+  // ── Legend chips ──────────────────────────────────────────────────
+  const hasDetails = tokenDetails && tokenDetails.length > 0;
 
   const tokens = useMemo(
     () => tokenizeWithTargets(text, targets),
@@ -162,6 +175,28 @@ export default function Teleprompter({
     }
     return map;
   }, [pauseMarkers]);
+
+  // Map existing detector events onto matched script tokens by timestamp.
+  // Matched tokens carry their spoken word's start/end time (set by the
+  // matcher as pure metadata). Renderer-only: the script pointer, scoring
+  // and matcher state are completely untouched.
+  const tokenEventMap = useMemo(() => {
+    const map = new Map<number, FeedEvent[]>();
+    if (feedEvents.length === 0 || !hasDetails) return map;
+    const spans: { startTime: number; endTime: number }[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+      const d = tokenDetails![i];
+      spans.push({
+        startTime: d?.startTime ?? -1,
+        endTime: d?.endTime ?? -1,
+      });
+    }
+    const assignments = assignEventsToSpans(feedEvents, spans);
+    for (let i = 0; i < assignments.length; i++) {
+      if (assignments[i].length > 0) map.set(i, assignments[i]);
+    }
+    return map;
+  }, [feedEvents, tokenDetails, tokens, hasDetails]);
 
   // ── Speech-driven scroll: center the active token ─────────────────
   useEffect(() => {
@@ -256,7 +291,6 @@ export default function Teleprompter({
   }, [progress, isActive, activeIndex]);
 
   // ── Legend chips ──────────────────────────────────────────────────
-  const hasDetails = tokenDetails && tokenDetails.length > 0;
   const showLegend = isActive && (hasDetails || (tokenStates && tokenStates.length > 0));
 
   return (
@@ -350,6 +384,10 @@ export default function Teleprompter({
                   }
                 >
                   {token.word}
+                  {/* Feed-style chips: existing detector events mapped to this token */}
+                  {tokenEventMap.get(i)?.map((evt) => (
+                    <FeedChip key={evt.id} event={evt} />
+                  ))}
                   {/* Floating tooltip on hover for disfluent tokens */}
                   {disfluency && (
                     <span className="absolute -top-7 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none z-30 whitespace-nowrap px-2 py-0.5 rounded-md text-[10px] font-medium bg-black/80 border border-white/10 backdrop-blur-sm"

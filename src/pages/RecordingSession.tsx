@@ -49,6 +49,7 @@ import {
 } from "../hooks/useSessionAnalysis";
 import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
 import { useAuth } from "../context/AuthContext";
+import { toFeedEvents } from "../lib/feedEvents";
 
 type Phase = "topic" | "recording" | "processing";
 
@@ -103,6 +104,13 @@ export default function RecordingSession() {
   const analysis = useSessionAnalysis(ws.transcripts, acoustic.events);
   const pace = usePaceEngine();
   const paceSnapshot = usePaceSnapshot(pace.engine);
+
+  // Existing detector events in the Detection Feed vocabulary — the same
+  // list the Detection Feed renders, mapped onto finalized transcript words.
+  const feedEvents = useMemo(
+    () => toFeedEvents([...acoustic.events, ...sensor.events]),
+    [acoustic.events, sensor.events]
+  );
 
   // ── Fused sensor events feed (stutter/stammer from RMS+ZCR) ─────────
   const tickerItems = useMemo<TickerItem[]>(() => {
@@ -313,6 +321,9 @@ export default function RecordingSession() {
           pauseEvents,
           confidenceTimeline,
           avgConfidence: finalScore.avgConfidence,
+          // ── Existing detector events (feed + transcript must agree) ──
+          acousticEvents: finalAcoustic,
+          sensorEvents,
         },
       });
     }, 900);
@@ -570,6 +581,7 @@ export default function RecordingSession() {
                   transcripts={ws.transcripts}
                   wordTags={analysis.wordTags}
                   pauseEvents={analysis.pauseEvents}
+                  events={feedEvents}
                 />
               </div>
 

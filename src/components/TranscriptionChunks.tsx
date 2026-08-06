@@ -3,6 +3,9 @@ import { motion, AnimatePresence } from "framer-motion";
 import type { TranscriptChunk } from "../hooks/useSpeechmaticsWS";
 import type { DisfluencyTag } from "../hooks/useSessionAnalysis";
 import type { PauseEvent } from "../lib/pauseDetector";
+import type { FeedEvent } from "../lib/feedEvents";
+import { assignEventsToSpans } from "../lib/feedEvents";
+import FeedChip from "./FeedChip";
 
 interface TranscriptionChunksProps {
   transcripts: TranscriptChunk[];
@@ -10,6 +13,12 @@ interface TranscriptionChunksProps {
   wordTags?: Map<string, DisfluencyTag>;
   /** Pause events to render as inline badges (sorted by startTime) */
   pauseEvents?: PauseEvent[];
+  /**
+   * Existing detector events (the SAME list the Detection Feed renders).
+   * Mapped onto finalized words by timestamp overlap — the renderer only
+   * visualizes these; it never creates new events.
+   */
+  events?: FeedEvent[];
   /** Safety-net max words per line */
   maxWordsPerLine?: number;
 }
@@ -26,6 +35,7 @@ export default function TranscriptionChunks({
   transcripts,
   wordTags,
   pauseEvents = [],
+  events = [],
   maxWordsPerLine = 16,
 }: TranscriptionChunksProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -35,6 +45,7 @@ export default function TranscriptionChunks({
     transcripts,
     wordTags,
     pauseEvents,
+    events,
     maxWordsPerLine
   );
 
@@ -96,6 +107,8 @@ interface LineWord {
   isFinal: boolean;
   tag: DisfluencyTag | null;
   startTime: number; // seconds — for pause badge placement
+  /** Existing detector events mapped onto this word (feed-style chips) */
+  events?: FeedEvent[];
 }
 
 const TAG_STYLES: Record<DisfluencyTag, string> = {
@@ -157,6 +170,7 @@ function PauseBadge({ event }: { event: PauseEvent }) {
 function WordSpan({ word }: { word: LineWord }) {
   const style = word.tag ? TAG_STYLES[word.tag] : null;
   const base = style ?? (word.isFinal ? "text-white/80" : "text-soft-gray/50");
+  const feedEvents = word.events ?? [];
 
   // Sentence markers (period, comma, ?!…) — render subtly, never as boxes
   if (SENTENCE_MARKERS.has(word.text.trim())) {
@@ -168,12 +182,21 @@ function WordSpan({ word }: { word: LineWord }) {
   }
 
   return (
-    <span
-      className={`inline-block rounded px-1 transition-colors duration-200 ${base} ${
-        word.tag ? "underline decoration-dotted underline-offset-2" : ""
-      }`}
-    >
-      {word.text}
+    <span className="inline-flex items-center gap-1 align-middle">
+      <span
+        className={`inline-block rounded px-1 transition-colors duration-200 ${base} ${
+          word.tag ? "underline decoration-dotted underline-offset-2" : ""
+        }`}
+      >
+        {word.text}
+      </span>
+      {feedEvents.length > 0 && (
+        <span className="inline-flex items-center gap-0.5">
+          {feedEvents.map((evt) => (
+            <FeedChip key={evt.id} event={evt} />
+          ))}
+        </span>
+      )}
     </span>
   );
 }
@@ -188,6 +211,7 @@ function buildLines(
   transcripts: TranscriptChunk[],
   wordTags: Map<string, DisfluencyTag> | undefined,
   pauseEvents: PauseEvent[],
+  events: FeedEvent[],
   maxWordsPerLine: number
 ): { id: string; items: LineItem[] }[] {
   const lines: { id: string; items: LineItem[] }[] = [];
@@ -197,6 +221,9 @@ function buildLines(
   const finals = transcripts.filter((t) => t.isFinal);
   const grouped = new Map<number, LineItem[]>();
 
+  // Collect finalized word spans (for event mapping) in stream order
+  const wordSpans: { text: string; startTime: number; endTime: number }[] = [];
+
   for (const chunk of finals) {
     const utterance = chunk.utterance ?? 0;
     for (const w of chunk.words) {
@@ -205,11 +232,27 @@ function buildLines(
       const key = `${Math.round(w.startTime * 1000)}-${Math.round(w.endTime * 1000)}`;
       const tag = wordTags?.get(key) ?? null;
       const arr = grouped.get(utterance) ?? [];
+      wordSpans.push({ text, startTime: w.startTime, endTime: w.endTime });
       arr.push({
         kind: "word" as const,
         word: { text, isFinal: true, tag, startTime: w.startTime },
       });
       grouped.set(utterance, arr);
+    }
+  }
+
+  // Map existing detector events onto finalized word spans by timestamp.
+  // Renderer-only: no new events, no re-classification.
+  const eventAssignments = assignEventsToSpans(events, wordSpans);
+
+  // Attach mapped events to each word item (parallel to wordSpans)
+  let spanIdx = 0;
+  for (const [, items] of grouped) {
+    for (const item of items) {
+      if (item.kind === "word") {
+        item.word.events = eventAssignments[spanIdx] ?? [];
+        spanIdx++;
+      }
     }
   }
 

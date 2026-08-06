@@ -15,6 +15,12 @@ import {
 } from "lucide-react";
 import Navbar from "../components/Navbar";
 import type { SensorSession } from "../lib/sensorTypes";
+import FeedChip from "../components/FeedChip";
+import {
+  toFeedEvents,
+  assignEventsToSpans,
+  type FeedEvent,
+} from "../lib/feedEvents";
 
 // ─── Stat Card ──────────────────────────────────────────────────────────
 
@@ -235,6 +241,29 @@ export default function Analysis() {
     Array.isArray(data?.confidenceTimeline) ? data.confidenceTimeline : [];
   const avgConfidence = data?.avgConfidence ?? 0;
 
+  // ── Existing detector events (the SAME list the Detection Feed rendered) ──
+  // Reconstructed from the acoustic events snapshot carried on the session.
+  const feedEvents: FeedEvent[] = useMemo(() => {
+    const raw: unknown = data?.acousticEvents ?? data?.sensorEvents ?? [];
+    if (Array.isArray(raw) && raw.length > 0) {
+      return toFeedEvents(raw as any[]);
+    }
+    // Fallback: reconstruct from tagged words (the live view used the same
+    // source events; tags carry the type + timestamp of the event).
+    const fromTags: any[] = [];
+    for (const w of taggedWords) {
+      if (!w.tag) continue;
+      if (w.tag === "filler" || w.tag === "repetition" || w.tag === "prolongation") continue;
+      fromTags.push({
+        type: w.tag,
+        startTime: w.startTime,
+        endTime: w.endTime,
+        durationMs: (w.endTime - w.startTime) * 1000,
+      });
+    }
+    return toFeedEvents(fromTags);
+  }, [data, taggedWords]);
+
   const TAG_STYLES: Record<string, string> = {
     filler: "text-amber-300/90 bg-amber-300/10",
     block: "text-orange-300/90 bg-orange-400/10",
@@ -268,7 +297,13 @@ export default function Analysis() {
   // scoreable pause badges (same approach as the live view).
   const annotatedItems = useMemo(() => {
     const items: Array<
-      | { kind: "word"; word: string; tag: string | null; startTime: number }
+      | {
+          kind: "word";
+          word: string;
+          tag: string | null;
+          startTime: number;
+          events?: FeedEvent[];
+        }
       | { kind: "pause"; event: (typeof pauseEvents)[number] }
     > = taggedWords.map((w) => ({
       kind: "word" as const,
@@ -276,6 +311,20 @@ export default function Analysis() {
       tag: w.tag,
       startTime: w.startTime,
     }));
+
+    // Attach existing detector events to their overlapping words by timestamp
+    const wordSpans = taggedWords.map((w) => ({
+      startTime: w.startTime,
+      endTime: w.endTime,
+    }));
+    const assignments = assignEventsToSpans(feedEvents, wordSpans);
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (it.kind === "word") {
+        it.events = assignments[i] ?? [];
+      }
+    }
+
     for (const p of sortedPauses) {
       if (!p.shouldColor) continue;
       const pauseEndMs = p.endTime * 1000;
@@ -295,7 +344,7 @@ export default function Analysis() {
       }
     }
     return items;
-  }, [taggedWords, sortedPauses]);
+  }, [taggedWords, sortedPauses, feedEvents]);
 
   // Count disfluency types from tags for a clean legend
   const tagCounts = useMemo(() => {
@@ -862,14 +911,25 @@ export default function Analysis() {
                     ) : (
                       <span
                         key={`w-${i}`}
-                        className={`inline-block rounded px-1 mr-0.5 transition-colors ${
-                          item.tag
-                            ? `${TAG_STYLES[item.tag] ?? ""} underline decoration-dotted underline-offset-2`
-                            : ""
-                        }`}
-                        title={item.tag ? TAG_LABELS[item.tag] : undefined}
+                        className="inline-flex items-center gap-1 align-middle mr-1"
                       >
-                        {item.word}
+                        <span
+                          className={`inline-block rounded px-1 transition-colors ${
+                            item.tag
+                              ? `${TAG_STYLES[item.tag] ?? ""} underline decoration-dotted underline-offset-2`
+                              : ""
+                          }`}
+                          title={item.tag ? TAG_LABELS[item.tag] : undefined}
+                        >
+                          {item.word}
+                        </span>
+                        {item.events && item.events.length > 0 && (
+                          <span className="inline-flex items-center gap-0.5">
+                            {item.events.map((evt) => (
+                              <FeedChip key={evt.id} event={evt} />
+                            ))}
+                          </span>
+                        )}
                       </span>
                     )
                   )}
