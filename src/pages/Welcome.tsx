@@ -236,8 +236,8 @@ export default function Welcome() {
                 color: "from-electric-violet/20 to-neon-indigo/20",
               },
               {
-                title: "Debate",
-                desc: "AI conversational debate designed to gently exercise stumble words.",
+                title: "Closer",
+                desc: "Simulate a real cold sales call — AI customers interrupt, object, and hang up.",
                 color: "from-vibrant-indigo/20 to-neon-purple/20",
               },
             ].map((card, i) => (

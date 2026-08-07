@@ -5,7 +5,7 @@ import Welcome from "./pages/Welcome";
 import Dashboard from "./pages/Dashboard";
 import RecordingSession from "./pages/RecordingSession";
 import SessionScript from "./pages/SessionScript";
-import SessionDebate from "./pages/SessionDebate";
+import CloserMode from "./pages/CloserMode";
 import Analysis from "./pages/Analysis";
 import PageTransition from "./components/PageTransition";
 import DevTuningPanel from "./components/DevTuningPanel";
@@ -21,7 +21,7 @@ export default function App() {
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/session" element={<RecordingSession />} />
               <Route path="/session/script" element={<SessionScript />} />
-              <Route path="/session/debate" element={<SessionDebate />} />
+              <Route path="/closer" element={<CloserMode />} />
               <Route path="/analysis" element={<Analysis />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

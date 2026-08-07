@@ -16,7 +16,7 @@ import Navbar from "../components/Navbar";
 import { useAuth } from "../context/AuthContext";
 
 interface PracticeMode {
-  id: "debate" | "script" | "unprompted";
+  id: "closer" | "script" | "unprompted";
   title: string;
   description: string;
   icon: typeof Mic;
@@ -28,14 +28,14 @@ interface PracticeMode {
 
 const modes: PracticeMode[] = [
   {
-    id: "debate",
-    title: "Debate Mode",
-    description: "Step into an AI-powered debate. The AI challenges your perspective across multiple exchanges to exercise spontaneous speech.",
+    id: "closer",
+    title: "Closer Mode",
+    description: "Practice realistic cold calls with AI customers. The customer interrupts, objects, and might hang up on you.",
     icon: Zap,
     gradient: "from-vibrant-indigo/20 via-neon-purple/10 to-transparent",
-    duration: "2-3 min",
-    features: ["AI opponent", "Multiple turns", "Real-time scoring"],
-    route: "/session/debate",
+    duration: "2 min",
+    features: ["AI customer", "Real objections", "Full sales report"],
+    route: "/closer",
   },
   {
     id: "script",
