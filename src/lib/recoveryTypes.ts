@@ -161,13 +161,17 @@ export interface RecoveredAssignment {
 }
 
 /**
- * Attach each "attached" annotation to its word span using the mission's
+ * Attach each annotation to the word it PRECEDES using the mission's
  * PRE-ONSET first-word window:
  *     [word.start − 600ms, word.end + 200ms]
  * The FIRST word whose window fits the annotation owns it (annotations never
- * drift to later words just because timestamps are closer). "Recovered" /
- * "unresolved" annotations have no lexical word and are returned as
- * standalone tokens for the renderer to insert inline.
+ * drift to later words just because timestamps are closer).
+ *
+ * "Recovered" annotations (the local recognizer found the INTENDED word
+ * Speechmatics missed) are ALSO attached to the following word here, so the
+ * transcript renders "slap + badge" inline exactly where the stutter
+ * happened — the intended word is never lost. Only truly wordless
+ * unresolved blocks fall through as standalone tokens.
  */
 export function assignRecoveredToSpans<T extends TimedSpan>(
   recs: RecoveredAnnotation[],
@@ -178,7 +182,7 @@ export function assignRecoveredToSpans<T extends TimedSpan>(
   if (recs.length === 0) return { attachedBySpan, standalone };
 
   for (const rec of recs) {
-    if (rec.status !== "attached") {
+    if (rec.status === "unresolved") {
       standalone.push(rec);
       continue;
     }

@@ -112,6 +112,11 @@ export function useLiveEvidenceFusion(
  * that exact word (pre-onset first-word window) — a suppressed event's
  * key is simply absent, so the word renders as a plain word. This is a
  * drop-in for the raw analysis.wordTags used by the transcript renderers.
+ *
+ * The transcript DISPLAY tag always mirrors the DETECTED type (block /
+ * repetition / prolongation / stutter / stammer) — the mission refinement
+ * (e.g. stammer→prolongation) stays internal metadata. This keeps the
+ * transcript and the Detection Feed in the exact same vocabulary.
  */
 export function buildVisibleTags(
   transcripts: TranscriptChunk[],
@@ -141,14 +146,9 @@ export function buildVisibleTags(
         if (!best || s.evidenceScore > best.evidenceScore) best = s;
       }
       if (best) {
-        // Map the mission classification back onto the render vocabulary.
-        // `hesitation_sequence` never comes from a single detector event
-        // (no acoustic type maps to it), so fall back to the raw type.
-        const refined = best.refinedType;
-        const tag: DisfluencyTag =
-          refined === "uncertain" || refined === "hesitation_sequence"
-            ? best.event.type
-            : refined;
+        // Transcript displays the DETECTED type, mirroring the Detection
+        // Feed. The refined mission type is metadata only.
+        const tag: DisfluencyTag = best.event.type;
         out.set(key, tag);
       }
     }

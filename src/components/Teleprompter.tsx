@@ -11,6 +11,30 @@ import FeedChip from "./FeedChip";
 import StutterSpan from "./StutterSpan";
 import PulseDots from "./PulseDots";
 
+/** Inline marker for an event with no matched script token yet — mirrors the
+ *  Detection Feed chip so the transcript NEVER loses a detected disfluency
+ *  while its word finalizes. */
+function InlineEventChip({ evt }: { evt: FeedEvent }) {
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-mono select-none border transition-colors duration-200 align-middle mx-0.5"
+      style={{
+        color: evt.color,
+        backgroundColor: `${evt.color}14`,
+        borderColor: `${evt.color}30`,
+      }}
+      title={`${evt.label} · ${(evt.durationMs / 1000).toFixed(1)}s`}
+    >
+      <span
+        className="w-1.5 h-1.5 rounded-full shrink-0"
+        style={{ backgroundColor: evt.color }}
+      />
+      {evt.label}
+      <span className="opacity-80">{(evt.durationMs / 1000).toFixed(1)}s</span>
+    </span>
+  );
+}
+
 // ─── Types ──────────────────────────────────────────────────────────────
 
 interface TeleprompterProps {
@@ -197,22 +221,30 @@ export default function Teleprompter({
   // Matched tokens carry their spoken word's start/end time (set by the
   // matcher as pure metadata). Renderer-only: the script pointer, scoring
   // and matcher state are completely untouched.
-  const tokenEventMap = useMemo(() => {
+  const { tokenEventMap, orphanEvents } = useMemo(() => {
     const map = new Map<number, FeedEvent[]>();
-    if (feedEvents.length === 0 || !hasDetails) return map;
-    const spans: { startTime: number; endTime: number }[] = [];
-    for (let i = 0; i < tokens.length; i++) {
-      const d = tokenDetails![i];
-      spans.push({
-        startTime: d?.startTime ?? -1,
-        endTime: d?.endTime ?? -1,
-      });
+    let orphans: FeedEvent[] = [];
+    if (feedEvents.length > 0 && hasDetails) {
+      const spans: { startTime: number; endTime: number }[] = [];
+      for (let i = 0; i < tokens.length; i++) {
+        const d = tokenDetails![i];
+        spans.push({
+          startTime: d?.startTime ?? -1,
+          endTime: d?.endTime ?? -1,
+        });
+      }
+      const assignments = assignEventsToSpans(feedEvents, spans);
+      for (let i = 0; i < assignments.length; i++) {
+        if (assignments[i].length > 0) map.set(i, assignments[i]);
+      }
+      // Events that matched NO token are orphan markers (rendered after the
+      // active token) so a detected disfluency is never lost from the script.
+      const attachedIds = new Set(assignments.flat().map((e) => e.id));
+      orphans = feedEvents
+        .filter((e) => !attachedIds.has(e.id))
+        .sort((a, b) => a.startTime - b.startTime);
     }
-    const assignments = assignEventsToSpans(feedEvents, spans);
-    for (let i = 0; i < assignments.length; i++) {
-      if (assignments[i].length > 0) map.set(i, assignments[i]);
-    }
-    return map;
+    return { tokenEventMap: map, orphanEvents: orphans };
   }, [feedEvents, tokenDetails, tokens, hasDetails]);
 
   // Map recovery annotations onto matched script tokens by timestamp (Stage 3).
@@ -443,6 +475,14 @@ export default function Teleprompter({
                 {i === activeIndex && pending.length > 0 && (
                   <PulseDots title={`Analyzing ${pending[0].type}…`} />
                 )}
+                {/* Orphan event markers (no matched script token yet) —
+                    rendered after the active token so the transcript NEVER
+                    loses a detected disfluency while its word finalizes. */}
+                {i === activeIndex &&
+                  orphanEvents.length > 0 &&
+                  orphanEvents.map((evt) => (
+                    <InlineEventChip key={evt.id} evt={evt} />
+                  ))}
               </span>
             );
           })}

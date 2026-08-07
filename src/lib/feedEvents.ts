@@ -80,12 +80,20 @@ function eventOverlapRatio(evt: FeedEvent, span: TimedSpan): number {
 }
 
 const MIN_OVERLAP_RATIO = 0.15;
+/** Pre-onset attachment window after an event ends (mirrors evidenceFusion). */
+const PRE_ONSET_ATTACH_S = 0.6;
+/** Blocks release INTO the following word — the net is wider for them. */
+const BLOCK_PRE_ONSET_S = 0.9;
 
 /**
  * Attach each feed event to its single best-matching word/span by timestamp
  * overlap, so each event appears on exactly one word (no duplicates).
- * Events that end just before a word onset (silent blocks) attach to that
- * following word. Returns one array per span (parallel to `spans`).
+ *
+ * PRE-ONSET RULE (mirrors the fusion layer): a stutter/repetition/block
+ * happens BEFORE the lexical word — "s-s-s-" then "slap", "------" then
+ * "cat". An event that ends just before a word onset attaches to that
+ * FOLLOWING word, so the transcript mirrors the Detection Feed exactly.
+ * Returns one array per span (parallel to `spans`).
  *
  * Purely additive and stable: as events and finalized words grow, an
  * existing word's annotations are never removed or reassigned.
@@ -111,14 +119,15 @@ export function assignEventsToSpans<T extends TimedSpan>(
       out[bestIdx].push(evt);
       continue;
     }
-    // Silent block that ends right before a word onset attaches to that word
-    if (evt.type === "block") {
-      for (let i = 0; i < spans.length; i++) {
-        const s = spans[i];
-        if (s.startTime >= evt.endTime - 0.05 && s.startTime <= evt.endTime + 0.25) {
-          out[i].push(evt);
-          break;
-        }
+    // Pre-onset: the event ends just before a word onset (stutter prefix,
+    // silent block). The FIRST following word owns it — never drift.
+    const windowS = evt.type === "block" ? BLOCK_PRE_ONSET_S : PRE_ONSET_ATTACH_S;
+    for (let i = 0; i < spans.length; i++) {
+      const s = spans[i];
+      const gap = s.startTime - evt.endTime;
+      if (gap >= -0.05 && gap <= windowS) {
+        out[i].push(evt);
+        break;
       }
     }
   }

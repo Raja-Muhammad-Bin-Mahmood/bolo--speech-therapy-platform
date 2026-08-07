@@ -119,6 +119,8 @@ export default function TranscriptionChunks({
                 <StutterSpan key={`r-${item.rec.id}`} annotation={item.rec} />
               ) : item.kind === "pending" ? (
                 <PulseDots key={item.evt.id} title={`Analyzing ${item.evt.type}…`} />
+              ) : item.kind === "event" ? (
+                <InlineEventChip key={item.evt.id} evt={item.evt} />
               ) : (
                 <WordSpan key={wi} word={item.word} />
               )
@@ -171,6 +173,33 @@ const PAUSE_LABELS: Record<PauseEvent["type"], string> = {
 
 /** Pure sentence markers — rendered as faint separators, NEVER error boxes */
 const SENTENCE_MARKERS = new Set([".", "!", "?", "…"]);
+
+/** Inline marker for a detector event that has no transcript word yet
+ *  (e.g. a block before the following word finalizes). Renders the type +
+ *  duration exactly like the Detection Feed chip, so the transcript NEVER
+ *  loses a detected disfluency — it stays visible until its word lands. */
+function InlineEventChip({ evt }: { evt: FeedEvent }) {
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-mono select-none border transition-colors duration-200"
+      style={{
+        color: evt.color,
+        backgroundColor: `${evt.color}14`,
+        borderColor: `${evt.color}30`,
+      }}
+      title={`${evt.label} · ${(evt.durationMs / 1000).toFixed(1)}s`}
+    >
+      <span
+        className="w-1.5 h-1.5 rounded-full shrink-0"
+        style={{ backgroundColor: evt.color }}
+      />
+      {evt.label}
+      <span className="opacity-80">
+        {(evt.durationMs / 1000).toFixed(1)}s
+      </span>
+    </span>
+  );
+}
 
 function PauseBadge({ event }: { event: PauseEvent }) {
   if (!event.shouldColor) return null;
@@ -273,7 +302,8 @@ type LineItem =
   | { kind: "word"; word: LineWord }
   | { kind: "pause"; event: PauseEvent }
   | { kind: "recovered"; rec: RecoveredAnnotation }
-  | { kind: "pending"; evt: PendingSpeechEvent };
+  | { kind: "pending"; evt: PendingSpeechEvent }
+  | { kind: "event"; evt: FeedEvent };
 
 function buildLines(
   transcripts: TranscriptChunk[],
@@ -318,6 +348,14 @@ function buildLines(
   // Map existing detector events onto finalized word spans by timestamp.
   // Renderer-only: no new events, no re-classification.
   const eventAssignments = assignEventsToSpans(events, wordSpans);
+  // Events that matched NO word (orphans — e.g. a block before the next
+  // word has finalized) are injected inline as `[Type] d.ds` markers so the
+  // transcript NEVER loses a detected disfluency. When the word lands, the
+  // event attaches to it and the inline marker disappears.
+  const attachedIds = new Set(eventAssignments.flat().map((e) => e.id));
+  const orphanEvents = events
+    .filter((e) => !attachedIds.has(e.id))
+    .sort((a, b) => a.startTime - b.startTime);
 
   // Map recovery annotations onto the same word spans (Stage 3).
   const recoveredAssignment = buildRecoveredItems(recovered, wordSpans);
@@ -330,6 +368,77 @@ function buildLines(
         item.word.events = eventAssignments[spanIdx] ?? [];
         item.word.recovered = recoveredAssignment.attachedByIndex[spanIdx] ?? null;
         spanIdx++;
+      }
+    }
+  }
+
+  // ── Interim hypotheses → stable word (mission rule) ──────────────────
+  // Partials ARE the live transcript: a disfluency detected on an interim
+  // word is shown immediately (tag + feed chip), so the user sees the
+  // struggle while speaking, not after the final lands. When the final
+  // supersedes the partial, the same tag/event re-attaches to the final
+  // token — annotations MIGRATE, never disappear.
+  const partials = transcripts.filter((t) => !t.isFinal);
+  if (partials.length > 0) {
+    const latest = partials[partials.length - 1];
+    const partialSpans: { text: string; startTime: number; endTime: number }[] = [];
+    for (const w of latest.words) {
+      const text = (w as any).text || w.word || "";
+      if (!text) continue;
+      partialSpans.push({
+        text,
+        startTime: w.startTime ?? 0,
+        endTime: w.endTime ?? (w.startTime ?? 0) + 0.3,
+      });
+    }
+    const partialAssignments = assignEventsToSpans(events, partialSpans);
+    const partialRecovered = buildRecoveredItems(recovered, partialSpans);
+    const partialOrphans: FeedEvent[] = [];
+    const pAttached = new Set(partialAssignments.flat().map((e) => e.id));
+    for (const e of events) {
+      if (!pAttached.has(e.id)) partialOrphans.push(e);
+    }
+    partialOrphans.sort((a, b) => a.startTime - b.startTime);
+
+    const liveItems: LineItem[] = latest.words.map((w, wi) => {
+      const text = (w as any).text || w.word || "";
+      const key = `${Math.round((w.startTime ?? 0) * 1000)}-${Math.round((w.endTime ?? (w.startTime ?? 0) + 0.3) * 1000)}`;
+      const tag = wordTags?.get(key) ?? null;
+      return {
+        kind: "word" as const,
+        word: {
+          text,
+          isFinal: false,
+          tag,
+          startTime: w.startTime ?? 0,
+          events: partialAssignments[wi] ?? [],
+          recovered: partialRecovered.attachedByIndex[wi] ?? null,
+        },
+      };
+    });
+    // Orphan events (no partial word yet — block before the word finalizes)
+    for (const evt of partialOrphans) {
+      const evtTime = evt.startTime;
+      let inserted = false;
+      for (let idx = 0; idx < liveItems.length; idx++) {
+        const it = liveItems[idx];
+        if (it.kind !== "word") continue;
+        if ((it.word as LineWord).startTime >= evtTime) {
+          liveItems.splice(idx, 0, { kind: "event", evt });
+          inserted = true;
+          break;
+        }
+      }
+      if (!inserted) liveItems.push({ kind: "event", evt });
+    }
+    if (liveItems.some((i) => i.kind === "word" && (i.word as LineWord).text)) {
+      if (lines.length === 0) {
+        lines.push({ id: `line-${lineId++}`, items: liveItems });
+      } else {
+        lines[lines.length - 1] = {
+          ...lines[lines.length - 1],
+          items: [...lines[lines.length - 1].items, ...liveItems],
+        };
       }
     }
   }
@@ -393,6 +502,32 @@ function buildLines(
     }
   }
 
+  // ── Inject orphan events inline (no word yet — block before onset, etc.) ──
+  for (const evt of orphanEvents) {
+    const evtTime = evt.startTime;
+    let inserted = false;
+    for (const line of lines) {
+      for (let idx = 0; idx < line.items.length; idx++) {
+        const item = line.items[idx];
+        if (item.kind !== "word") continue;
+        const wStart = (item.word as LineWord).startTime;
+        if (wStart >= evtTime) {
+          line.items.splice(idx, 0, { kind: "event", evt });
+          inserted = true;
+          break;
+        }
+      }
+      if (inserted) break;
+    }
+    if (!inserted) {
+      // No word after it yet — append to the last line so the block stays
+      // visible at the transcript cursor while the word finalizes.
+      if (lines.length > 0) {
+        lines[lines.length - 1].items.push({ kind: "event", evt });
+      }
+    }
+  }
+
   // ── Inject pending markers inline (events still OPEN/WAITING) ──────
   for (const evt of pending) {
     const evtTime = evt.startTime;
@@ -414,31 +549,6 @@ function buildLines(
       // No word yet — leave it to the trailing cursor indicator (rendered
       // by the component after the last line).
       continue;
-    }
-  }
-
-  // Append current partials (live preview) to the last line, dimmed.
-  const partials = transcripts.filter((t) => !t.isFinal);
-  if (partials.length > 0) {
-    const latest = partials[partials.length - 1];
-    const liveItems: LineItem[] = latest.words.map((w) => ({
-      kind: "word" as const,
-      word: {
-        text: (w as any).text || w.word || "",
-        isFinal: false,
-        tag: null,
-        startTime: w.startTime ?? 0,
-      },
-    }));
-    if (liveItems.some((i) => i.kind === "word" && (i.word as LineWord).text)) {
-      if (lines.length === 0) {
-        lines.push({ id: `line-${lineId++}`, items: liveItems });
-      } else {
-        lines[lines.length - 1] = {
-          ...lines[lines.length - 1],
-          items: [...lines[lines.length - 1].items, ...liveItems],
-        };
-      }
     }
   }
 

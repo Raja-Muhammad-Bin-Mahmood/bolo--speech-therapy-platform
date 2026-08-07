@@ -5,13 +5,15 @@
  * the three transcript surfaces (Script / Free Speech / Debate). They are
  * the SAME annotation logic everywhere — only the display container differs.
  *
- * Rendering rule (spec):
- *   <span class="stutter-annotation">b-b-b-</span>boy
- *   <span class="stutter-annotation">ssssss</span>slap
+ * Rendering rule (mission — "NEVER lose the intended word"):
+ *   sssssslap  →  slap + "Prolong" badge   (recovered → the INTENDED word)
+ *   b-b-b-boy  →  boy  + "Stutter" badge   (recovered → the INTENDED word)
+ *   ------cat  →  [Block] cat              (unresolved block stays visible)
  *
- * An "attached" annotation wraps the prefix + base word; a "recovered" one
- * inserts the fragment before the following word; an "unresolved" one shows
- * a conservative placeholder. Never invents words, never duplicates.
+ * The transcript NEVER shows raw phonetic characters ("ssss", "b-b-b-").
+ * A recovered annotation inserts the LEXICAL WORD (recoveredText) inline;
+ * an unresolved block inserts a "[Block]" marker — the intended word must
+ * never disappear from the transcript.
  */
 import type { RecoveredAnnotation } from "./recoveryTypes";
 import { assignRecoveredToSpans } from "./recoveryTypes";
@@ -27,6 +29,10 @@ export interface TimedSpan {
  * Each word carries its base text + any attached annotation; standalone
  * annotations (recovered/unresolved with no word) are inserted inline by
  * timestamp so the transcript stays aligned and nothing duplicates.
+ *
+ * Recovery annotations are attached to the word they precede (pre-onset
+ * first-word window), so a recovered "slap" renders inline where the
+ * stutter happened and never duplicates a later Speechmatics token.
  */
 export function buildRecoveredItems<T extends TimedSpan>(
   recs: RecoveredAnnotation[],
