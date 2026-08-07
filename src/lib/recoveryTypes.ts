@@ -40,10 +40,18 @@ export interface RecoveredAnnotation {
   source: RecoverySource;
   /** Speechmatics base word the annotation is attached to (if any) */
   baseWord?: string;
-  /** Stuttered prefix to render BEFORE the base word, e.g. "b-b-b-" */
+  /**
+   * Stuttered prefix — metadata only (review/tooltips). The transcript NEVER
+   * renders raw phonetic characters; it renders the lexical word + a badge.
+   */
   prefix?: string;
   /** Text recovered by the local fallback recognizer (when status=recovered) */
   recoveredText?: string;
+  /**
+   * Display badge label (e.g. "Stutter", "Block", "Prolong", "Repeat").
+   * The transcript renders the lexical word + this label — never "ssss".
+   */
+  label?: string;
   /** Conservative placeholder when nothing confident was recovered */
   placeholder?: string;
   /** Human-readable WHY (shown in tooltips / review) */

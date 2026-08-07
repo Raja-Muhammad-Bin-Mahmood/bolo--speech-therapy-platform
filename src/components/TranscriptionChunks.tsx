@@ -5,10 +5,12 @@ import type { DisfluencyTag } from "../hooks/useSessionAnalysis";
 import type { PauseEvent } from "../lib/pauseDetector";
 import type { FeedEvent } from "../lib/feedEvents";
 import type { RecoveredAnnotation } from "../lib/recoveryTypes";
+import type { PendingSpeechEvent } from "../hooks/useEventEngine";
 import { assignEventsToSpans } from "../lib/feedEvents";
 import { buildRecoveredItems } from "../lib/recoveryRender";
 import FeedChip from "./FeedChip";
 import StutterSpan from "./StutterSpan";
+import PulseDots from "./PulseDots";
 
 interface TranscriptionChunksProps {
   transcripts: TranscriptChunk[];
@@ -23,11 +25,20 @@ interface TranscriptionChunksProps {
    */
   events?: FeedEvent[];
   /**
-   * Recovery annotations (Stage 3). Attached ones wrap the stuttered prefix
-   * + base word; recovered/unresolved ones insert inline fragments or
-   * conservative placeholders. Never duplicates, never invents words.
+   * Recovery annotations (Stage 3). Recovered ones insert the lexical word
+   * + badge inline; unresolved ones are suppressed (never a placeholder).
    */
   recovered?: RecoveredAnnotation[];
+  /**
+   * Speechmatics word keys to HIDE — words the engine recovered locally
+   * first (timestamp-locked). Prevents duplicate tokens.
+   */
+  duplicateKeys?: Set<string>;
+  /**
+   * OPEN/WAITING events — render a pulsing "analyzing" indicator at the
+   * transcript cursor while BOLO resolves the struggle.
+   */
+  pending?: PendingSpeechEvent[];
   /** Safety-net max words per line */
   maxWordsPerLine?: number;
 }
@@ -46,6 +57,8 @@ export default function TranscriptionChunks({
   pauseEvents = [],
   events = [],
   recovered = [],
+  duplicateKeys,
+  pending = [],
   maxWordsPerLine = 16,
 }: TranscriptionChunksProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -57,6 +70,8 @@ export default function TranscriptionChunks({
     pauseEvents,
     events,
     recovered,
+    duplicateKeys,
+    pending,
     maxWordsPerLine
   );
 
@@ -102,10 +117,21 @@ export default function TranscriptionChunks({
                 <PauseBadge key={wi} event={item.event} />
               ) : item.kind === "recovered" ? (
                 <StutterSpan key={`r-${item.rec.id}`} annotation={item.rec} />
+              ) : item.kind === "pending" ? (
+                <PulseDots key={item.evt.id} title={`Analyzing ${item.evt.type}…`} />
               ) : (
                 <WordSpan key={wi} word={item.word} />
               )
             )}
+            {/* Pulsing "analyzing" indicator at the transcript cursor */}
+            {line.id === lines[lines.length - 1].id &&
+              pending.length > 0 && (
+                <PulseDots
+                  title={`BOLO is analyzing ${pending.length} ${
+                    pending.length === 1 ? "struggle" : "struggles"
+                  }…`}
+                />
+              )}
           </motion.div>
         ))}
       </AnimatePresence>
@@ -246,7 +272,8 @@ function WordSpan({ word }: { word: LineWord }) {
 type LineItem =
   | { kind: "word"; word: LineWord }
   | { kind: "pause"; event: PauseEvent }
-  | { kind: "recovered"; rec: RecoveredAnnotation };
+  | { kind: "recovered"; rec: RecoveredAnnotation }
+  | { kind: "pending"; evt: PendingSpeechEvent };
 
 function buildLines(
   transcripts: TranscriptChunk[],
@@ -254,6 +281,8 @@ function buildLines(
   pauseEvents: PauseEvent[],
   events: FeedEvent[],
   recovered: RecoveredAnnotation[],
+  duplicateKeys: Set<string> | undefined,
+  pending: PendingSpeechEvent[],
   maxWordsPerLine: number
 ): { id: string; items: LineItem[] }[] {
   const lines: { id: string; items: LineItem[] }[] = [];
@@ -272,6 +301,9 @@ function buildLines(
       const text = (w as any).text || w.word || "";
       if (!text) continue;
       const key = `${Math.round(w.startTime * 1000)}-${Math.round(w.endTime * 1000)}`;
+      // Timestamp-anchored dedup: a word the engine recovered locally first
+      // is hidden here so it never renders twice.
+      if (duplicateKeys?.has(key)) continue;
       const tag = wordTags?.get(key) ?? null;
       const arr = grouped.get(utterance) ?? [];
       wordSpans.push({ text, startTime: w.startTime, endTime: w.endTime });
@@ -358,6 +390,30 @@ function buildLines(
     }
     if (!inserted && lines.length > 0) {
       lines[lines.length - 1].items.push({ kind: "recovered", rec });
+    }
+  }
+
+  // ── Inject pending markers inline (events still OPEN/WAITING) ──────
+  for (const evt of pending) {
+    const evtTime = evt.startTime;
+    let inserted = false;
+    for (const line of lines) {
+      for (let idx = 0; idx < line.items.length; idx++) {
+        const item = line.items[idx];
+        if (item.kind !== "word") continue;
+        const wStart = (item.word as LineWord).startTime;
+        if (wStart >= evtTime) {
+          line.items.splice(idx, 0, { kind: "pending", evt });
+          inserted = true;
+          break;
+        }
+      }
+      if (inserted) break;
+    }
+    if (!inserted) {
+      // No word yet — leave it to the trailing cursor indicator (rendered
+      // by the component after the last line).
+      continue;
     }
   }
 
