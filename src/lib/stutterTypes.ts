@@ -2,7 +2,7 @@
  * BOLO — Shared Stutter Event Contract
  *
  * ONE event model used by every surface: live transcript, script mode,
- * free speech mode, debate mode, review screen, charts and summary cards.
+ * free speech mode, review screen, charts and summary cards.
  * The local audio lane (AudioWorklet) posts feature FRAMES; the timeline
  * engine produces CANDIDATES; the fusion layer turns them into StutterEvents
  * bound to finalized Speechmatics words.

@@ -2,7 +2,7 @@
  * BOLO — Evidence Tuning Context
  *
  * Holds the live evidence-fusion weights shared by every mode (Script /
- * Free Speech / Debate) and a rolling log of the most recent scored
+ * Free Speech / Closer) and a rolling log of the most recent scored
  * events for the hidden developer panel. Slider changes here take
  * effect immediately — consumers recompute their gating on the next
  * render (no reload, no rebuild).

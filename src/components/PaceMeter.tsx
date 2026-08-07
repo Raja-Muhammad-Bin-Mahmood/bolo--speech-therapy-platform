@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import { Gauge, TrendingDown, TrendingUp, Minus } from "lucide-react";
 import type { PaceSnapshot, PaceState, PaceTrend } from "../lib/paceEngine";
 
-export type PaceVariant = "compact" | "full" | "session" | "debate";
+export type PaceVariant = "compact" | "full" | "session";
 
 interface PaceMeterProps {
   snapshot: PaceSnapshot;
@@ -17,7 +17,7 @@ interface PaceMeterProps {
  *
  * - compact: small badge + mini bar (Script Mode — don't steal attention)
  * - full:    prominent bar + all readouts (Free Speech Mode)
- * - debate:  medium bar tuned for the debate HUD
+ * - session: medium card (Unprompted mode HUD)
  */
 function PaceMeterBase({ snapshot, variant = "full", className }: PaceMeterProps) {
   if (variant === "compact") {
@@ -25,9 +25,6 @@ function PaceMeterBase({ snapshot, variant = "full", className }: PaceMeterProps
   }
   if (variant === "session") {
     return <SessionPace snapshot={snapshot} className={className} />;
-  }
-  if (variant === "debate") {
-    return <DebatePace snapshot={snapshot} className={className} />;
   }
   return <FullPace snapshot={snapshot} className={className} />;
 }
@@ -244,32 +241,6 @@ function SessionPace({ snapshot, className }: { snapshot: PaceSnapshot; classNam
       <div className="mt-2">
         <TrendTag trend={snapshot.trend} />
       </div>
-    </div>
-  );
-}
-
-// ─── Debate (medium — lives in the debate HUD) ───────────────────────
-
-function DebatePace({ snapshot, className }: { snapshot: PaceSnapshot; className?: string }) {
-  const color = STATE_COLORS[snapshot.paceState];
-  return (
-    <div className={`flex flex-col gap-1.5 ${className ?? ""}`}>
-      <div className="flex items-center justify-between">
-        <span className="inline-flex items-center gap-1 text-[10px] text-soft-gray/70">
-          <Gauge className="w-3 h-3" style={{ color }} />
-          Pace
-        </span>
-        <div className="flex items-center gap-2">
-          <TrendTag trend={snapshot.trend} />
-          <span
-            className="text-[10px] font-mono font-medium"
-            style={{ color }}
-          >
-            {snapshot.rollingWpm > 0 ? snapshot.rollingWpm : "—"} WPM
-          </span>
-        </div>
-      </div>
-      <PaceAxis wpm={snapshot.rollingWpm} height="h-2" markerSize="w-3 h-3" />
     </div>
   );
 }

@@ -45,7 +45,7 @@ const BADGE_LABELS: Record<AcousticEventType, string> = {
 
 interface StutterSpanProps {
   annotation: RecoveredAnnotation;
-  /** Optional extra class for mode-specific layout (compact in Debate). */
+  /** Optional extra class for mode-specific layout. */
   className?: string;
 }
 

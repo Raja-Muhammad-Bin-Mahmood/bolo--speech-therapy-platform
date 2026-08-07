@@ -2,7 +2,7 @@
  * BOLO — recoveryRender helpers
  *
  * Pure functions that turn RecoveredAnnotations into renderable items for
- * the three transcript surfaces (Script / Free Speech / Debate). They are
+ * the three transcript surfaces (Script / Free Speech / Closer). They are
  * the SAME annotation logic everywhere — only the display container differs.
  *
  * Rendering rule (mission — "NEVER lose the intended word"):

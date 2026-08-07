@@ -2,7 +2,7 @@
  * BOLO — useEventEngine: Event-Centric Stutter Recovery & Word Stitching
  *
  * Replaces the old fire-and-forget recovery hook with the mission's
- * event-centric pipeline (shared by Script, Free Speech and Debate):
+ * event-centric pipeline (shared by Script, Free Speech and Closer):
  *
  *   • EVERY suspicious acoustic pattern becomes an OPEN event immediately —
  *     we never wait for the sentence to finish.

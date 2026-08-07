@@ -1,7 +1,7 @@
 /**
  * BOLO — useEvidenceFusion
  *
- * ONE shared hook for Script / Free Speech / Debate modes. It:
+ * ONE shared hook for Script / Free Speech / Closer modes. It:
  *   • scores every raw acoustic event with the Evidence Fusion layer
  *     (the base detector output is NEVER modified — we only read it)
  *   • reports the live verdicts to the developer tuning panel

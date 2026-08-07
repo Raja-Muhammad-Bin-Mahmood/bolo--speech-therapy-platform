@@ -1,7 +1,7 @@
 /**
  * BOLO — Shared Pace Engine
  *
- * One engine for ALL modes (Script, Free Speech, Debate).
+ * One engine for ALL modes (Script, Free Speech, Closer).
  * Measures pace from finalized Speechmatics words + pause events.
  * Never uses partials. Never counts punctuation as words.
  * Startup guard prevents fake-fast WPM in the first ~1.5s.

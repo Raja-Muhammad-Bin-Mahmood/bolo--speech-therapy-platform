@@ -82,7 +82,7 @@ export default function SessionScript() {
     }, [scriptMetrics.activeTokenIndex, scriptMetrics.tokenDetails, passage.text]),
   });
 
-  // ── Evidence Fusion Layer (same gate as Free Speech + Debate): scores
+  // ── Evidence Fusion Layer (same gate as Free Speech + Closer): scores
   // every raw acoustic event and only lets strong evidence become a
   // visible annotation. Script alignment, scoring and pacing are untouched.
   const fusion = useLiveEvidenceFusion(

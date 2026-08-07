@@ -3,6 +3,7 @@ import { useAudioCapture } from "./useAudioCapture";
 import { useSpeechmaticsWS } from "./useSpeechmaticsWS";
 import { useGeminiLive } from "./useGeminiLive";
 import { pickMood, pickName, pickPersona } from "../data/closerCatalog";
+import { playHangupTone } from "../lib/closerAudio";
 import {
   buildCustomerSystemPrompt,
   buildReportPrompt,
@@ -136,6 +137,7 @@ export function useCloserCall() {
       mic.stop();
       stt.disconnect();
       live.close();
+      playHangupTone();
       setPhaseBoth("ended");
       void generateReport(reason);
     },
