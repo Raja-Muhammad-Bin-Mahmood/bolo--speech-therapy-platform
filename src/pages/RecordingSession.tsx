@@ -48,7 +48,7 @@ import {
   finalizeSessionScore,
 } from "../hooks/useSessionAnalysis";
 import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
-import { useEventEngine } from "../hooks/useEventEngine";
+import { useStutterRecovery } from "../hooks/useStutterRecovery";
 import { useLiveEvidenceFusion, buildVisibleTags } from "../hooks/useEvidenceFusion";
 import { useAuth } from "../context/AuthContext";
 import { toFeedEvents } from "../lib/feedEvents";
@@ -108,26 +108,16 @@ export default function RecordingSession() {
   const pace = usePaceEngine();
   const paceSnapshot = usePaceSnapshot(pace.engine);
 
-  // ── Combined acoustic lane (worklet DSP + RMS/ZCR sensor) ──────────
-  const allAcoustic = useMemo(
-    () => [...acoustic.events, ...sensor.events],
-    [acoustic.events, sensor.events]
-  );
-
-  // ── Stage 3: Event-centric recovery (OPEN event → hold → fallback worker).
-  // Speechmatics stays the primary transcript; the engine ONLY recovers words
-  // that Speechmatics normalized away (slap → sssssslap, boy → b-b-boy) and
-  // stitches them in once with a badge — never raw phonetic text, never dupes.
-  const recovery = useEventEngine({
+  // ── Stage 3: Event-triggered recovery (hold → ring buffer → fallback) ──
+  // Speechmatics stays the primary transcript; this ONLY annotates detector
+  // events that Speechmatics normalized away (slap → sssssslap, boy → b-b-boy).
+  const recovery = useStutterRecovery({
     active: isRecording && ws.status === "connected",
     getStreamTime: audio.getStreamTime,
     setOnPcm: audio.setOnPcm,
     transcripts: ws.transcripts,
-    events: allAcoustic,
+    events: [...acoustic.events, ...sensor.events],
   });
-  // Speechmatics word keys the engine recovered locally first (hidden in the
-  // transcript so a word never renders twice).
-  const duplicateKeys = useMemo(() => recovery.duplicateKeys, [recovery.duplicateKeys]);
 
   // Existing detector events in the Detection Feed vocabulary — the same
   // list the Detection Feed renders, mapped onto finalized transcript words.
@@ -140,6 +130,10 @@ export default function RecordingSession() {
   // become a VISIBLE transcript annotation. The base detector output is
   // never modified — raw events still reach the Detection Feed below and
   // the full review on /analysis. ─────────────────────────────────────
+  const allAcoustic = useMemo(
+    () => [...acoustic.events, ...sensor.events],
+    [acoustic.events, sensor.events]
+  );
   const fusion = useLiveEvidenceFusion(ws.transcripts, allAcoustic, analysis.pauseEvents);
 
   // Gated word-tags for the visible transcript (suppressed events render
@@ -639,8 +633,6 @@ export default function RecordingSession() {
                   pauseEvents={analysis.pauseEvents}
                   events={gatedFeedForTranscript}
                   recovered={gatedRecovered}
-                  duplicateKeys={duplicateKeys}
-                  pending={recovery.pending}
                 />
               </div>
 

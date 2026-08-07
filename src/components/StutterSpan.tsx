@@ -1,43 +1,32 @@
 /**
- * BOLO — StutterSpan (lexical word + badge)
+ * BOLO — StutterSpan
  *
- * Rendering rule (mission):
- *   sssssslap    →  slap  + "prolongation" badge
- *   b-b-b-boy    →  boy   + "repetition" badge
- *   bbhhlock     →  lock  + "block"/"stammer" badge
+ * The DOM/rendering requirement from the spec:
+ *   <span class="stutter-annotation">b-b-b-</span>boy
+ *   <span class="stutter-annotation">ssssss</span>slap
  *
- * The transcript NEVER shows raw phonetic characters (no "ssss", no
- * "b-b-b-"). This component renders the LEXICAL word plus a small
- * structured label/marker. The stutter evidence itself lives in the
- * badge + tooltip, never in the text.
+ * This is the ONE component used identically in Script, Free Speech and
+ * Debate modes. It reuses the existing feed color system (no new color
+ * schemes) and never breaks transcript alignment. Unresolved fragments
+ * (nothing confidently recovered) are suppressed from the transcript —
+ * they are never invented words; the Detection Feed and review panel
+ * still surface them.
  *
  * Provenance-aware:
- *   - attached   → Speechmatics word + badge (Case A/C)
- *   - recovered  → local fallback word + badge (Case B)
- *   - unresolved → suppressed from the transcript (never a placeholder
- *                  like "[unrecognized stutter]") — feed/review only
- *
- * Reuses the existing feed color system — no new color schemes.
+ *   - attached   → Speechmatics word + stuttered prefix span
+ *   - recovered  → local Wav2Vec2 fragment + stuttered prefix span
+ *   - unresolved → suppressed from transcript (never an invented word)
  */
 import type { RecoveredAnnotation } from "../lib/recoveryTypes";
 import type { AcousticEventType } from "../hooks/useAcousticAnalysis";
 
 // Existing feed vocabulary — SAME colors as the Detection Feed / transcript
-const BADGE_COLORS: Record<AcousticEventType, string> = {
+const PREFIX_COLORS: Record<AcousticEventType, string> = {
   block: "#FDBA74",
   repetition: "#FCA5A5",
   prolongation: "#F9A8D4",
   stutter: "#F87171",
   stammer: "#BD8CFF",
-};
-
-/** Label shown on the badge (structured marker, never phonetic text). */
-const BADGE_LABELS: Record<AcousticEventType, string> = {
-  block: "Block",
-  repetition: "Repeat",
-  prolongation: "Prolong",
-  stutter: "Stutter",
-  stammer: "Stammer",
 };
 
 interface StutterSpanProps {
@@ -50,7 +39,7 @@ export default function StutterSpan({
   annotation,
   className = "",
 }: StutterSpanProps) {
-  const color = BADGE_COLORS[annotation.type] ?? "#8B93A7";
+  const color = PREFIX_COLORS[annotation.type] ?? "#8B93A7";
 
   // Strong = solid styling; medium = slightly dimmed; uncertain = soft/dashed
   const bandStyle =
@@ -61,7 +50,27 @@ export default function StutterSpan({
         : { color: `${color}99`, borderColor: `${color}22`, background: "transparent", borderStyle: "dashed" as const };
 
   const confidencePct = Math.round(annotation.confidence * 100);
-  const label = annotation.label ?? BADGE_LABELS[annotation.type] ?? annotation.type;
+
+  // ── Recovered fragment (local recognizer) — insert inline before word ──
+  if (annotation.status === "recovered" && annotation.recoveredText) {
+    return (
+      <span
+        className={`stutter-annotation inline-flex items-center gap-0.5 align-middle mx-0.5 ${className}`}
+        title={`Recovered locally: "${annotation.recoveredText}" · ${confidencePct}% confidence · ${annotation.reason}`}
+      >
+        <span
+          className="rounded px-1 py-px text-[11px] font-medium select-none border"
+          style={bandStyle}
+        >
+          {annotation.prefix}
+          {annotation.recoveredText}
+        </span>
+        <span className="text-[9px] font-mono opacity-60" style={{ color }}>
+          ↺
+        </span>
+      </span>
+    );
+  }
 
   // ── Unresolved — nothing confident was recovered. Suppressed from the
   // transcript: no invented word, no placeholder chip. The Detection Feed
@@ -70,37 +79,18 @@ export default function StutterSpan({
     return null;
   }
 
-  // ── Attached (Speechmatics word) or recovered (local word) ──────────
-  // Render the LEXICAL word + the structured label badge. The raw stutter
-  // prefix (ssss / b-b-b-) is metadata only — shown in the tooltip, never
-  // in the transcript text.
-  const lexicalWord =
-    annotation.status === "recovered"
-      ? annotation.recoveredText
-      : annotation.baseWord;
-
+  // ── Attached — stuttered prefix + the Speechmatics base word ──
   return (
     <span
-      className={`stutter-annotation inline-flex items-center gap-1 align-middle mx-0.5 ${className}`}
-      title={`${label} · ${confidencePct}% · ${annotation.reason}${
-        annotation.prefix ? ` · spoken: “${annotation.prefix}”` : ""
-      }`}
+      className={`stutter-annotation inline-flex items-center gap-0.5 align-middle mx-0.5 ${className}`}
+      title={`${annotation.type} · ${confidencePct}% · ${annotation.reason}`}
     >
       <span
-        className="rounded-md px-1.5 py-px text-[13px] font-medium select-none border"
+        className="rounded px-1 py-px text-[11px] font-medium select-none border"
         style={bandStyle}
       >
-        {lexicalWord}
-      </span>
-      <span
-        className="rounded px-1 py-px text-[9px] font-semibold uppercase tracking-wide select-none border"
-        style={{
-          color,
-          borderColor: `${color}33`,
-          background: `${color}0D`,
-        }}
-      >
-        {label}
+        {annotation.prefix}
+        {annotation.baseWord}
       </span>
     </span>
   );
