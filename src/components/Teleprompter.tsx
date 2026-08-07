@@ -4,10 +4,12 @@ import type { TokenState, TokenDetail, DisfluencyKind } from "../hooks/useScript
 import type { PauseEvent } from "../lib/pauseDetector";
 import type { FeedEvent } from "../lib/feedEvents";
 import type { RecoveredAnnotation } from "../lib/recoveryTypes";
+import type { PendingSpeechEvent } from "../hooks/useEventEngine";
 import { assignEventsToSpans } from "../lib/feedEvents";
 import { buildRecoveredItems } from "../lib/recoveryRender";
 import FeedChip from "./FeedChip";
 import StutterSpan from "./StutterSpan";
+import PulseDots from "./PulseDots";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -35,10 +37,15 @@ interface TeleprompterProps {
    */
   feedEvents?: FeedEvent[];
   /**
-   * Recovery annotations (Stage 3) — the stuttered prefix + base word,
-   * or a conservative placeholder. Same annotation logic as Free Speech.
+   * Recovery annotations (Stage 3) — the lexical word + badge, or nothing
+   * (unresolved events are suppressed). Same annotation logic as Free Speech.
    */
   recovered?: RecoveredAnnotation[];
+  /**
+   * OPEN/WAITING events — render a pulsing "analyzing" indicator after the
+   * active token while BOLO resolves the struggle.
+   */
+  pending?: PendingSpeechEvent[];
 }
 
 // ─── Phoneme Highlighter ────────────────────────────────────────────────
@@ -160,6 +167,7 @@ export default function Teleprompter({
   pauseMarkers = [],
   feedEvents = [],
   recovered = [],
+  pending = [],
 }: TeleprompterProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -431,6 +439,10 @@ export default function Teleprompter({
                     </span>
                   )}
                 </motion.span>{" "}
+                {/* Pulsing "analyzing" indicator after the active token */}
+                {i === activeIndex && pending.length > 0 && (
+                  <PulseDots title={`Analyzing ${pending[0].type}…`} />
+                )}
               </span>
             );
           })}

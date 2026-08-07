@@ -15,7 +15,7 @@ import { useSpeechmaticsWS } from "../hooks/useSpeechmaticsWS";
 import { useAcousticAnalysis } from "../hooks/useAcousticAnalysis";
 import { useScriptMatcher, ScriptMetrics } from "../hooks/useScriptMatcher";
 import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
-import { useStutterRecovery } from "../hooks/useStutterRecovery";
+import { useEventEngine } from "../hooks/useEventEngine";
 import { useLiveEvidenceFusion } from "../hooks/useEvidenceFusion";
 import { toFeedEvents } from "../lib/feedEvents";
 import { visibleRecoveredFor, visibleFeedEventsFor } from "../lib/evidenceGating";
@@ -55,13 +55,31 @@ export default function SessionScript() {
     acousticEvents
   );
 
-  // ── Stage 3: Event-triggered recovery (annotate stuttered script words) ──
-  const recovery = useStutterRecovery({
+  // ── Stage 3: Event-centric recovery (annotate stuttered script words).
+  // The current script token is passed as the script anchor so the engine can
+  // recover a word Speechmatics missed when the script is consistent (Case B).
+  const recovery = useEventEngine({
     active: isRecording && ws.status === "connected",
     getStreamTime: audio.getStreamTime,
     setOnPcm: audio.setOnPcm,
     transcripts: ws.transcripts,
     events: acousticEvents,
+    // Script anchor: the passage word the speaker is currently on (only when
+    // it hasn't been flagged disfluent — that word is already being tracked).
+    scriptWord: useMemo(() => {
+      const idx = scriptMetrics.activeTokenIndex;
+      const detail = scriptMetrics.tokenDetails?.[idx];
+      if (
+        idx < 0 ||
+        !detail ||
+        detail.state === "matched" ||
+        detail.state === "skipped" ||
+        detail.disfluency
+      ) {
+        return null;
+      }
+      return passage.text.split(/\s+/)[idx] ?? null;
+    }, [scriptMetrics.activeTokenIndex, scriptMetrics.tokenDetails, passage.text]),
   });
 
   // ── Evidence Fusion Layer (same gate as Free Speech + Debate): scores
@@ -395,6 +413,7 @@ export default function SessionScript() {
                   pauseMarkers={scriptMetrics.pauseMarkers}
                   feedEvents={gatedFeedForTranscript}
                   recovered={gatedRecovered}
+                  pending={recovery.pending}
                 />
               </div>
             </div>
