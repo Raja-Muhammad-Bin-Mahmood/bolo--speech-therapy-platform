@@ -353,9 +353,14 @@ function buildLines(
   // transcript NEVER loses a detected disfluency. When the word lands, the
   // event attaches to it and the inline marker disappears.
   const attachedIds = new Set(eventAssignments.flat().map((e) => e.id));
-  const orphanEvents = events
-    .filter((e) => !attachedIds.has(e.id))
-    .sort((a, b) => a.startTime - b.startTime);
+  // Events attached to ANY rendered word (final OR live partial) must never
+  // be re-injected as an inline chip. The two orphan passes below share one
+  // mutually-exclusive pool, so a single event can never render twice —
+  // this kills the "duplicate key evt-*" React warning.
+  const injectedInlineIds = new Set<string>();
+  // Set inside the partial pass below; hoisted so the finals orphan pass
+  // can exclude events already attached to interim words.
+  let partialAttachedIds: Set<string> | null = null;
 
   // Map recovery annotations onto the same word spans (Stage 3).
   const recoveredAssignment = buildRecoveredItems(recovered, wordSpans);
@@ -393,12 +398,18 @@ function buildLines(
     }
     const partialAssignments = assignEventsToSpans(events, partialSpans);
     const partialRecovered = buildRecoveredItems(recovered, partialSpans);
-    const partialOrphans: FeedEvent[] = [];
-    const pAttached = new Set(partialAssignments.flat().map((e) => e.id));
-    for (const e of events) {
-      if (!pAttached.has(e.id)) partialOrphans.push(e);
-    }
-    partialOrphans.sort((a, b) => a.startTime - b.startTime);
+    // Events attached to interim words (or already rendered anywhere) never
+    // inject — an event attached to a FINAL word is already on screen as a
+    // chip, so it must not be spliced into the live line a second time.
+    partialAttachedIds = new Set(partialAssignments.flat().map((e) => e.id));
+    const partialOrphans = events
+      .filter(
+        (e) =>
+          !partialAttachedIds!.has(e.id) &&
+          !attachedIds.has(e.id) &&
+          !injectedInlineIds.has(e.id)
+      )
+      .sort((a, b) => a.startTime - b.startTime);
 
     const liveItems: LineItem[] = latest.words.map((w, wi) => {
       const text = (w as any).text || w.word || "";
@@ -430,6 +441,7 @@ function buildLines(
         }
       }
       if (!inserted) liveItems.push({ kind: "event", evt });
+      injectedInlineIds.add(evt.id);
     }
     if (liveItems.some((i) => i.kind === "word" && (i.word as LineWord).text)) {
       if (lines.length === 0) {
@@ -503,6 +515,17 @@ function buildLines(
   }
 
   // ── Inject orphan events inline (no word yet — block before onset, etc.) ──
+  // Pool = events attached to NEITHER a final word NOR a live partial, and
+  // not already injected by the partial pass — mutual exclusion guarantees a
+  // given event id appears at most once in the whole transcript.
+  const unionAttached = new Set<string>([
+    ...attachedIds,
+    ...(partialAttachedIds ?? []),
+    ...injectedInlineIds,
+  ]);
+  const orphanEvents = events
+    .filter((e) => !unionAttached.has(e.id))
+    .sort((a, b) => a.startTime - b.startTime);
   for (const evt of orphanEvents) {
     const evtTime = evt.startTime;
     let inserted = false;
@@ -526,6 +549,7 @@ function buildLines(
         lines[lines.length - 1].items.push({ kind: "event", evt });
       }
     }
+    injectedInlineIds.add(evt.id);
   }
 
   // ── Inject pending markers inline (events still OPEN/WAITING) ──────
