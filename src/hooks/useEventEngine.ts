@@ -40,6 +40,11 @@ import {
 } from "../lib/speechEvents";
 import { recognizeInWorker } from "../lib/fallbackAsr";
 import { FEED_LABELS } from "../lib/feedEvents";
+import {
+  evaluateInterruptionGate,
+  findPrevWordEnd,
+  countSpannedWords,
+} from "../lib/interruptionGate";
 
 // ─── Public types ───────────────────────────────────────────────────────
 
@@ -185,20 +190,48 @@ export function useEventEngine(options: EventEngineOptions): EventEngineOutput {
   // ── Ingest new DSP events → OPEN tickets immediately ──────────────────
   const ingestEvents = useCallback(() => {
     const now = performance.now();
+    const words = currentWords();
     for (const evt of eventsRef.current) {
       const key = `${evt.type}-${evt.startTime.toFixed(3)}`;
       if (seenEventsRef.current.has(key)) continue;
       seenEventsRef.current.add(key);
+
+      // STAGE 1 — Interruption Gate. Before a DSP candidate may be
+      // classified as a stutter (and consume the hold window + fallback
+      // ASR), the speech FLOW must show an interruption: a micro-pause
+      // before the labeled word (≥ 100 ms — the "reasonable delay between
+      // the two words"), a repeated onset, a sustained segment, or an
+      // onset block. Fluent function words ("could", "travel", "think")
+      // carry none of these — the candidate is discarded immediately and
+      // never becomes an OPEN ticket. The internal micro-pause is a
+      // validation signal only — never shown in the feed or transcript.
+      const prevWordEnd = findPrevWordEnd(words, evt.startTime);
+      const gate = evaluateInterruptionGate({
+        type: evt.type,
+        startTime: evt.startTime,
+        endTime: evt.endTime,
+        durationMs: evt.durationMs,
+        prevWordEnd,
+        wordStart: null,
+        overlappingWords: countSpannedWords(words, evt.startTime, evt.endTime),
+      });
+      if (!gate.passed) {
+        console.debug(
+          `[BOLO·event] gate: ${evt.type}@${evt.startTime.toFixed(2)}s rejected — ${gate.rejectionReason}`
+        );
+        continue;
+      }
+
       const se = createOpenEvent(evt);
       se.holdDeadlineMs = now + EVENT_SPEC.HOLD_MS;
       se.createdAtMs = now;
       eventMapRef.current.set(se.id, se);
       log(
         se,
-        `OPEN — DSP candidate (conf ${(evt.confidence * 100) | 0}%, ${evt.durationMs}ms)`
+        `OPEN — DSP candidate (conf ${(evt.confidence * 100) | 0}%, ${evt.durationMs}ms) · gate: ${gate.signals.join("; ")}`
       );
     }
-  }, [log]);
+  }, [currentWords, log]);
 
   // ── Ingest new Speechmatics words → anchor + dedupe ───────────────────
   const attachWords = useCallback(() => {

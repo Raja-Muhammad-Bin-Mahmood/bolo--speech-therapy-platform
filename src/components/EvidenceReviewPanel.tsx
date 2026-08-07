@@ -9,7 +9,7 @@
  */
 import { memo } from "react";
 import { motion } from "framer-motion";
-import { ShieldCheck, Eye, EyeOff, SlidersHorizontal } from "lucide-react";
+import { ShieldCheck, Eye, EyeOff, SlidersHorizontal, Activity } from "lucide-react";
 import type { ScoredEvent } from "../lib/evidenceFusion";
 
 const BAND_COLORS = {
@@ -96,6 +96,14 @@ function EvidenceReviewPanelBase({ scored }: EvidenceReviewPanelProps) {
                 {s.suppressionReasons.length > 0 && (
                   <p className="text-soft-gray/50 mt-1 leading-snug">
                     {s.suppressionReasons.join(" · ")}
+                  </p>
+                )}
+                {!s.interruptionPassed && (
+                  <p className="text-[#FDBA74]/90 mt-0.5 flex items-center gap-1">
+                    <Activity className="w-2.5 h-2.5 shrink-0" />
+                    <span className="leading-snug">
+                      Stage 1 gate — no interruption in speech flow
+                    </span>
                   </p>
                 )}
                 {s.lexicalVetoApplied && (

@@ -42,6 +42,11 @@
 import type { AcousticEvent, AcousticEventType } from "../hooks/useAcousticAnalysis";
 import type { PauseEvent } from "./pauseDetector";
 import type { FeedEvent } from "./feedEvents";
+import {
+  evaluateInterruptionGate,
+  findPrevWordEnd,
+  countSpannedWords,
+} from "./interruptionGate";
 
 // ─── Spec hard numbers (mission) ─────────────────────────────────────────
 
@@ -182,6 +187,14 @@ export interface ScoredEvent {
   attachmentPosition: AttachmentPosition;
   /** Why this word owns the event (logged for the debugging requirement) */
   attachmentReason: string;
+  /** Stage 1 gate — was the speech FLOW interrupted (micro-pause, repeated
+   *  onset, sustained segment, onset block)? A fluent word with no
+   *  interruption is never classified as a stutter. */
+  interruptionPassed: boolean;
+  /** The interruption evidence that justified classification (empty when rejected). */
+  interruptionSignals: string[];
+  /** Why the Stage 1 gate rejected the candidate (null when passed). */
+  interruptionRejected: string | null;
 }
 
 // ─── Lexical context (weak signals only — never a hard decision) ─────────
@@ -482,6 +495,27 @@ export function scoreEvent(
   const lexical = match.word ? lexicalSignal(match.word, match.position) : 0.15;
   const transcriptSupport = clamp01(match.confidence * lexical);
 
+  // ── STAGE 1 — Interruption Gate ────────────────────────────────────
+  // Before ANY candidate may be classified as a stutter, the speech FLOW
+  // must have been interrupted. A fluent word with no micro-pause before
+  // it, no repeated onset, no sustained segment and no onset block is
+  // normal fluent speech — the gate rejects it immediately, regardless of
+  // how confident the acoustic detector was. This removes the false
+  // positives on fluent function words ("could", "travel", "think", …).
+  const prevWordEnd = findPrevWordEnd(words, evt.startTime);
+  const gate = evaluateInterruptionGate({
+    type: evt.type,
+    startTime: evt.startTime,
+    endTime: evt.endTime,
+    durationMs: evt.durationMs,
+    prevWordEnd,
+    wordStart: match.word?.startTime ?? null,
+    overlappingWords: countSpannedWords(words, evt.startTime, evt.endTime),
+  });
+  const interruptionPassed = gate.passed;
+  const interruptionSignals = gate.signals;
+  const interruptionRejected = gate.rejectionReason;
+
   // ── 4) Recovery quality (look-ahead for smooth resumption) ──────
   const rec = recoverySignal(evt, words, weights.lookaheadMs);
 
@@ -541,14 +575,25 @@ export function scoreEvent(
   // removes it — never multi-signal doubt, never the fused score alone.
   let visible = evt.confidence >= weights.minVisibleScore;
 
+  // STAGE 1 HARD VETO — a fluent event with no interruption in the speech
+  // flow is never classified as a stutter, no matter how strong the raw
+  // detector confidence was. The candidate still reaches the Detection
+  // Feed (raw detector truth) and the Review Screen, but it can never
+  // render as a visible transcript annotation.
+  let fpReason: string | null = null;
+  if (visible && !interruptionPassed) {
+    fpReason =
+      interruptionRejected ??
+      "No interruption in speech flow — treated as normal fluent speech";
+  }
+
   // Hard false-positive fingerprints (kept feed/review-only).
   // BLOCKS get the widest benefit of the doubt: a block must NEVER be
   // missed just because no transcript token exists yet, so only a TINY
   // block (under 250ms) that is fully inside a natural pause AND has a
   // weak acoustic signature reads as a plain pause. Everything else —
   // including a tense struggle with no word yet — renders immediately.
-  let fpReason: string | null = null;
-  if (visible) {
+  if (visible && !fpReason) {
     if (evt.type === "block") {
       if (
         evt.durationMs < 250 &&
@@ -613,6 +658,9 @@ export function scoreEvent(
     refinedType: refineType(evt, band),
     attachmentPosition: match.position,
     attachmentReason: match.reason,
+    interruptionPassed,
+    interruptionSignals,
+    interruptionRejected,
   };
 }
 
