@@ -53,6 +53,7 @@ import { useLiveEvidenceFusion, buildVisibleTags } from "../hooks/useEvidenceFus
 import { useAuth } from "../context/AuthContext";
 import { toFeedEvents } from "../lib/feedEvents";
 import { visibleRecoveredFor, visibleFeedEventsFor } from "../lib/evidenceGating";
+import { mergeAcousticEvents } from "../lib/mergeAcousticEvents";
 
 type Phase = "topic" | "recording" | "processing";
 
@@ -104,15 +105,19 @@ export default function RecordingSession() {
   const acoustic = useAcousticAnalysis(audio.getAnalyser, isRecording);
   // RMS / ZCR / ΔEnergy lane — same shared analyser, drives stutter/stammer
   const sensor = useAnalyserSensor(audio.getAnalyser, isRecording);
-  const analysis = useSessionAnalysis(ws.transcripts, acoustic.events);
-  const pace = usePaceEngine();
-  const paceSnapshot = usePaceSnapshot(pace.engine);
 
   // ── Combined acoustic lane (worklet DSP + RMS/ZCR sensor) ──────────
+  // ONE shared event pool — merged, deduped, corroboration-tagged by the
+  // shared helper. EVERY surface below (live metrics, feed, transcript,
+  // review) reads from this single pool so they always agree.
   const allAcoustic = useMemo(
-    () => [...acoustic.events, ...sensor.events],
+    () => mergeAcousticEvents(acoustic.events, sensor.events),
     [acoustic.events, sensor.events]
   );
+
+  const analysis = useSessionAnalysis(ws.transcripts, allAcoustic);
+  const pace = usePaceEngine();
+  const paceSnapshot = usePaceSnapshot(pace.engine);
 
   // ── Stage 3: Event-centric recovery (OPEN event → hold → fallback worker).
   // Speechmatics stays the primary transcript; the engine ONLY recovers words
@@ -132,8 +137,8 @@ export default function RecordingSession() {
   // Existing detector events in the Detection Feed vocabulary — the same
   // list the Detection Feed renders, mapped onto finalized transcript words.
   const feedEvents = useMemo(
-    () => toFeedEvents([...acoustic.events, ...sensor.events]),
-    [acoustic.events, sensor.events]
+    () => toFeedEvents(allAcoustic),
+    [allAcoustic]
   );
 
   // ── Evidence Fusion Layer: scores every raw event and gates what may
@@ -163,25 +168,18 @@ export default function RecordingSession() {
     [feedEvents, fusion.scored]
   );
 
-  // ── Fused sensor events feed (stutter/stammer from RMS+ZCR) ─────────
+  // ── Fused event feed (stutter/stammer from A + B, deduped) ─────────
   const tickerItems = useMemo<TickerItem[]>(() => {
     const items: TickerItem[] = [];
-    for (const e of acoustic.events) {
+    // The Detection Feed renders the SHARED merged pool (deduped, so a
+    // single disfluency detected by both lanes shows once, not twice).
+    for (const e of allAcoustic) {
       items.push({
         key: `a-${e.startTime}-${e.type}`,
         t: e.startTime,
         label: ACOUSTIC_LABELS[e.type] ?? e.type,
         durMs: e.durationMs,
         color: ACOUSTIC_COLORS[e.type] ?? "#8B93A7",
-      });
-    }
-    for (const e of sensor.events) {
-      items.push({
-        key: `s-${e.startTime}-${e.type}`,
-        t: e.startTime,
-        label: e.type === "stutter" ? "Stutter" : "Stammer",
-        durMs: e.durationMs,
-        color: e.type === "stutter" ? "#F87171" : "#BD8CFF",
       });
     }
     for (const p of analysis.pauseEvents) {
@@ -195,7 +193,7 @@ export default function RecordingSession() {
       });
     }
     return items.sort((a, b) => a.t - b.t).slice(-16).reverse();
-  }, [acoustic.events, sensor.events, analysis.pauseEvents]);
+  }, [allAcoustic, analysis.pauseEvents]);
 
   // Wire PCM → Speechmatics
   useEffect(() => {
@@ -261,8 +259,10 @@ export default function RecordingSession() {
     const finalTranscripts = ws.snapshotTranscripts();
     const finalAcoustic = acoustic.getEvents();
     // ── Fuse in the RMS/ZCR/ΔEnergy sensor events (stutter/stammer) ──
+    // via the SAME shared merge the live view uses — the review payload
+    // carries the identical deduped pool the feed/transcript showed.
     const sensorEvents = sensor.getEvents();
-    const allAcoustic = [...finalAcoustic, ...sensorEvents];
+    const allAcoustic = mergeAcousticEvents(finalAcoustic, sensorEvents);
     const finalScore = finalizeSessionScore(finalTranscripts, allAcoustic);
     const paceReport = pace.finalize();
     const { taggedWords, segments, pauseEvents, wordTags } = buildTimeline(

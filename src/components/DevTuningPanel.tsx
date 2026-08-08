@@ -93,7 +93,9 @@ export default function DevTuningPanel() {
       <div className="px-4 py-3 space-y-3">
         {(Object.keys(EVIDENCE_WEIGHT_META) as (keyof EvidenceWeights)[]).map((key) => {
           const meta = EVIDENCE_WEIGHT_META[key];
-          const value = weights[key];
+          const raw = weights[key];
+          const isBool = typeof raw === "boolean";
+          const value = isBool ? (raw ? 1 : 0) : raw;
           return (
             <div key={key}>
               <div className="flex items-baseline justify-between mb-1">
@@ -105,7 +107,7 @@ export default function DevTuningPanel() {
                   {meta.label}
                 </label>
                 <span className="text-[10px] font-mono text-neon-purple tabular-nums">
-                  {meta.step >= 1 ? Math.round(value) : value.toFixed(2)}
+                  {isBool ? (raw ? "on" : "off") : meta.step >= 1 ? Math.round(value) : value.toFixed(2)}
                 </span>
               </div>
               <input
@@ -115,7 +117,10 @@ export default function DevTuningPanel() {
                 max={meta.max}
                 step={meta.step}
                 value={value}
-                onChange={(e) => setWeight(key, Number(e.target.value))}
+                onChange={(e) => {
+                  const next = Number(e.target.value);
+                  setWeight(key, isBool ? next >= 1 : next);
+                }}
                 className="w-full h-1.5 rounded-full appearance-none bg-white/10 accent-[#BD8CFF] cursor-pointer"
                 aria-describedby={`ev-${key}-hint`}
               />
@@ -201,8 +206,9 @@ export default function DevTuningPanel() {
 
         <p className="mt-3 text-[8px] text-soft-gray/35 leading-snug">
           Only the transcript rendering is filtered. Every raw event still
-          reaches the Detection Feed and Review Screen. Medium-band events go
-          visible only when independent signals agree.
+          reaches the Detection Feed and Review Screen. An event becomes a
+          visible annotation only when its FUSED evidence score clears the
+          floor (and, if enabled, a second detector corroborates it).
         </p>
       </div>
     </div>

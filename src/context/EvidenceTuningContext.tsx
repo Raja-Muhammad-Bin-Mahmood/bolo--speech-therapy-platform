@@ -24,7 +24,9 @@ import {
 
 export interface EvidenceTuningState {
   weights: EvidenceWeights;
-  setWeight: (key: keyof EvidenceWeights, value: number) => void;
+  /** Update a single weight. Numeric weights take a number; the boolean
+   *  `requireCorroboration` toggle takes true/false. */
+  setWeight: (key: keyof EvidenceWeights, value: number | boolean) => void;
   resetWeights: () => void;
   /** Most recent scored events (live debug readout for the dev panel). */
   recent: ScoredEvent[];
@@ -49,8 +51,8 @@ export function EvidenceTuningProvider({ children }: { children: ReactNode }) {
   const lastReportedRef = useRef("");
   const pendingRef = useRef<ScoredEvent[]>([]);
 
-  const setWeight = useCallback((key: keyof EvidenceWeights, value: number) => {
-    setWeights((prev) => ({ ...prev, [key]: value }));
+  const setWeight = useCallback((key: keyof EvidenceWeights, value: number | boolean) => {
+    setWeights((prev) => ({ ...prev, [key]: value as never }));
   }, []);
 
   const resetWeights = useCallback(() => {

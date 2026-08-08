@@ -56,16 +56,42 @@ export interface SessionScore {
 }
 
 // ─── Filler set ─────────────────────────────────────────────────────────
+//
+// Phase-2 precision pass: only TRUE filler interjections are dictionary
+// fillers. Content words ("like", "well", "right", "okay", "actually",
+// "basically", "literally", …) carry real meaning and were inflating the
+// filler count / disfluency rate / top-filler stat for anyone who simply
+// uses those words conversationally. They are no longer bare fillers.
 
-const FILLER_SET = new Set([
+const TRUE_FILLERS = new Set([
   "um", "uh", "ah", "er", "hmm", "mm", "hm",
-  "like", "you know", "sort of", "kind of",
-  "actually", "basically", "literally", "i mean",
-  "you see", "well", "so yeah", "right", "okay", "anyway",
+  "uhh", "umm", "erm", "ahh", "uhm", "mhm",
 ]);
 
-function isFiller(word: string): boolean {
-  return FILLER_SET.has(word.toLowerCase().replace(/[^a-z]/g, ""));
+/**
+ * Discourse markers ("well", "right", "okay", "so", "you know") are only
+ * filler-like when they stand ALONE (a bare interjection at a pause) —
+ * "well, I think…" is a discourse opener, not a disfluency. So a marker
+ * only counts as filler when the neighbouring words are ALSO in the
+ * true-filler / marker set (an interjection run like "well, um, well").
+ */
+const DISCOURSE_MARKERS = new Set([
+  "like", "well", "right", "okay", "ok", "so", "yeah", "yep",
+  "you know", "you see", "sort of", "kind of", "i mean",
+  "actually", "basically", "literally", "so yeah", "anyway",
+]);
+
+function isFiller(word: string, neighbors: string[] = []): boolean {
+  const clean = word.toLowerCase().replace(/[^a-z ]/g, "").trim();
+  if (TRUE_FILLERS.has(clean)) return true;
+  if (!DISCOURSE_MARKERS.has(clean)) return false;
+  // Marker stands alone OR inside a run of markers/fillers → filler.
+  const cleanNeighbors = neighbors.map((n) =>
+    n.toLowerCase().replace(/[^a-z ]/g, "").trim()
+  );
+  return cleanNeighbors.every(
+    (n) => TRUE_FILLERS.has(n) || DISCOURSE_MARKERS.has(n)
+  );
 }
 
 // ─── Fusion constants — confidence removed per spec ─────────────────────
@@ -131,6 +157,29 @@ export function buildTimeline(
   // Collect finalised words for pause detection
   const finalWords: FinalWordLike[] = [];
 
+  // All finalized word texts in stream order (for the filler context check)
+  const finalTexts: string[] = [];
+
+  for (const chunk of transcripts) {
+    if (!chunk.isFinal) continue;
+
+    for (const w of chunk.words) {
+      const wText = (w as any).text || w.word || "";
+      if (!wText) continue;
+      finalTexts.push(wText);
+    }
+  }
+
+  // Helper: neighbours of the current word index (true fillers / markers)
+  // for the discourse-marker context check.
+  const neighborsAt = (idx: number): string[] => {
+    const out: string[] = [];
+    if (idx > 0) out.push(finalTexts[idx - 1]);
+    if (idx < finalTexts.length - 1) out.push(finalTexts[idx + 1]);
+    return out;
+  };
+
+  let wordIdx = 0;
   for (const chunk of transcripts) {
     if (!chunk.isFinal) continue;
     const utterance = chunk.utterance ?? 0;
@@ -139,7 +188,8 @@ export function buildTimeline(
       const wText = (w as any).text || w.word || "";
       if (!wText) continue;
       const confidence = (w as any).confidence ?? 0.9;
-      const isFillerWord = isFiller(wText);
+      const isFillerWord = isFiller(wText, neighborsAt(wordIdx));
+      wordIdx++;
 
       finalWords.push({
         word: wText,

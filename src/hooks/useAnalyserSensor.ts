@@ -57,6 +57,19 @@ const STAMMER_ZCR_MIN = 0.16; // fricative / tight-larynx hold
 const STAMMER_MIN_MS = 200;
 const STAMMER_MAX_MS = 650;
 
+/**
+ * Fricative shape confirmation for the burst machine. Detector B only has
+ * RMS/ZCR/ΔE — no spectral centroid — so we approximate a fricative onset
+ * with high ZCR (noise-like) + a sharp ΔE spike. This is the burst-level
+ * fricative gate: a pure loud-plosive burst ("k", "t", "p" — low ZCR,
+ * high ΔE) no longer registers as a stutter fragment. A real repeated
+ * fricative ("s-s-s-") has noisy high-ZCR bursts and passes.
+ */
+const BURST_FRICATIVE_ZCR_MIN = 0.22;
+const BURST_DELTA_SPIKE_MIN = 0.01;
+/** How many frames inside the burst must show the fricative shape. */
+const BURST_SHAPE_MIN_FRAMES = 1;
+
 const COOLDOWN_MS = 300; // no two sensor events within 300ms
 const ROLLING_MS = 800; // rolling frame window
 const VOICE_FLOOR = 0.006; // absolute minimum for "speech" RMS
@@ -91,6 +104,8 @@ export function useAnalyserSensor(
   const burstRef = useRef<{ start: number; end: number; durMs: number }[]>([]);
   const burstStartRef = useRef(0);
   const inBurstRef = useRef(false);
+  /** Fricative-shape frame counter for the current burst (see burst gate). */
+  const shapeFramesRef = useRef(0);
 
   // Stammer (sustained tension) state machine
   const stammerStartRef = useRef(0);
@@ -104,20 +119,37 @@ export function useAnalyserSensor(
 
       // ── Burst machine (stutter pattern) ─────────────────────────────
       // A burst is a loud, noisy onset — OR a sudden ΔE spike (plosive
-      // onset, acoustic rule PLOSIVE_BURST).
+      // onset, acoustic rule PLOSIVE_BURST). Since Detector B has no
+      // spectral centroid, the burst must ALSO show a fricative shape
+      // (high ZCR + sharp ΔE) — a pure loud plosive burst ("k", "t", "p")
+      // must not register as a stutter fragment, or any word with ≥3
+      // consonant onsets would false-positive.
       const inBurst =
         (rms > Math.max(voiceRms * 1.4, floor * BURST_RMS_FACTOR) &&
           zcr > BURST_ZCR_MIN) ||
         delta > floor * 3; // PLOSIVE_BURST: ΔE > 3 × E_floor
 
       if (inBurst) {
-        if (!inBurstRef.current) burstStartRef.current = t;
+        if (!inBurstRef.current) {
+          burstStartRef.current = t;
+          shapeFramesRef.current = 0;
+        }
         inBurstRef.current = true;
+        // Fricative shape confirmation: the burst frame must be noisy
+        // (high ZCR) AND carry a sharp energy rise. ΔE spikes on their own
+        // (plosives, mic pops) never count toward the stutter pattern.
+        if (zcr > BURST_FRICATIVE_ZCR_MIN && delta > BURST_DELTA_SPIKE_MIN) {
+          shapeFramesRef.current++;
+        }
       } else if (inBurstRef.current) {
         inBurstRef.current = false;
         const durMs = (t - burstStartRef.current) * 1000;
 
-        if (durMs >= BURST_MIN_MS && durMs <= BURST_MAX_MS) {
+        if (
+          durMs >= BURST_MIN_MS &&
+          durMs <= BURST_MAX_MS &&
+          shapeFramesRef.current >= BURST_SHAPE_MIN_FRAMES
+        ) {
           const bursts = burstRef.current;
           const last = bursts.length > 0 ? bursts[bursts.length - 1] : null;
           const gapMs = last
@@ -188,6 +220,7 @@ export function useAnalyserSensor(
         durationMs: Math.round((end - start) * 1000),
         confidence: 0.85,
         acoustic: 0.8,
+        source: "sensor",
       };
       eventsRef.current = [...eventsRef.current, evt];
       setEvents(eventsRef.current);
@@ -267,6 +300,7 @@ export function useAnalyserSensor(
       burstRef.current = [];
       burstStartRef.current = 0;
       inBurstRef.current = false;
+      shapeFramesRef.current = 0;
       stammerStartRef.current = 0;
       stammerPeakRef.current = 0;
       startRef.current = 0;

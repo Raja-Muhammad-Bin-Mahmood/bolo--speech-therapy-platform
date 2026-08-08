@@ -9,13 +9,14 @@
  *
  * DISPLAY POLICY — "show probable disfluencies immediately, refine later":
  *   The Detection Feed is the source of truth for WHAT was detected, and
- *   the Live Transcript mirrors it. Any detector event whose raw temporal
- *   confidence clears the display floor (`minVisibleScore`, default 0.70)
- *   is annotated on the transcript at once, attached to its word by
- *   timestamp, and only REMOVED when the evidence is a clear false
- *   positive (breath/sniff fingerprint, a too-short cue, or a plain pause
- *   misread as a block). The fused `evidenceScore` is NOT a hard gate any
- *   more — it styles intensity (band) and feeds the developer tuning panel.
+ *   the Live Transcript mirrors it. A detector event is annotated on the
+ *   transcript at once ONLY when its fused evidence clears the visibility
+ *   floor (`minVisibleScore`, default 0.70). The fused `evidenceScore`
+ *   (lexical veto, pause/noise penalties, cadence, recovery, agreement)
+ *   is the GATE: no single raw detector's confidence can make an event
+ *   visible by itself. An event whose fused score clears the floor AND
+ *   passes the Stage-1 interruption gate AND clears the false-positive
+ *   fingerprints is annotated; everything else stays feed/review-only.
  *
  * Attribution is PRE-ONSET, not overlap-only:
  *     word.start − 600ms … word.end + 200ms
@@ -90,6 +91,17 @@ export interface EvidenceWeights {
   cadenceBaselineWeight: number;
   /** Weight of the breath/sniff/short-noise suppressor (0–1). */
   noisePenalty: number;
+  /** Bonus applied to the fused score when a SECOND detector corroborated
+   *  the event (0–0.2). Agreement is real evidence — a lone detector's
+   *  confident guess should not reach the visible floor on its own. */
+  corroborationBonus: number;
+  /** Whether an event may be visible WITHOUT a second-detector
+   *  corroboration. When false, single-detector events must clear a higher
+   *  bar (minSingleSourceScore) instead. */
+  requireCorroboration: boolean;
+  /** Visibility floor for single-source (uncorroborated) events when
+   *  `requireCorroboration` is true (0–0.95). */
+  minSingleSourceScore: number;
 }
 
 export const DEFAULT_EVIDENCE_WEIGHTS: EvidenceWeights = {
@@ -103,6 +115,9 @@ export const DEFAULT_EVIDENCE_WEIGHTS: EvidenceWeights = {
   recoveryQualityWeight: 1.0,
   cadenceBaselineWeight: 1.0,
   noisePenalty: 0.8,
+  corroborationBonus: 0.08,
+  requireCorroboration: false,
+  minSingleSourceScore: 0.8,
 };
 
 export const EVIDENCE_WEIGHT_META: Record<
@@ -114,11 +129,14 @@ export const EVIDENCE_WEIGHT_META: Record<
   prolongationWeight: { label: "Prolongation Weight", min: 0, max: 2, step: 0.05, hint: "Scales acoustic evidence for prolongations" },
   pausePenalty: { label: "Pause Penalty", min: 0, max: 1, step: 0.01, hint: "Suppresses events inside natural/thinking pauses" },
   lexicalVetoPenalty: { label: "Lexical Veto Penalty", min: 0, max: 1, step: 0.01, hint: "Suppresses filler words & mid-word dips" },
-  minVisibleScore: { label: "Minimum Visible Score", min: 0.4, max: 0.9, step: 0.01, hint: "Display floor — detector confidence at/above this renders on the transcript immediately (default 0.70)" },
+  minVisibleScore: { label: "Minimum Visible Score", min: 0.4, max: 0.9, step: 0.01, hint: "Visibility floor — fused evidence score at/above this renders on the transcript (default 0.70)" },
   lookaheadMs: { label: "Lookahead Window", min: 100, max: 1200, step: 25, hint: "How far to look for smooth speech resumption (ms)" },
   recoveryQualityWeight: { label: "Recovery Quality Weight", min: 0, max: 2, step: 0.05, hint: "Weight of the recovery-after-event signal" },
   cadenceBaselineWeight: { label: "Cadence Baseline Weight", min: 0, max: 2, step: 0.05, hint: "Weight of the local speaker-cadence signal" },
   noisePenalty: { label: "Noise Penalty", min: 0, max: 1, step: 0.01, hint: "Suppresses breath/sniff-like and short non-disfluent events" },
+  corroborationBonus: { label: "Corroboration Bonus", min: 0, max: 0.2, step: 0.01, hint: "Fused-score bonus when a second detector agreed (0–0.2)" },
+  requireCorroboration: { label: "Require Corroboration", min: 0, max: 1, step: 1, hint: "0 = single-detector events visible above the floor; 1 = require a second detector" },
+  minSingleSourceScore: { label: "Min Single-Source Score", min: 0.4, max: 0.95, step: 0.01, hint: "Visibility floor for uncorroborated (single-detector) events" },
 };
 
 // ─── Verdict / output types ─────────────────────────────────────────────
@@ -195,6 +213,11 @@ export interface ScoredEvent {
   interruptionSignals: string[];
   /** Why the Stage 1 gate rejected the candidate (null when passed). */
   interruptionRejected: string | null;
+  /** true when a second detector emitted a same-type event overlapping
+   *  this one (real cross-detector agreement — a positive evidence signal). */
+  corroborated: boolean;
+  /** Whether this event needed a second detector to be visible. */
+  corroborationRequired: boolean;
 }
 
 // ─── Lexical context (weak signals only — never a hard decision) ─────────
@@ -542,12 +565,17 @@ export function scoreEvent(
   const noiseHit = noisePenaltySignal(evt, match.position);
 
   // ── Weighted fusion (rebalanced: no single cue can reach the floor) ──
+  // Corroboration is a positive signal: a second detector agreeing on the
+  // same event is real evidence (it was merged/deduped upstream, so a
+  // corroborated event carries both lanes' signals).
+  const corroborated = evt.corroborated === true;
   const pos =
     0.35 * acousticSignal +
     0.15 * onsetShape +
     0.15 * transcriptSupport +
     0.2 * weights.recoveryQualityWeight * rec.quality +
-    0.15 * weights.cadenceBaselineWeight * cadence;
+    0.15 * weights.cadenceBaselineWeight * cadence +
+    (corroborated ? weights.corroborationBonus : 0);
 
   const penalty =
     weights.pausePenalty * pauseHit +
@@ -558,22 +586,29 @@ export function scoreEvent(
   // ── Band + visibility ───────────────────────────────────────────
   const band = bandFromScore(evidenceScore);
 
-  // Independent-signal agreement — informational only. The detector's own
-  // confidence is the display source of truth; agreement styles the
-  // dev-panel readout but no longer gates the transcript.
+  // Independent-signal agreement — counts how many independent signals
+  // supported this event (transcript, onset shape, recovery, acoustic,
+  // cadence, and cross-detector corroboration).
   let agreement = 0;
   if (transcriptSupport >= 0.5) agreement++;
   if (onsetShape >= 0.5) agreement++;
   if (rec.quality >= 0.5) agreement++;
   if (acousticSignal >= 0.6) agreement++;
   if (cadence >= 0.5) agreement++;
+  if (corroborated) agreement++;
 
   // DISPLAY POLICY — "show probable disfluencies immediately, refine later":
-  // any detector event whose raw temporal confidence clears the display
-  // floor renders on the transcript at once, so the Detection Feed and the
-  // transcript mirror each other. Only a clear false-positive fingerprint
-  // removes it — never multi-signal doubt, never the fused score alone.
-  let visible = evt.confidence >= weights.minVisibleScore;
+  // an event is annotated on the transcript ONLY when its FUSED evidence
+  // score clears the visibility floor. No single raw detector's confidence
+  // can make an event visible by itself — Detector A's regularity-tuned
+  // confidence and Detector B's hardcoded 0.85 are each just ONE signal.
+  // When `requireCorroboration` is on, uncorroborated (single-source)
+  // events must clear a higher floor (`minSingleSourceScore`).
+  const corroborationRequired = weights.requireCorroboration && !corroborated;
+  const visibleFloor = corroborationRequired
+    ? weights.minSingleSourceScore
+    : weights.minVisibleScore;
+  let visible = evidenceScore >= visibleFloor;
 
   // STAGE 1 HARD VETO — a fluent event with no interruption in the speech
   // flow is never classified as a stutter, no matter how strong the raw
@@ -613,9 +648,13 @@ export function scoreEvent(
   // ── Human-readable suppression reasons ─────────────────────────
   const reasons: string[] = [];
   if (!visible) {
-    if (evt.confidence < weights.minVisibleScore) {
+    if (corroborationRequired) {
       reasons.push(
-        `Below the display floor (${(weights.minVisibleScore * 100).toFixed(0)}% detector confidence)`
+        "Not corroborated by a second detector — below the single-source floor"
+      );
+    } else if (evidenceScore < weights.minVisibleScore) {
+      reasons.push(
+        `Fused evidence below the visibility floor (${(weights.minVisibleScore * 100).toFixed(0)}%)`
       );
     }
     if (fpReason) reasons.push(fpReason);
@@ -661,6 +700,8 @@ export function scoreEvent(
     interruptionPassed,
     interruptionSignals,
     interruptionRejected,
+    corroborated,
+    corroborationRequired,
   };
 }
 

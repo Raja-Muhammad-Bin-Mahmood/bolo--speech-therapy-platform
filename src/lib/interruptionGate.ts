@@ -38,8 +38,11 @@
 // ─── Spec numbers ─────────────────────────────────────────────────────────
 
 export const INTERRUPTION_GATE_SPEC = {
-  /** Pre-onset arrest: previous word → labeled word gap (user: 0.1 s). */
-  ARREST_MIN_S: 0.1,
+  /** Pre-onset arrest: previous word → labeled word gap (user: 0.1 s).
+   *  Raised to 0.14s in the phase-2 precision pass: a 100ms gap is normal
+   *  fluent inter-word timing, and the old 0.10 threshold let fluent
+   *  multi-word phrases through as "arrests" on ordinary spacing. */
+  ARREST_MIN_S: 0.14,
   /** Repeated-onset (repetition/stutter) intrinsic floor — the detector's
    *  own minimum pattern spans ≈150 ms (3 fragments × 40–250 ms gaps). */
   REPEATED_ONSET_MIN_MS: 150,
@@ -163,11 +166,15 @@ export function evaluateInterruptionGate(
   const onsetBlock = type === "block" || type === "tense_block";
 
   // 2) Repeated onset — the event itself is a cluster of ≥3 fragments with
-  //    micro-gaps ("b-b-b-ball"). Must not span several finalized words.
+  //    micro-gaps ("b-b-b-ball"). A pattern that spans several finalized
+  //    words is fluent multi-word speech misread as one repetition, so it
+  //    must NOT count as an interruption signal (tightened from ≤1 spanned
+  //    word: a repeated onset flush against the boundary word is still
+  //    fine, but spanning 2+ words is never a stutter).
   if (
     repeatedOnset &&
     input.durationMs >= spec.REPEATED_ONSET_MIN_MS &&
-    input.overlappingWords <= spec.MAX_SPANNED_WORDS
+    input.overlappingWords <= 1
   ) {
     signals.push(
       `repeated-onset fragments (${input.durationMs}ms, ${input.overlappingWords} spanned word${input.overlappingWords === 1 ? "" : "s"})`

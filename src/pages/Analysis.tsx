@@ -31,6 +31,7 @@ import { scoreAcousticEvents, type ScoredEvent } from "../lib/evidenceFusion";
 import type { PauseEvent } from "../lib/pauseDetector";
 import { useEvidenceTuning } from "../context/EvidenceTuningContext";
 import { visibleTagForWord } from "../lib/evidenceGating";
+import { mergeAcousticEvents } from "../lib/mergeAcousticEvents";
 
 // ─── Stat Card ──────────────────────────────────────────────────────────
 
@@ -311,10 +312,12 @@ export default function Analysis() {
   const rawFusionEvents = useMemo(() => {
     const a: unknown = data?.acousticEvents ?? [];
     const s: unknown = data?.sensorEvents ?? [];
-    return [
-      ...(Array.isArray(a) ? a : []),
-      ...(Array.isArray(s) ? s : []),
-    ] as any[];
+    // SAME shared merge the live view used — the review recomputes the
+    // identical deduped pool, so verdicts always agree with the live view.
+    return mergeAcousticEvents(
+      Array.isArray(a) ? (a as any[]) : [],
+      Array.isArray(s) ? (s as any[]) : []
+    ) as any[];
   }, [data]);
   const scored: ScoredEvent[] = useMemo(() => {
     if (rawFusionEvents.length === 0) return [];

@@ -20,6 +20,15 @@ export interface AcousticEvent {
   confidence: number;
   /** 0..1 — raw feature-magnitude certainty (separate evidence source) */
   acoustic: number;
+  /** Which detector lane produced this event (A = worklet/Meyda analysis,
+   *  B = RMS/ZCR/ΔEnergy sensor, or BOTH after the shared merge deduped a
+   *  same-type event). Used by the fusion layer for cross-detector
+   *  corroboration. */
+  source?: "acoustic" | "sensor" | "acoustic+sensor";
+  /** true when the OTHER detector emitted a same-type event overlapping
+   *  this one (computed by the shared merge helper). Real agreement
+   *  evidence for the fusion layer — never set by a detector itself. */
+  corroborated?: boolean;
 }
 
 interface FeatureFrame {
@@ -64,11 +73,38 @@ const STUTTER_GAP_MIN_MS = 40;
 const STUTTER_GAP_MAX_MS = 220;
 const STUTTER_MIN_BURSTS = 3;
 const STUTTER_WINDOW_MS = 600;
+/**
+ * Max spectral-shape delta (normalized Δcentroid + Δrolloff) allowed
+ * between bursts of the SAME stutter pattern. A real repetition repeats
+ * ONE phoneme ("s-s-s-") — near-identical shapes. A fluent word like
+ * "conversation" alternates /v/ /s/ /ʃ/ — very different shapes — and
+ * must be rejected here, at the detector, before fusion even runs.
+ */
+const STUTTER_SHAPE_TOL = 0.45;
+/**
+ * Emission recall floor (was 0.75 — regularity-tuned, so IRREGULAR real
+ * stutters never emitted). The fusion layer's fused evidence score now
+ * gates visibility, so the base detector can afford recall-oriented
+ * emission: irregular patterns (bursts at 60–220ms gaps instead of the
+ * 80ms ideal) still emit and let the evidence layer judge them.
+ */
+const EMIT_FLOOR = 0.6;
+/**
+ * Repetition suppressor: how long after a stutter/stammer the onset
+ * tracker stays silent (was 150ms — it killed real mid-sentence stutters
+ * that land shortly after another event).
+ */
+const STUTTER_OVERLAP_COOLDOWN_S = 0.05;
 
 // Stammer (sustained fricative: sssssssslap)
 const STAMMER_MIN_MS = 150;
 const STAMMER_MAX_MS = 600;
-const STAMMER_RELEASE_WINDOW_MS = 150; // wait for voiced release to confirm
+/** How long to wait for the voiced release after a fricative run (was 150ms). */
+const STAMMER_RELEASE_WINDOW_MS = 300;
+/** A fricative hold at least this long with strong high-band energy is a
+ *  real stammer even when no voiced release arrives within the window
+ *  (the release can land after ASR/analyser lag, or the speaker trails off). */
+const STAMMER_HOLD_MIN_MS = 450;
 
 const HI_FLOOR = 0.008;
 const HI_BASELINE_FACTOR = 3;
@@ -149,10 +185,19 @@ export function useAcousticAnalysis(
     prolongStart: 0,
     pitchRing: [] as number[],
 
-    // Stutter (fricative burst pattern)
+    // Stutter (fricative burst pattern) — each burst carries its spectral
+    // shape (centroid/rolloff at the falling edge) for cross-burst
+    // phoneme-consistency checks ("s-s-s-" vs the /v/ /s/ /ʃ/ of "conversation").
     fricStart: 0,
     prevFric: false,
-    fricBursts: [] as { start: number; end: number; durMs: number; strength: number }[],
+    fricBursts: [] as {
+      start: number;
+      end: number;
+      durMs: number;
+      strength: number;
+      centroid: number;
+      rolloff: number;
+    }[],
     hiBaseline: 0.004,
 
     // Stammer (sustained fricative hold — deferred confirm)
@@ -164,8 +209,9 @@ export function useAcousticAnalysis(
     } | null,
     pendingStammerTick: 0,
 
-    // Event de-dupe
-    lastEmit: 0,
+    // Event de-dupe — PER TYPE (a global cooldown ate real multi-type
+    // clusters: a stutter followed by a block 200ms later disappeared).
+    lastEmitByType: {} as Partial<Record<AcousticEventType, number>>,
     lastStutterEnd: 0,
   });
 
@@ -303,6 +349,13 @@ export function useAcousticAnalysis(
           ? Math.min(1, f.highBand / Math.max(0.01, s.hiBaseline * 6))
           : 0;
 
+      // Spectral shape at the falling edge (centroid/rolloff). A repeated
+      // stutter phoneme repeats a near-identical shape across bursts; the
+      // /v/ /s/ /ʃ/ onsets inside a fluent word differ strongly and must
+      // break the pattern here.
+      const normCentroid = f.centroid / Math.max(1, 8000);
+      const normRolloff = f.rolloff / Math.max(1, 8000);
+
       if (runDurMs >= STUTTER_BURST_MIN_MS && runDurMs <= STUTTER_BURST_MAX_MS) {
         // Short burst — candidate for stutter pattern
         const bursts = s.fricBursts;
@@ -311,16 +364,32 @@ export function useAcousticAnalysis(
           ? (s.fricStart - lastBurst.end) * 1000
           : Infinity;
 
+        // ── PHONEME-CONSISTENCY GATE ─────────────────────────────
+        // Same-phoneme repetition (s-s-s-) keeps the pattern; a burst whose
+        // spectral shape differs sharply from the previous burst is a
+        // DIFFERENT phoneme — the start of a fluent word, not a stutter
+        // ("conversation" = /v/ /s/ /ʃ/). Break the pattern and begin fresh.
+        const shapeDelta =
+          lastBurst && normCentroid > 0 && lastBurst.centroid > 0
+            ? Math.abs(normCentroid - lastBurst.centroid) +
+              Math.abs(normRolloff - lastBurst.rolloff)
+            : 0;
+        const sameShape =
+          !lastBurst || shapeDelta <= STUTTER_SHAPE_TOL;
+
         if (
           lastBurst &&
           gapMs >= STUTTER_GAP_MIN_MS &&
-          gapMs <= STUTTER_GAP_MAX_MS
+          gapMs <= STUTTER_GAP_MAX_MS &&
+          sameShape
         ) {
           bursts.push({
             start: s.fricStart,
             end: t,
             durMs: Math.round(runDurMs),
             strength: burstStrength,
+            centroid: normCentroid,
+            rolloff: normRolloff,
           });
 
           // Pattern complete? ≥3 bursts within 600ms window
@@ -337,9 +406,18 @@ export function useAcousticAnalysis(
               const burstFactor = Math.min(1, (bursts.length - 2) / 4);
               const strengthAvg =
                 bursts.reduce((a, b) => a + b.strength, 0) / bursts.length;
+              const shapeConsistent =
+                bursts.reduce((a, b) => a + b.centroid, 0) / bursts.length;
 
+              // Regularity still boosts confidence, but irregular real
+              // stutters (bursts at 60–220ms gaps) now clear the recall
+              // floor instead of being filtered out before fusion runs.
               const temporal =
-                0.5 + 0.25 * regularity + 0.15 * burstFactor + 0.1 * strengthAvg;
+                0.5 +
+                0.2 * regularity +
+                0.15 * burstFactor +
+                0.1 * strengthAvg +
+                0.05 * shapeConsistent;
               const acoustic = 0.5 + 0.3 * burstFactor + 0.2 * strengthAvg;
 
               emitEvent("stutter", firstBurst.start, t, temporal, acoustic);
@@ -350,8 +428,15 @@ export function useAcousticAnalysis(
             }
           }
         } else {
-          // Gap too large — start a fresh pattern
+          // Gap too large, OR a shape change (different phoneme) — start a
+          // fresh pattern. A shape change alone resets: the new burst may be
+          // the first of a NEW repetition of that phoneme.
           if (lastBurst && gapMs > STUTTER_GAP_MAX_MS) {
+            bursts.length = 0;
+          }
+          if (!sameShape && bursts.length > 0) {
+            // Keep the new burst only — the old pattern (different phoneme)
+            // must not seed the new one.
             bursts.length = 0;
           }
           bursts.push({
@@ -359,6 +444,8 @@ export function useAcousticAnalysis(
             end: t,
             durMs: Math.round(runDurMs),
             strength: burstStrength,
+            centroid: normCentroid,
+            rolloff: normRolloff,
           });
           if (bursts.length > 10) bursts.shift();
         }
@@ -383,8 +470,9 @@ export function useAcousticAnalysis(
       s.pendingStammer &&
       (f.voiced || t - s.pendingStammerTick > STAMMER_RELEASE_WINDOW_MS / 1000)
     ) {
-      if (f.voiced) {
-        const p = s.pendingStammer;
+      const p = s.pendingStammer;
+      const longHold = p.durMs >= STAMMER_HOLD_MIN_MS && p.strength >= 0.7;
+      if (f.voiced || longHold) {
         const durNorm = Math.min(1, p.durMs / 400);
         const temporal = 0.5 + 0.3 * durNorm + 0.2 * p.strength;
         const acoustic = 0.5 + 0.25 * durNorm + 0.25 * p.strength;
@@ -412,7 +500,9 @@ export function useAcousticAnalysis(
       lastRun.end = t;
     }
 
-    // Repetition: ≥3 onsets spaced 80–250ms apart, brief runs, no stutter overlap
+    // Repetition: ≥3 onsets spaced 80–250ms apart, brief runs. The stutter
+    // overlap suppressor only waits out the 50ms cooldown — a real
+    // mid-sentence stutter shortly after another event must still emit.
     if (s.onsets.length >= REP_MIN_ONSETS) {
       const gaps: number[] = [];
       for (let i = 1; i < s.onsets.length; i++) {
@@ -424,7 +514,7 @@ export function useAcousticAnalysis(
       const runsBrief = s.voicingOnRuns.every(
         (r) => (r.end - r.start) * 1000 <= REP_VOICED_RUN_MAX_MS
       );
-      const noStutterOverlap = s.onsets[0] > s.lastStutterEnd + 0.15;
+      const noStutterOverlap = s.onsets[0] > s.lastStutterEnd + STUTTER_OVERLAP_COOLDOWN_S;
 
       if (allInRange && runsBrief && noStutterOverlap) {
         const avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
@@ -511,11 +601,18 @@ export function useAcousticAnalysis(
     acoustic: number
   ) {
     const s = stateRef.current;
-    if (temporal < 0.75) return;
+    // Recall-oriented emission floor (0.60): the detector's job is to
+    // CATCH candidates — the fusion layer's fused evidence score decides
+    // visibility. Regularity-tuned floors (0.75) made irregular real
+    // stutters never emit at all.
+    if (temporal < EMIT_FLOOR) return;
 
-    // Global de-dupe: no two events within 250ms
-    if (endTime - s.lastEmit < 0.25) return;
-    s.lastEmit = endTime;
+    // Per-type de-dupe: no two events of the SAME type within 250ms.
+    // (Was a global 250ms cooldown that ate real multi-type clusters —
+    // a stutter followed by a block 200ms later simply disappeared.)
+    const lastForType = s.lastEmitByType[type] ?? 0;
+    if (endTime - lastForType < 0.25) return;
+    s.lastEmitByType[type] = endTime;
 
     const evt: AcousticEvent = {
       type,
@@ -524,6 +621,7 @@ export function useAcousticAnalysis(
       durationMs: Math.round((endTime - startTime) * 1000),
       confidence: Math.min(1, temporal),
       acoustic: Math.min(1, acoustic),
+      source: "acoustic",
     };
     eventsRef.current = [...eventsRef.current, evt];
     setEvents(eventsRef.current);
@@ -555,7 +653,7 @@ export function useAcousticAnalysis(
         hiBaseline: 0.004,
         pendingStammer: null,
         pendingStammerTick: 0,
-        lastEmit: 0,
+        lastEmitByType: {},
         lastStutterEnd: 0,
       };
       return;
