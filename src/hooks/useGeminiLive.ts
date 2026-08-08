@@ -73,6 +73,7 @@ export function useGeminiLive() {
   const sessionRef = useRef<{ close: () => void } | null>(null);
   const queueRef = useRef<AudioQueue | null>(null);
   const handlersRef = useRef<LiveHandlers | null>(null);
+  const instructionRef = useRef("");
   const statusRef = useRef<LiveStatus>("idle");
   const [status, setStatus] = useState<LiveStatus>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -136,6 +137,94 @@ export function useGeminiLive() {
     [flushAudio]
   );
 
+  /**
+   * Connect the Live session with a freshly minted ephemeral token. Used both
+   * for the initial call and for reconnection after a transient socket close:
+   * `instructionRef` + `handlersRef` persist, so a retry picks up exactly
+   * where the call left off (no duplicate system-instruction state).
+   */
+  const connectLive = useCallback(async (instruction: string) => {
+    setLiveStatus("connecting");
+    try {
+      // 1. Mint a short-lived ephemeral token (key stays in the Edge Function).
+      const session = (await supabase.auth.getSession()).data.session;
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (session?.access_token) headers.Authorization = `Bearer ${session.access_token}`;
+
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/gemini-live-token`, {
+        method: "POST",
+        headers,
+      });
+      if (!res.ok) {
+        // The Edge Function returns { class, error } — map it to a clear,
+        // safe message instead of leaking raw internals.
+        let cls: string | undefined;
+        let raw = `Live token request failed (${res.status})`;
+        try {
+          const body = await res.json();
+          cls = body?.class;
+          if (body?.error) raw = body.error;
+        } catch {
+          // Non-JSON error body — keep the generic message.
+        }
+        throw new Error(liveErrorMessage(cls, raw));
+      }
+      const { token } = await res.json();
+      if (!token) throw new Error("No live token returned by server");
+
+      // 2. Connect with the ephemeral token, carrying the full customer
+      //    system instruction (name / persona / product / mood / behaviour
+      //    rules). Logged for runtime verification that it reached the
+      //    session config.
+      if (import.meta.env?.DEV) {
+        console.info("[BOLO] Gemini Live system instruction (chars):", instruction.length);
+        console.info("[BOLO] Gemini Live customer:", instruction.split("\n").slice(0, 6).join(" | "));
+      }
+      const ai = new GoogleGenAI({
+        apiKey: token,
+        httpOptions: { apiVersion: "v1alpha" },
+      });
+      const liveSession = await ai.live.connect({
+        model: LIVE_MODEL,
+        config: {
+          responseModalities: [Modality.AUDIO],
+          systemInstruction: { parts: [{ text: instruction }] },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: LIVE_VOICE } },
+          },
+          generationConfig: { temperature: 1.1 },
+        },
+        callbacks: {
+          onopen: () => {
+            setLiveStatus("live");
+            handlersRef.current?.onOpen();
+          },
+          onmessage: handleServerMessage,
+          onerror: (e: any) => {
+            const m = e?.error?.message || e?.message || "Live connection error";
+            setError(m);
+            setLiveStatus("error");
+            handlersRef.current?.onError(m);
+          },
+          onclose: () => {
+            setLiveStatus("closed");
+            handlersRef.current?.onClose();
+          },
+        },
+      });
+      sessionRef.current = liveSession as unknown as { close: () => void };
+    } catch (err: any) {
+      const m = String(err?.message || err);
+      setError(m);
+      setLiveStatus("error");
+      handlersRef.current?.onError(m);
+    }
+  }, [handleServerMessage]);
+
   const start = useCallback(
     async (systemInstruction: string, handlers: LiveHandlers) => {
       handlersRef.current = handlers;
@@ -152,87 +241,10 @@ export function useGeminiLive() {
         handlersRef.current?.onError(msg);
         return;
       }
-      setLiveStatus("connecting");
-      try {
-        // 1. Mint a short-lived ephemeral token (key stays in the Edge Function).
-        const session = (await supabase.auth.getSession()).data.session;
-        const headers: Record<string, string> = {
-          "Content-Type": "application/json",
-        };
-        if (session?.access_token) headers.Authorization = `Bearer ${session.access_token}`;
-
-        const res = await fetch(`${SUPABASE_URL}/functions/v1/gemini-live-token`, {
-          method: "POST",
-          headers,
-        });
-        if (!res.ok) {
-          // The Edge Function returns { class, error } — map it to a clear,
-          // safe message instead of leaking raw internals.
-          let cls: string | undefined;
-          let raw = `Live token request failed (${res.status})`;
-          try {
-            const body = await res.json();
-            cls = body?.class;
-            if (body?.error) raw = body.error;
-          } catch {
-            // Non-JSON error body — keep the generic message.
-          }
-          throw new Error(liveErrorMessage(cls, raw));
-        }
-        const { token } = await res.json();
-        if (!token) throw new Error("No live token returned by server");
-
-        // 2. Connect with the ephemeral token, carrying the full customer
-        //    system instruction (name / persona / product / mood / behaviour
-        //    rules). Logged for runtime verification that it reached the
-        //    session config.
-        if (import.meta.env?.DEV) {
-          console.info("[BOLO] Gemini Live system instruction (chars):", instruction.length);
-          console.info("[BOLO] Gemini Live customer:", instruction.split("\n").slice(0, 6).join(" | "));
-        }
-        const ai = new GoogleGenAI({
-          apiKey: token,
-          httpOptions: { apiVersion: "v1alpha" },
-        });
-        const liveSession = await ai.live.connect({
-          model: LIVE_MODEL,
-          config: {
-            responseModalities: [Modality.AUDIO],
-            systemInstruction: { parts: [{ text: instruction }] },
-            inputAudioTranscription: {},
-            outputAudioTranscription: {},
-            speechConfig: {
-              voiceConfig: { prebuiltVoiceConfig: { voiceName: LIVE_VOICE } },
-            },
-            generationConfig: { temperature: 1.1 },
-          },
-          callbacks: {
-            onopen: () => {
-              setLiveStatus("live");
-              handlersRef.current?.onOpen();
-            },
-            onmessage: handleServerMessage,
-            onerror: (e: any) => {
-              const m = e?.error?.message || e?.message || "Live connection error";
-              setError(m);
-              setLiveStatus("error");
-              handlersRef.current?.onError(m);
-            },
-            onclose: () => {
-              setLiveStatus("closed");
-              handlersRef.current?.onClose();
-            },
-          },
-        });
-        sessionRef.current = liveSession as unknown as { close: () => void };
-      } catch (err: any) {
-        const m = String(err?.message || err);
-        setError(m);
-        setLiveStatus("error");
-        handlersRef.current?.onError(m);
-      }
+      instructionRef.current = instruction;
+      await connectLive(instruction);
     },
-    [handleServerMessage]
+    [connectLive]
   );
 
   /**
@@ -274,7 +286,25 @@ export function useGeminiLive() {
     setLiveStatus("closed");
   }, []);
 
+  /**
+   * Reconnect a Live session that dropped mid-call (transient network blip).
+   * Reuses the stored system instruction + handlers so the conversation can
+   * resume instead of the call being treated as a hang-up. Returns true once
+   * the socket is live again, false if the retry itself failed.
+   */
+  const reconnect = useCallback(async (): Promise<boolean> => {
+    if (!instructionRef.current) return false;
+    try {
+      (sessionRef.current as any)?.close();
+    } catch {
+      // noop
+    }
+    sessionRef.current = null;
+    await connectLive(instructionRef.current);
+    return statusRef.current === "live";
+  }, [connectLive]);
+
   useEffect(() => () => close(), [close]);
 
-  return { status, error, start, sendPcm, close };
+  return { status, error, start, reconnect, sendPcm, close };
 }

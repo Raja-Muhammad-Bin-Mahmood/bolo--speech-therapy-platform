@@ -20,12 +20,27 @@ import type {
   TranscriptLine,
 } from "../lib/closerTypes";
 
-/** Hard cap on any call — the model is told to wrap up before this too. */
+/** Soft cap on a call — the model is told to wrap up before this too. */
 const MAX_CALL_SECONDS = 120;
 
-/** Detects the customer's goodbye line (only ever checked on CUSTOMER turns). */
-const HANGUP_RE =
-  /(hang\s?up|hanging up|gotta go|got to go|have to go|need to leave|i'?m (going|leaving now)|goodbye|\bbye\b|don'?t call me)/i;
+/**
+ * FINAL goodbye signals — a customer line matching this (as their complete
+ * turn) is treated as an unambiguous, final hang-up. Short soft phrases like
+ * "I've got to go" / "I'm busy" are deliberately NOT here: per the customer
+ * system prompt (§9) those are *attempts to leave* that the salesperson gets
+ * a chance to recover from, so they must not hard-end the call.
+ */
+const FINAL_HANGUP_RE =
+  /\b(goodbye|bye)\b|hanging up|hang up now|i'?m (hanging up|leaving now)|(that'?s|this is) all for me/i;
+
+/**
+ * Soft "I might leave" signals — the customer is trying to end the call but
+ * the prompt guarantees the salesperson a recovery window. If they repeat
+ * this intent across multiple turns (and never get a reason to stay), we
+ * treat it as a real hang-up.
+ */
+const SOFT_HANGUP_RE =
+  /(got to go|gotta go|have to go|need to leave|i'?m (going|leaving)|don'?t call me|really busy|in the middle of something|not interested|not for me|send me an email|email me)/i;
 
 /**
  * The whole Closer Mode state machine: roulette → ringing → live call →
@@ -68,6 +83,11 @@ export function useCloserCall() {
   const userPartialRef = useRef("");
   const micActiveRef = useRef(false);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Soft leave-attempts the customer made but the salesperson recovered from.
+  const softHangupCountRef = useRef(0);
+  // Ongoing reconnect bookkeeping (transient socket drops are NOT hang-ups).
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
 
   const setPhaseBoth = useCallback((p: CallPhase) => {
     phaseRef.current = p;
@@ -164,6 +184,10 @@ export function useCloserCall() {
         clearInterval(tickRef.current);
         tickRef.current = null;
       }
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       setOutcome(reason);
       setCustomerSpeaking(false);
       setCustomerPartial("");
@@ -181,6 +205,37 @@ export function useCloserCall() {
 
   const endCallRef = useRef(endCall);
   endCallRef.current = endCall;
+
+  // ── Hang-up decision (final intent only, with a recovery window) ──────
+  const scheduleHangup = useCallback((delayMs = 700) => {
+    window.setTimeout(() => endCallRef.current("customer-hung-up"), delayMs);
+  }, []);
+
+  // ── Reconnect after a transient socket drop (NOT a hang-up) ────────────
+  const handleReconnect = useCallback(async () => {
+    if (endedRef.current) return;
+    setLiveStateBoth("reconnecting");
+    if (reconnectAttemptRef.current >= 3) {
+      // Give up after a few clean attempts — the connection is truly gone.
+      endCallRef.current("connection-lost");
+      return;
+    }
+    reconnectAttemptRef.current += 1;
+    const ok = await live.reconnect();
+    if (endedRef.current) return;
+    if (ok) {
+      reconnectAttemptRef.current = 0;
+      setLiveStateBoth("connected");
+      return;
+    }
+    // Retry with backoff: 1.5s, 3s, 6s…
+    const delay = 1500 * 2 ** (reconnectAttemptRef.current - 1);
+    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = window.setTimeout(
+      () => void handleReconnect(),
+      Math.min(delay, 8000)
+    );
+  }, [live, setLiveStateBoth]);
 
   // ── Connect the live call (after the ringing phase) ──────────────────
   const connectCall = useCallback(async () => {
@@ -228,15 +283,29 @@ export function useCloserCall() {
         setLiveStateBoth("connected");
         if (!text) return;
         pushLine("customer", text);
-        // The customer decided to hang up? (only after 10s so greetings
-        // like "bye" in a normal reply can't false-trigger).
-        if (
-          elapsedRef.current > 10 &&
-          text.length < 140 &&
-          !text.endsWith("?") &&
-          HANGUP_RE.test(text)
-        ) {
-          window.setTimeout(() => endCallRef.current("customer-hung-up"), 700);
+
+        // The customer's final goodbye — unambiguous, no recovery. Only
+        // matches explicit farewell/hang-up lines (NOT "I've got to go",
+        // "I'm busy", "email me" — those are recovery opportunities the
+        // prompt guarantees, so they never hard-end the call).
+        if (FINAL_HANGUP_RE.test(text)) {
+          scheduleHangup();
+          return;
+        }
+
+        // Soft leave-attempt (e.g. "I've got to go", "I'm really busy"):
+        // give the salesperson a chance to recover. Only escalate to a real
+        // hang-up if the customer keeps pushing to leave across multiple
+        // turns and the salesperson never wins them back.
+        if (SOFT_HANGUP_RE.test(text)) {
+          softHangupCountRef.current += 1;
+          if (softHangupCountRef.current >= 3) {
+            scheduleHangup();
+          }
+        } else {
+          // A normal response means the call is still on — reset the counter
+          // so occasional "I'm busy" remarks don't accumulate forever.
+          softHangupCountRef.current = 0;
         }
       },
       onInterrupted: () => {
@@ -261,13 +330,15 @@ export function useCloserCall() {
         setPhaseBoth("error");
       },
       onClose: () => {
-        // Unexpected socket close mid-call = the customer hung up.
+        // Unexpected socket close mid-call is almost always a transient
+        // network blip — NOT the customer hanging up. Give the Live session
+        // a chance to reconnect before ever ending the call.
         if (phaseRef.current === "live" && !endedRef.current) {
-          endCallRef.current("customer-hung-up");
+          void handleReconnect();
         }
       },
     });
-  }, [mic, stt, live, pushLine, setPhaseBoth, setLiveStateBoth, onUserFinalTranscript]);
+  }, [mic, stt, live, pushLine, setPhaseBoth, setLiveStateBoth, onUserFinalTranscript, handleReconnect]);
 
   // ── Flow actions ──────────────────────────────────────────────────────
   const beginRoulette = useCallback(() => {
@@ -302,6 +373,12 @@ export function useCloserCall() {
     customerTurnRef.current = "";
     userPartialRef.current = "";
     elapsedRef.current = 0;
+    softHangupCountRef.current = 0;
+    reconnectAttemptRef.current = 0;
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
     transcriptRef.current = [];
     setTranscript([]);
     setElapsed(0);
@@ -327,6 +404,7 @@ export function useCloserCall() {
   useEffect(
     () => () => {
       if (tickRef.current) clearInterval(tickRef.current);
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
     },
     []
   );

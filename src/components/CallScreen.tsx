@@ -340,6 +340,18 @@ export default function CallScreen(props: CallScreenProps) {
               )}
 
               {/* Banners */}
+              {/* Reconnecting banner */}
+              {liveState === "reconnecting" && (
+                <div className="w-full rounded-xl bg-amber-500/10 border border-amber-500/20 px-3 py-2.5 flex items-center gap-2 text-xs text-amber-200">
+                  <span className="relative flex h-2 w-2 shrink-0">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-400" />
+                  </span>
+                  <span>
+                    Connection dropped — reconnecting to the customer…
+                  </span>
+                </div>
+              )}
               {liveError && (
                 <div className="w-full rounded-xl bg-rose-500/10 border border-rose-500/20 px-3 py-2.5 flex items-start gap-2 text-xs text-rose-200">
                   <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />

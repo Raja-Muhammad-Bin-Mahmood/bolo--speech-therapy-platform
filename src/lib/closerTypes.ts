@@ -24,6 +24,7 @@ export type LiveCallState =
   | "customer_speaking"
   | "user_speaking"
   | "interrupted"
+  | "reconnecting"
   | "ending"
   | "ended"
   | "error";
@@ -32,6 +33,7 @@ export type CallOutcome =
   | "user-ended"
   | "customer-hung-up"
   | "timeout"
+  | "connection-lost"
   | "error";
 
 export type SpeakerRole = "user" | "customer";

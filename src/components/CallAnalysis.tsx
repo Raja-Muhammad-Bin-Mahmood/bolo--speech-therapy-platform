@@ -187,7 +187,8 @@ export default function CallAnalysis(props: CallAnalysisProps) {
   const outcomeLabel: Record<string, string> = {
     "user-ended": "You ended the call",
     "customer-hung-up": "The customer hung up",
-    timeout: "Time's up — 2 minutes",
+    timeout: "Time's up",
+    "connection-lost": "The connection dropped",
     error: "Call ended with an error",
   };
 
