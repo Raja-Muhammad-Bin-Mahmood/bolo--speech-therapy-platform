@@ -130,7 +130,9 @@ export default function CallScreen(props: CallScreenProps) {
       ? "Calling…"
       : phase === "connecting"
         ? "Connecting…"
-        : "Connected";
+        : phase === "error"
+          ? "Call failed"
+          : "Connected";
 
   return (
     <motion.div
@@ -221,22 +223,30 @@ export default function CallScreen(props: CallScreenProps) {
             </p>
           </div>
 
-          {/* Live call body */}
-          {phase === "live" && (
+          {/* Live call body — visible for live AND error so the classified
+              error banner + End Call control always stay reachable. */}
+          {(phase === "live" || phase === "error") && (
             <div className="w-full flex flex-col items-center gap-4">
-              {/* Transcript */}
-              <div
-                ref={scrollRef}
-                className="w-full h-52 overflow-y-auto space-y-2.5 pr-1 rounded-xl"
-                role="log"
-                aria-live="polite"
-                aria-label="Call transcript"
-              >
-                {transcript.length === 0 && !customerPartial && (
-                  <p className="text-center text-xs text-soft-gray/40 pt-10">
-                    Say hello — the customer just picked up…
-                  </p>
-                )}
+              {/* Transcript — rendered live, or kept if the call already had
+                  content when an unexpected error hit. */}
+              {(phase === "live" ||
+                transcript.length > 0 ||
+                customerPartial ||
+                userPartial) && (
+                <div
+                  ref={scrollRef}
+                  className="w-full h-52 overflow-y-auto space-y-2.5 pr-1 rounded-xl"
+                  role="log"
+                  aria-live="polite"
+                  aria-label="Call transcript"
+                >
+                  {phase === "live" &&
+                    transcript.length === 0 &&
+                    !customerPartial && (
+                      <p className="text-center text-xs text-soft-gray/40 pt-10">
+                        Say hello — the customer just picked up…
+                      </p>
+                    )}
                 {transcript.map((line, i) => (
                   <div
                     key={i}
@@ -295,7 +305,8 @@ export default function CallScreen(props: CallScreenProps) {
                     </p>
                   </div>
                 )}
-              </div>
+                </div>
+              )}
 
               {/* Customer speaking waveform */}
               {customerSpeaking && (
