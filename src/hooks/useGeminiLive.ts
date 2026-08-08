@@ -28,6 +28,30 @@ const LIVE_VOICE = "Puck";
 
 export type LiveStatus = "idle" | "connecting" | "live" | "error" | "closed";
 
+/**
+ * Developer-facing messages per error class returned by the gemini-live-token
+ * Edge Function. Never includes the API key — Google error bodies are parsed
+ * server-side and only the safe, classified message reaches the browser.
+ */
+const LIVE_ERROR_MESSAGES: Record<string, string> = {
+  "missing-secret":
+    "Gemini isn't configured yet — add the GEMINI_API_KEY secret in Supabase Edge Function secrets.",
+  "unsupported-credential-type":
+    "The stored Gemini credential is the wrong type (Google: ACCESS_TOKEN_TYPE_UNSUPPORTED) — it is not a Gemini API key. Store a standard key (starts with AIza) from https://aistudio.google.com/apikey.",
+  "invalid-key":
+    "Gemini rejected the stored API key (401) — verify it at https://aistudio.google.com/apikey.",
+  forbidden:
+    "Gemini denied access (403) — check that the API key's project has the Gemini API enabled.",
+  quota: "Gemini quota exceeded (429) — wait a bit and try again.",
+  "model-unavailable": `The Gemini Live model (${LIVE_MODEL}) is unavailable — check the model name.`,
+};
+
+function liveErrorMessage(cls: string | undefined, fallback: string): string {
+  if (cls && LIVE_ERROR_MESSAGES[cls]) return LIVE_ERROR_MESSAGES[cls];
+  const f = (fallback || "").slice(0, 240);
+  return f || "The live connection failed — check the Gemini configuration.";
+}
+
 export interface LiveHandlers {
   onOpen: () => void;
   /** Streaming text of the customer's current reply (may arrive in parts). */
@@ -129,7 +153,20 @@ export function useGeminiLive() {
           method: "POST",
           headers,
         });
-        if (!res.ok) throw new Error(`Live token request failed (${res.status})`);
+        if (!res.ok) {
+          // The Edge Function returns { class, error } — map it to a clear,
+          // safe message instead of leaking raw internals.
+          let cls: string | undefined;
+          let raw = `Live token request failed (${res.status})`;
+          try {
+            const body = await res.json();
+            cls = body?.class;
+            if (body?.error) raw = body.error;
+          } catch {
+            // Non-JSON error body — keep the generic message.
+          }
+          throw new Error(liveErrorMessage(cls, raw));
+        }
         const { token } = await res.json();
         if (!token) throw new Error("No live token returned by server");
 
