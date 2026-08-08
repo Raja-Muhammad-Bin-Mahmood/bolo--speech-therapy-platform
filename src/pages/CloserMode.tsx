@@ -101,15 +101,19 @@ export default function CloserMode() {
             {/* Screen 3 — the phone call */}
             {(call.phase === "ringing" ||
               call.phase === "connecting" ||
-              call.phase === "live") &&
+              call.phase === "live" ||
+              call.phase === "ending" ||
+              call.phase === "error") &&
               call.context && (
                 <CallScreen
                   key="call"
                   phase={call.phase}
+                  liveState={call.liveState}
                   context={call.context}
                   elapsed={call.elapsed}
                   transcript={call.transcript}
                   customerPartial={call.customerPartial}
+                  userPartial={call.userPartial}
                   customerSpeaking={call.customerSpeaking}
                   speakingLevel={call.speakingLevel}
                   interruptedAt={call.interruptedAt}

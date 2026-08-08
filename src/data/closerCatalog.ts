@@ -101,26 +101,6 @@ export const MOODS: string[] = [
   "you're stressed about money",
 ];
 
-/** Objection pool the customer draws from (weighted by persona in the prompt). */
-export const OBJECTION_LINES: string[] = [
-  "That's way too expensive.",
-  "I already have one.",
-  "I need to ask my spouse first.",
-  "I don't have the money right now.",
-  "This isn't a good time.",
-  "I don't trust sales calls like this.",
-  "I need to think about it.",
-  "I don't believe those claims.",
-  "Show me some proof first.",
-  "Do you have reviews?",
-  "Is there a warranty?",
-  "I'm really busy.",
-  "I'm not interested.",
-  "I already use a different brand.",
-  "That doesn't solve my problem.",
-  "It's not a priority for me.",
-];
-
 // ─── No-frequent-repeat pickers ─────────────────────────────────────────
 
 const recentProducts: string[] = [];

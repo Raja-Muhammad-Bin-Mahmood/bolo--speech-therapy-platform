@@ -15,6 +15,7 @@ import type {
   CallContext,
   CallOutcome,
   CallPhase,
+  LiveCallState,
   SalesReport,
   TranscriptLine,
 } from "../lib/closerTypes";
@@ -29,7 +30,7 @@ const HANGUP_RE =
 /**
  * The whole Closer Mode state machine: roulette → ringing → live call →
  * ended + report. Owns mic, Speechmatics STT (user's side) and the Gemini
- * Live customer.
+ * Live customer (audio + transcriptions).
  */
 export function useCloserCall() {
   const mic = useAudioCapture();
@@ -37,10 +38,13 @@ export function useCloserCall() {
   const live = useGeminiLive();
 
   const [phase, setPhase] = useState<CallPhase>("idle");
+  /** Explicit live-call sub-state (per spec §23). */
+  const [liveState, setLiveState] = useState<LiveCallState>("idle");
   const [context, setContext] = useState<CallContext | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
   const [customerPartial, setCustomerPartial] = useState("");
+  const [userPartial, setUserPartial] = useState("");
   const [customerSpeaking, setCustomerSpeaking] = useState(false);
   const [interruptedAt, setInterruptedAt] = useState(0);
   const [liveError, setLiveError] = useState<string | null>(null);
@@ -53,18 +57,26 @@ export function useCloserCall() {
 
   // ── Refs (escape hatch for callbacks/timers) ──────────────────────────
   const phaseRef = useRef<CallPhase>("idle");
+  const liveStateRef = useRef<LiveCallState>("idle");
   const contextRef = useRef<CallContext | null>(null);
   const transcriptRef = useRef<TranscriptLine[]>([]);
   const elapsedRef = useRef(0);
   const endedRef = useRef(false);
   const customerTurnRef = useRef("");
   const seenFinalsRef = useRef<Set<object>>(new Set());
+  const seenUserTranscriptRef = useRef<Set<string>>(new Set());
+  const userPartialRef = useRef("");
   const micActiveRef = useRef(false);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const setPhaseBoth = useCallback((p: CallPhase) => {
     phaseRef.current = p;
     setPhase(p);
+  }, []);
+
+  const setLiveStateBoth = useCallback((s: LiveCallState) => {
+    liveStateRef.current = s;
+    setLiveState(s);
   }, []);
 
   const pushLine = useCallback((role: "user" | "customer", text: string) => {
@@ -91,6 +103,18 @@ export function useCloserCall() {
       pushLine("user", text);
     }
   }, [stt.transcripts, pushLine]);
+
+  // ── Gemini Live user transcription (final) → transcript lines ────────
+  const onUserFinalTranscript = useCallback(
+    (text: string) => {
+      const t = text.trim();
+      if (!t || phaseRef.current !== "live") return;
+      if (seenUserTranscriptRef.current.has(t)) return;
+      seenUserTranscriptRef.current.add(t);
+      pushLine("user", t);
+    },
+    [pushLine]
+  );
 
   // ── Report generation (server-side Gemini, fallback to instant stats) ─
   const generateReport = useCallback(async (reason: CallOutcome) => {
@@ -134,14 +158,16 @@ export function useCloserCall() {
       setOutcome(reason);
       setCustomerSpeaking(false);
       setCustomerPartial("");
+      setUserPartial("");
       mic.stop();
       stt.disconnect();
       live.close();
       playHangupTone();
+      setLiveStateBoth("ended");
       setPhaseBoth("ended");
       void generateReport(reason);
     },
-    [mic, stt, live, generateReport, setPhaseBoth]
+    [mic, stt, live, generateReport, setPhaseBoth, setLiveStateBoth]
   );
 
   const endCallRef = useRef(endCall);
@@ -152,9 +178,10 @@ export function useCloserCall() {
     const ctx = contextRef.current;
     if (!ctx || endedRef.current) return;
     setPhaseBoth("connecting");
+    setLiveStateBoth("connecting");
 
     // One mic stream feeds both lanes: Speechmatics (user transcript)
-    // and Gemini Live (customer hears the user). Each lane self-guards.
+    // and Gemini Live (customer hears the user + barge-in VAD).
     mic.setOnAudioData((chunk) => {
       stt.sendAudio(chunk);
       live.sendPcm(chunk);
@@ -168,6 +195,7 @@ export function useCloserCall() {
     live.start(buildCustomerSystemPrompt(ctx), {
       onOpen: () => {
         setPhaseBoth("live");
+        setLiveStateBoth("connected");
         if (tickRef.current) clearInterval(tickRef.current);
         tickRef.current = setInterval(() => {
           elapsedRef.current += 0.25;
@@ -181,12 +209,14 @@ export function useCloserCall() {
         customerTurnRef.current += text;
         setCustomerPartial(customerTurnRef.current);
         setCustomerSpeaking(true);
+        setLiveStateBoth("customer_speaking");
       },
       onTurnComplete: () => {
         const text = customerTurnRef.current.trim();
         customerTurnRef.current = "";
         setCustomerPartial("");
         setCustomerSpeaking(false);
+        setLiveStateBoth("connected");
         if (!text) return;
         pushLine("customer", text);
         // The customer decided to hang up? (only after 10s so greetings
@@ -200,10 +230,26 @@ export function useCloserCall() {
           window.setTimeout(() => endCallRef.current("customer-hung-up"), 700);
         }
       },
-      onInterrupted: () => setInterruptedAt(Date.now()),
+      onInterrupted: () => {
+        setInterruptedAt(Date.now());
+        setLiveStateBoth("interrupted");
+        // Reset to connected shortly after so the next turn is clean.
+        window.setTimeout(() => {
+          if (phaseRef.current === "live" && !endedRef.current) {
+            setLiveStateBoth("connected");
+          }
+        }, 1200);
+      },
+      onUserTranscript: (text) => {
+        userPartialRef.current = text;
+        setUserPartial(text);
+        setLiveStateBoth("user_speaking");
+      },
+      onUserFinalTranscript: onUserFinalTranscript,
       onError: (err) => {
         setLiveError(err);
-        setPhaseBoth("live");
+        setLiveStateBoth("error");
+        setPhaseBoth("error");
       },
       onClose: () => {
         // Unexpected socket close mid-call = the customer hung up.
@@ -212,7 +258,7 @@ export function useCloserCall() {
         }
       },
     });
-  }, [mic, stt, live, pushLine, setPhaseBoth]);
+  }, [mic, stt, live, pushLine, setPhaseBoth, setLiveStateBoth, onUserFinalTranscript]);
 
   // ── Flow actions ──────────────────────────────────────────────────────
   const beginRoulette = useCallback(() => {
@@ -230,11 +276,12 @@ export function useCloserCall() {
       contextRef.current = ctx;
       setContext(ctx);
       setPhaseBoth("ringing");
+      setLiveStateBoth("ringing");
       // Random 2–5s of ringing before the customer answers.
       const delay = 2000 + Math.random() * 3000;
       window.setTimeout(() => void connectCall(), delay);
     },
-    [connectCall, setPhaseBoth]
+    [connectCall, setPhaseBoth, setLiveStateBoth]
   );
 
   const endCallByUser = useCallback(() => endCall("user-ended"), [endCall]);
@@ -242,7 +289,9 @@ export function useCloserCall() {
   const reset = useCallback(() => {
     endedRef.current = false;
     seenFinalsRef.current = new Set();
+    seenUserTranscriptRef.current = new Set();
     customerTurnRef.current = "";
+    userPartialRef.current = "";
     elapsedRef.current = 0;
     transcriptRef.current = [];
     setTranscript([]);
@@ -256,9 +305,11 @@ export function useCloserCall() {
     setSttNote(false);
     setInterruptedAt(0);
     setCustomerPartial("");
+    setUserPartial("");
     setCustomerSpeaking(false);
+    setLiveStateBoth("idle");
     setPhaseBoth("idle");
-  }, [setPhaseBoth]);
+  }, [setPhaseBoth, setLiveStateBoth]);
 
   useEffect(() => {
     if (stt.status === "error") setSttNote(true);
@@ -273,10 +324,12 @@ export function useCloserCall() {
 
   return {
     phase,
+    liveState,
     context,
     elapsed,
     transcript,
     customerPartial,
+    userPartial,
     customerSpeaking,
     interruptedAt,
     liveError,

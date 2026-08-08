@@ -50,6 +50,8 @@ export function decodePcm16ToFloat32(b64: string): Float32Array<ArrayBuffer> {
 export class AudioQueue {
   private ctx: AudioContext | null = null;
   private nextTime = 0;
+  /** Currently scheduled/playing buffer sources — tracked so flush() can stop them. */
+  private active: AudioBufferSourceNode[] = [];
 
   private ensureCtx(): AudioContext {
     if (!this.ctx) {
@@ -74,12 +76,35 @@ export class AudioQueue {
       const when = Math.max(ctx.currentTime, this.nextTime);
       src.start(when);
       this.nextTime = when + buffer.duration;
+      this.active.push(src);
+      src.onended = () => {
+        const i = this.active.indexOf(src);
+        if (i >= 0) this.active.splice(i, 1);
+      };
     } catch {
       // Skip a corrupt chunk — never let audio kill the call.
     }
   }
 
+  /**
+   * Immediately stop whatever is playing and drop everything still queued.
+   * The context stays alive so the next chunk plays instantly (barge-in).
+   */
+  flush(): void {
+    for (const src of this.active) {
+      try {
+        src.stop();
+      } catch {
+        // Already ended — fine.
+      }
+    }
+    this.active = [];
+    this.nextTime = this.ctx?.currentTime ?? 0;
+  }
+
+  /** Full teardown (end of call). */
   stop(): void {
+    this.flush();
     try {
       void this.ctx?.close();
     } catch {

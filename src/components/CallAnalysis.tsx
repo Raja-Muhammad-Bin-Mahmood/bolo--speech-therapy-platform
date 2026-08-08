@@ -4,7 +4,6 @@ import {
   CircleCheck,
   CircleAlert,
   Target,
-  HeartHandshake,
   MessageSquare,
   Lightbulb,
   GraduationCap,
@@ -13,6 +12,8 @@ import {
   Loader2,
   RotateCcw,
   ChevronLeft,
+  TrendingUp,
+  TrendingDown,
 } from "lucide-react";
 import type {
   CallContext,
@@ -21,6 +22,7 @@ import type {
   TranscriptLine,
 } from "../lib/closerTypes";
 import { formatCallTime } from "./CallScreen";
+import { reportMetrics } from "../lib/salesReport";
 
 interface CallAnalysisProps {
   report: SalesReport | null;
@@ -134,6 +136,28 @@ function Section({
   );
 }
 
+function ObjectionRow({ o }: { o: { objection: string; outcome: string; grade: string } }) {
+  const color =
+    o.grade === "strong" ? "text-emerald-300" : o.grade === "weak" ? "text-amber-300" : "text-rose-300";
+  return (
+    <li className="text-sm text-white/85 flex items-start gap-2">
+      <span className={`mt-1 shrink-0 ${color}`}>
+        {o.grade === "strong" ? (
+          <CircleCheck className="w-4 h-4" />
+        ) : o.grade === "weak" ? (
+          <CircleAlert className="w-4 h-4" />
+        ) : (
+          <TrendingDown className="w-4 h-4" />
+        )}
+      </span>
+      <span>
+        <span className="text-white/90 font-medium">{o.objection}</span>
+        <span className="block text-xs text-soft-gray/60 mt-0.5">{o.outcome}</span>
+      </span>
+    </li>
+  );
+}
+
 export default function CallAnalysis(props: CallAnalysisProps) {
   const { report, loading, error, context, transcript, outcome, durationSec, onNewCall, onDashboard } = props;
 
@@ -153,8 +177,8 @@ export default function CallAnalysis(props: CallAnalysisProps) {
         </div>
         <p className="text-soft-gray text-sm">Analyzing your pitch…</p>
         <p className="text-soft-gray/40 text-xs max-w-xs text-center">
-          Scoring 14 sales metrics and replaying every objection against the
-          customer's hidden persona.
+          Scoring 7 sales metrics and replaying every objection against the
+          customer's hidden personality.
         </p>
       </div>
     );
@@ -166,6 +190,8 @@ export default function CallAnalysis(props: CallAnalysisProps) {
     timeout: "Time's up — 2 minutes",
     error: "Call ended with an error",
   };
+
+  const metrics = reportMetrics(report);
 
   return (
     <motion.div
@@ -197,87 +223,72 @@ export default function CallAnalysis(props: CallAnalysisProps) {
         <p className="text-center text-sm text-soft-gray max-w-sm">{report.verdict}</p>
       </div>
 
-      {/* Hidden persona reveal */}
+      {/* Hidden personality reveal */}
       <Section icon={<Eye className="w-4 h-4" />} title="Who you were actually talking to">
-        <p className="text-sm text-white/90 leading-relaxed">{report.personaReveal}</p>
+        <p className="text-sm text-white/90 leading-relaxed">
+          {context.persona} — the customer played this personality for the whole call.
+        </p>
       </Section>
 
       {/* Metrics */}
-      <Section icon={<Activity className="w-4 h-4" />} title="The 14-point breakdown">
+      <Section icon={<Activity className="w-4 h-4" />} title="The 7-point breakdown">
         <div className="grid sm:grid-cols-2 gap-3">
-          {report.metrics.map((m) => (
+          {metrics.map((m) => (
             <MetricBar key={m.label} label={m.label} score={m.score} note={m.note} />
           ))}
         </div>
       </Section>
 
-      {/* Strengths / weaknesses */}
+      {/* Best / weakest argument */}
       <div className="grid sm:grid-cols-2 gap-5">
-        <Section icon={<CircleCheck className="w-4 h-4" />} title="Strengths">
-          <ul className="space-y-2">
-            {report.strengths.map((s, i) => (
-              <li key={i} className="flex items-start gap-2 text-sm text-white/85">
-                <CircleCheck className="w-4 h-4 text-emerald-300 shrink-0 mt-0.5" />
-                {s}
-              </li>
-            ))}
-          </ul>
+        <Section icon={<TrendingUp className="w-4 h-4" />} title="Best argument">
+          <p className="text-sm text-white/85 leading-relaxed">{report.bestArgument}</p>
         </Section>
-        <Section icon={<CircleAlert className="w-4 h-4" />} title="Weaknesses">
-          <ul className="space-y-2">
-            {report.weaknesses.map((s, i) => (
-              <li key={i} className="flex items-start gap-2 text-sm text-white/85">
-                <CircleAlert className="w-4 h-4 text-rose-300 shrink-0 mt-0.5" />
-                {s}
-              </li>
-            ))}
-          </ul>
+        <Section icon={<TrendingDown className="w-4 h-4" />} title="Weakest argument">
+          <p className="text-sm text-white/85 leading-relaxed">{report.weakestArgument}</p>
         </Section>
       </div>
 
-      {/* Missed opportunities */}
-      <Section icon={<Target className="w-4 h-4" />} title="Missed opportunities">
+      {/* Objections */}
+      <Section icon={<MessageSquare className="w-4 h-4" />} title="Objections & how you handled them">
+        {report.objectionHandlingDetails.length === 0 ? (
+          <p className="text-sm text-soft-gray/60">No objections were captured this call.</p>
+        ) : (
+          <ul className="space-y-2">
+            {report.objectionHandlingDetails.map((o, i) => (
+              <ObjectionRow key={i} o={o} />
+            ))}
+          </ul>
+        )}
+      </Section>
+
+      {/* Missed opportunities + better strategy */}
+      <div className="grid sm:grid-cols-2 gap-5">
+        <Section icon={<Target className="w-4 h-4" />} title="Missed opportunities">
+          <ul className="space-y-2">
+            {report.missedOpportunities.map((s, i) => (
+              <li key={i} className="text-sm text-white/85 flex items-start gap-2">
+                <span className="text-neon-purple mt-1">·</span>
+                {s}
+              </li>
+            ))}
+          </ul>
+        </Section>
+        <Section icon={<Lightbulb className="w-4 h-4" />} title="Better strategy">
+          <p className="text-sm text-white/85 leading-relaxed">{report.betterStrategy}</p>
+        </Section>
+      </div>
+
+      {/* Specific improvements */}
+      <Section icon={<GraduationCap className="w-4 h-4" />} title="Specific improvements">
         <ul className="space-y-2">
-          {report.missedOpportunities.map((s, i) => (
+          {report.specificImprovements.map((s, i) => (
             <li key={i} className="text-sm text-white/85 flex items-start gap-2">
-              <span className="text-neon-purple mt-1">·</span>
+              <Lightbulb className="w-4 h-4 text-amber-300 shrink-0 mt-0.5" />
               {s}
             </li>
           ))}
         </ul>
-        <div className="mt-3 glass rounded-xl p-3 flex items-start gap-2">
-          <HeartHandshake className="w-4 h-4 text-neon-purple shrink-0 mt-0.5" />
-          <p className="text-xs text-soft-gray leading-relaxed">{report.almostAgreed}</p>
-        </div>
-      </Section>
-
-      {/* Objections + better responses */}
-      <div className="grid sm:grid-cols-2 gap-5">
-        <Section icon={<MessageSquare className="w-4 h-4" />} title="Why objections failed">
-          <ul className="space-y-2">
-            {report.objectionFeedback.map((s, i) => (
-              <li key={i} className="text-sm text-white/85 flex items-start gap-2">
-                <span className="text-rose-300 mt-1">·</span>
-                {s}
-              </li>
-            ))}
-          </ul>
-        </Section>
-        <Section icon={<Lightbulb className="w-4 h-4" />} title="Better responses">
-          <ul className="space-y-2">
-            {report.betterResponses.map((s, i) => (
-              <li key={i} className="text-sm text-white/85 flex items-start gap-2">
-                <Lightbulb className="w-4 h-4 text-amber-300 shrink-0 mt-0.5" />
-                {s}
-              </li>
-            ))}
-          </ul>
-        </Section>
-      </div>
-
-      {/* Coach note */}
-      <Section icon={<GraduationCap className="w-4 h-4" />} title="Coach's note">
-        <p className="text-sm text-white/85 leading-relaxed">{report.coachNote}</p>
       </Section>
 
       {/* Transcript */}

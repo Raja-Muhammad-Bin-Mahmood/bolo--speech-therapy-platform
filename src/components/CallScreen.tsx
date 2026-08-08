@@ -18,11 +18,15 @@ export function formatCallTime(sec: number): string {
 }
 
 interface CallScreenProps {
-  phase: "ringing" | "connecting" | "live";
+  phase: "ringing" | "connecting" | "live" | "ending" | "error";
+  /** Explicit live-call sub-state (per spec §23). */
+  liveState: string;
   context: CallContext;
   elapsed: number;
   transcript: TranscriptLine[];
   customerPartial: string;
+  /** Live user transcript (from Gemini input transcription). */
+  userPartial: string;
   customerSpeaking: boolean;
   /** 0–1 user mic level (drives the user waveform + mic glow). */
   speakingLevel: number;
@@ -96,10 +100,12 @@ function LevelBars({ level }: { level: number }) {
 export default function CallScreen(props: CallScreenProps) {
   const {
     phase,
+    liveState,
     context,
     elapsed,
     transcript,
     customerPartial,
+    userPartial,
     customerSpeaking,
     speakingLevel,
     interruptedAt,
@@ -260,6 +266,21 @@ export default function CallScreen(props: CallScreenProps) {
                   </div>
                 ))}
 
+                {userPartial && (
+                  <div className="flex items-start gap-2 flex-row-reverse">
+                    <span className="text-[10px] font-mono text-soft-gray/40 mt-1 w-8 shrink-0 text-right">
+                      {formatCallTime(elapsed)}
+                    </span>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded shrink-0 mt-0.5 bg-electric-violet/20 text-electric-violet">
+                      You
+                    </span>
+                    <p className="text-sm leading-relaxed text-white/60 italic max-w-[70%] text-left">
+                      {userPartial}
+                      <span className="inline-block w-1.5 h-3.5 bg-electric-violet/70 ml-0.5 align-middle animate-pulse" />
+                    </p>
+                  </div>
+                )}
+
                 {customerPartial && (
                   <div className="flex items-start gap-2">
                     <span className="text-[10px] font-mono text-soft-gray/40 mt-1 w-8 shrink-0 text-right">
@@ -308,6 +329,17 @@ export default function CallScreen(props: CallScreenProps) {
                   Your side of the transcript isn't being captured right now.
                 </p>
               )}
+
+              {/* Explicit live-call state (per spec §23) */}
+              <div className="w-full flex justify-center">
+                <span
+                  className="text-[10px] px-2.5 py-1 rounded-full bg-white/5 text-soft-gray/60 uppercase tracking-widest"
+                  role="status"
+                  aria-label={`Call state: ${liveState}`}
+                >
+                  {liveState.replace(/_/g, " ")}
+                </span>
+              </div>
 
               {/* Controls */}
               <div className="flex items-center justify-center gap-8 w-full pt-2">
