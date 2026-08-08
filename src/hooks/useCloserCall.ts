@@ -131,7 +131,16 @@ export function useCloserCall() {
           schema: REPORT_RESPONSE_SCHEMA,
         }),
       });
-      if (!res.ok) throw new Error(`report request failed (${res.status})`);
+      if (!res.ok) {
+        let detail = `report request failed (${res.status})`;
+        try {
+          const body = await res.json();
+          if (body?.class) detail = `${body.class}: ${body.error}`;
+        } catch {
+          // non-JSON error body — keep the generic detail
+        }
+        throw new Error(detail);
+      }
       const raw = await res.json();
       const parsed = normalizeReport(raw);
       if (!parsed) throw new Error("report was not parseable");
