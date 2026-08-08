@@ -140,6 +140,18 @@ export function useGeminiLive() {
     async (systemInstruction: string, handlers: LiveHandlers) => {
       handlersRef.current = handlers;
       setError(null);
+      // Hard guard: a Closer call must ALWAYS carry the customer system
+      // instruction. Refuse to connect rather than let Gemini improvise a
+      // cooperative assistant persona.
+      const instruction = (systemInstruction || "").trim();
+      if (!instruction) {
+        const msg =
+          "The live customer was started without a system instruction — refusing to connect.";
+        setError(msg);
+        setLiveStatus("error");
+        handlersRef.current?.onError(msg);
+        return;
+      }
       setLiveStatus("connecting");
       try {
         // 1. Mint a short-lived ephemeral token (key stays in the Edge Function).
@@ -170,7 +182,14 @@ export function useGeminiLive() {
         const { token } = await res.json();
         if (!token) throw new Error("No live token returned by server");
 
-        // 2. Connect with the ephemeral token.
+        // 2. Connect with the ephemeral token, carrying the full customer
+        //    system instruction (name / persona / product / mood / behaviour
+        //    rules). Logged for runtime verification that it reached the
+        //    session config.
+        if (import.meta.env?.DEV) {
+          console.info("[BOLO] Gemini Live system instruction (chars):", instruction.length);
+          console.info("[BOLO] Gemini Live customer:", instruction.split("\n").slice(0, 6).join(" | "));
+        }
         const ai = new GoogleGenAI({
           apiKey: token,
           httpOptions: { apiVersion: "v1alpha" },
@@ -179,7 +198,7 @@ export function useGeminiLive() {
           model: LIVE_MODEL,
           config: {
             responseModalities: [Modality.AUDIO],
-            systemInstruction: { parts: [{ text: systemInstruction }] },
+            systemInstruction: { parts: [{ text: instruction }] },
             inputAudioTranscription: {},
             outputAudioTranscription: {},
             speechConfig: {
