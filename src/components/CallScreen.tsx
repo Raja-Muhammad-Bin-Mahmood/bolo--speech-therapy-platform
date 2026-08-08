@@ -163,10 +163,10 @@ export default function CallScreen(props: CallScreenProps) {
                   </span>
                 </>
               )}
-              {phase === "ringing" && (
+              {(phase === "ringing" || phase === "error") && (
                 <button
                   onClick={onEnd}
-                  aria-label="Cancel call"
+                  aria-label={phase === "error" ? "Return" : "Cancel call"}
                   className="w-8 h-8 rounded-full bg-white/5 hover:bg-white/10 flex items-center justify-center text-soft-gray transition-all active:scale-90 cursor-pointer"
                 >
                   <X className="w-4 h-4" />
@@ -227,6 +227,29 @@ export default function CallScreen(props: CallScreenProps) {
               error banner + End Call control always stay reachable. */}
           {(phase === "live" || phase === "error") && (
             <div className="w-full flex flex-col items-center gap-4">
+              {/* Explicit error state — shown whenever authentication or the
+                  live connection failed. Never says "Connected", always shows
+                  the classified error, and always lets the user escape. */}
+              {phase === "error" && (
+                <div className="w-full rounded-2xl bg-rose-500/10 border border-rose-500/25 px-4 py-4 flex flex-col items-center gap-3">
+                  <div className="flex items-center gap-2 text-rose-200">
+                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                    <span className="font-heading font-semibold text-sm uppercase tracking-widest">
+                      Call failed
+                    </span>
+                  </div>
+                  <p className="text-xs text-rose-100/80 text-center leading-relaxed">
+                    {liveError || "The live connection couldn't be established."}
+                  </p>
+                  <button
+                    onClick={onEnd}
+                    className="mt-1 inline-flex items-center gap-2 rounded-full bg-rose-500/20 hover:bg-rose-500/30 text-rose-100 text-xs font-semibold px-5 py-2 transition-all duration-200 active:scale-[0.96] cursor-pointer"
+                  >
+                    <PhoneOff className="w-3.5 h-3.5" />
+                    Return
+                  </button>
+                </div>
+              )}
               {/* Transcript — rendered live, or kept if the call already had
                   content when an unexpected error hit. */}
               {(phase === "live" ||

@@ -37,11 +37,11 @@ const LIVE_ERROR_MESSAGES: Record<string, string> = {
   "missing-secret":
     "Gemini isn't configured yet — add the GEMINI_API_KEY secret in Supabase Edge Function secrets.",
   "unsupported-credential-type":
-    "The stored Gemini credential is the wrong type (Google: ACCESS_TOKEN_TYPE_UNSUPPORTED) — it is not a Gemini API key. Store a standard key (starts with AIza) from https://aistudio.google.com/apikey.",
+    "Google rejected the stored credential type when minting the live token (ACCESS_TOKEN_TYPE_UNSUPPORTED) — the AI Studio credential in GEMINI_API_KEY isn't accepted by the ephemeral-token endpoint in its current form. Re-store the credential from AI Studio and try again.",
   "invalid-key":
-    "Gemini rejected the stored API key (401) — verify it at https://aistudio.google.com/apikey.",
+    "Gemini rejected the stored credential (401) — verify it in AI Studio and re-store it.",
   forbidden:
-    "Gemini denied access (403) — check that the API key's project has the Gemini API enabled.",
+    "Gemini denied access (403) — check that the credential's project has the Gemini API enabled.",
   quota: "Gemini quota exceeded (429) — wait a bit and try again.",
   "model-unavailable": `The Gemini Live model (${LIVE_MODEL}) is unavailable — check the model name.`,
 };
