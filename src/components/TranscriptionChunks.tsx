@@ -8,10 +8,6 @@ import type { RecoveredAnnotation } from "../lib/recoveryTypes";
 import type { PendingSpeechEvent } from "../hooks/useEventEngine";
 import { assignEventsToSpans } from "../lib/feedEvents";
 import { buildRecoveredItems } from "../lib/recoveryRender";
-import {
-  suppressedByLock,
-  type TranscriptToken,
-} from "../lib/transcriptTokens";
 import FeedChip from "./FeedChip";
 import StutterSpan from "./StutterSpan";
 import PulseDots from "./PulseDots";
@@ -35,8 +31,7 @@ interface TranscriptionChunksProps {
   recovered?: RecoveredAnnotation[];
   /**
    * Speechmatics word keys to HIDE — words the engine recovered locally
-   * first (timestamp-locked) OR words a locked Deepgram disfluency token
-   * replaced. Prevents duplicate tokens.
+   * first (timestamp-locked). Prevents duplicate tokens.
    */
   duplicateKeys?: Set<string>;
   /**
@@ -44,13 +39,6 @@ interface TranscriptionChunksProps {
    * transcript cursor while BOLO resolves the struggle.
    */
   pending?: PendingSpeechEvent[];
-  /**
-   * Reconciled Deepgram disfluency tokens (fast-tracked, locked). Rendered
-   * as the NORMALIZED lexical word with the BOLO disfluency marker at its
-   * chronological position; also suppresses conflicting Speechmatics
-   * partials so the UI never flickers between "slap" and "rap".
-   */
-  deepgramTokens?: TranscriptToken[];
   /** Safety-net max words per line */
   maxWordsPerLine?: number;
 }
@@ -71,7 +59,6 @@ export default function TranscriptionChunks({
   recovered = [],
   duplicateKeys,
   pending = [],
-  deepgramTokens = [],
   maxWordsPerLine = 16,
 }: TranscriptionChunksProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -85,7 +72,6 @@ export default function TranscriptionChunks({
     recovered,
     duplicateKeys,
     pending,
-    deepgramTokens,
     maxWordsPerLine
   );
 
@@ -166,8 +152,6 @@ interface LineWord {
   events?: FeedEvent[];
   /** Recovery annotation attached to this word (Stage 3) */
   recovered?: RecoveredAnnotation | null;
-  /** Reconciled Deepgram disfluency token (normalized word + marker) */
-  deepgram?: TranscriptToken | null;
 }
 
 const TAG_STYLES: Record<DisfluencyTag, string> = {
@@ -297,29 +281,6 @@ function WordSpan({ word }: { word: LineWord }) {
     );
   }
 
-  // Reconciled Deepgram disfluency token — the NORMALIZED lexical word with
-  // the BOLO disfluency marker. The raw phonetic spelling ("sssslap",
-  // "b-b-ball") is NEVER shown; the marker is the visual disfluency signal.
-  if (word.deepgram) {
-    return (
-      <span className="inline-flex items-center gap-1 align-middle">
-        <span
-          className="inline-block rounded px-1 underline decoration-dotted underline-offset-2 bg-[#BD8CFF]/10 text-[#BD8CFF]/90 transition-colors duration-200"
-          title={`Deepgram disfluency${word.deepgram.disfluencyType ? ` · ${word.deepgram.disfluencyType}` : ""}${word.deepgram.rawWord && word.deepgram.rawWord !== word.deepgram.word ? ` · raw: ${word.deepgram.rawWord}` : ""}`}
-        >
-          {word.deepgram.word}
-        </span>
-        {feedEvents.length > 0 && (
-          <span className="inline-flex items-center gap-0.5">
-            {feedEvents.map((evt) => (
-              <FeedChip key={evt.id} event={evt} />
-            ))}
-          </span>
-        )}
-      </span>
-    );
-  }
-
   // Recovery annotation (Stage 3): wrap the stuttered prefix + base word.
   // The base word keeps its Speechmatics text — alignment is preserved.
   if (word.recovered) {
@@ -382,19 +343,10 @@ function buildLines(
   recovered: RecoveredAnnotation[],
   duplicateKeys: Set<string> | undefined,
   pending: PendingSpeechEvent[],
-  deepgramTokens: TranscriptToken[],
   maxWordsPerLine: number
 ): { id: string; items: LineItem[] }[] {
   const lines: { id: string; items: LineItem[] }[] = [];
   let lineId = 0;
-
-  // Reconciled Deepgram disfluency tokens — fast-tracked, locked. A
-  // Speechmatics partial/final word that competes for the same spoken slot
-  // is suppressed (never flickers between "slap" and "rap").
-  const lockedDg = deepgramTokens.filter(
-    (t) => t.source === "deepgram" && t.isDisfluency && t.locked
-  );
-  const dgByStartMs = [...lockedDg].sort((a, b) => a.startTimeMs - b.startTimeMs);
 
   // Finals grouped by utterance index
   const finals = transcripts.filter((t) => t.isFinal);
@@ -412,22 +364,6 @@ function buildLines(
       // Timestamp-anchored dedup: a word the engine recovered locally first
       // is hidden here so it never renders twice.
       if (duplicateKeys?.has(key)) continue;
-      // Locked Deepgram protection: a Speechmatics word competing for the
-      // same spoken slot is suppressed — Deepgram (which carries the
-      // disfluency evidence) must win.
-      if (
-        lockedDg.some((dg) =>
-          suppressedByLock(
-            {
-              startTimeMs: Math.round(w.startTime * 1000),
-              endTimeMs: Math.round((w.endTime || w.startTime) * 1000),
-            },
-            dg
-          )
-        )
-      ) {
-        continue;
-      }
       const tag = wordTags?.get(key) ?? null;
       const arr = grouped.get(utterance) ?? [];
       wordSpans.push({ text, startTime: w.startTime, endTime: w.endTime });
@@ -505,38 +441,21 @@ function buildLines(
       )
       .sort((a, b) => a.startTime - b.startTime);
 
-    const liveItems: LineItem[] = latest.words.flatMap((w, wi) => {
+    const liveItems: LineItem[] = latest.words.map((w, wi) => {
       const text = (w as any).text || w.word || "";
-      if (!text) return [];
-      // Partial collision rule: a Speechmatics PARTIAL word overlapping a
-      // locked Deepgram disfluency token is suppressed — partials are
-      // lower priority than a confirmed Deepgram disfluency.
-      const wStartMs = Math.round((w.startTime ?? 0) * 1000);
-      const wEndMs = Math.round(
-        (w.endTime ?? (w.startTime ?? 0) + 0.3) * 1000
-      );
-      if (
-        lockedDg.some((dg) =>
-          suppressedByLock({ startTimeMs: wStartMs, endTimeMs: wEndMs }, dg)
-        )
-      ) {
-        return [];
-      }
-      const key = `${wStartMs}-${wEndMs}`;
+      const key = `${Math.round((w.startTime ?? 0) * 1000)}-${Math.round((w.endTime ?? (w.startTime ?? 0) + 0.3) * 1000)}`;
       const tag = wordTags?.get(key) ?? null;
-      return [
-        {
-          kind: "word" as const,
-          word: {
-            text,
-            isFinal: false,
-            tag,
-            startTime: w.startTime ?? 0,
-            events: partialAssignments[wi] ?? [],
-            recovered: partialRecovered.attachedByIndex[wi] ?? null,
-          },
+      return {
+        kind: "word" as const,
+        word: {
+          text,
+          isFinal: false,
+          tag,
+          startTime: w.startTime ?? 0,
+          events: partialAssignments[wi] ?? [],
+          recovered: partialRecovered.attachedByIndex[wi] ?? null,
         },
-      ];
+      };
     });
     // Orphan events (no partial word yet — block before the word finalizes)
     for (const evt of partialOrphans) {
@@ -684,68 +603,6 @@ function buildLines(
       // No word yet — leave it to the trailing cursor indicator (rendered
       // by the component after the last line).
       continue;
-    }
-  }
-
-  // ── Inject reconciled Deepgram disfluency tokens chronologically ────
-  // Fast-track rendering: the moment a Deepgram final disfluency token
-  // exists it is inserted at its chronological position (normalized word +
-  // BOLO disfluency marker). Speechmatics backfills the surrounding fluent
-  // words afterward; the token array is the source of truth.
-  if (dgByStartMs.length > 0) {
-    const dgWordSpans: { text: string; startTime: number; endTime: number }[] =
-      dgByStartMs.map((d) => ({
-        text: d.word,
-        startTime: d.startTimeMs / 1000,
-        endTime: d.endTimeMs / 1000,
-      }));
-    const dgAssignments = assignEventsToSpans(events, dgWordSpans);
-    const dgItems: LineItem[] = dgByStartMs.map((d, i) => ({
-      kind: "word" as const,
-      word: {
-        text: d.word,
-        isFinal: true,
-        tag: null,
-        startTime: d.startTimeMs / 1000,
-        deepgram: d,
-        events: dgAssignments[i] ?? [],
-      },
-    }));
-
-    // All lines + every word item, flattened for insertion.
-    const allItems = lines.flatMap((l) => l.items);
-
-    for (const dgItem of dgItems) {
-      if (dgItem.kind !== "word" || !dgItem.word.deepgram) continue;
-      const dgTok = dgItem.word.deepgram;
-      // Already injected? (e.g. merged with an existing word item)
-      const alreadyShown = allItems.some(
-        (i) => i.kind === "word" && i.word.deepgram?.id === dgTok.id
-      );
-      if (alreadyShown) continue;
-      const dgStartSec = dgTok.startTimeMs / 1000;
-
-      let inserted = false;
-      for (const line of lines) {
-        for (let idx = 0; idx < line.items.length; idx++) {
-          const item = line.items[idx];
-          if (item.kind !== "word") continue;
-          const wStart = (item.word as LineWord).startTime;
-          if (wStart >= dgStartSec) {
-            line.items.splice(idx, 0, dgItem);
-            inserted = true;
-            break;
-          }
-        }
-        if (inserted) break;
-      }
-      if (!inserted) {
-        if (lines.length > 0) {
-          lines[lines.length - 1].items.push(dgItem);
-        } else {
-          lines.push({ id: `line-${lineId++}`, items: [dgItem] });
-        }
-      }
     }
   }
 
