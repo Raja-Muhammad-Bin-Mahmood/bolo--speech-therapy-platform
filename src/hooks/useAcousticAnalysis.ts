@@ -73,6 +73,12 @@ export interface FragmentDetail {
     zcrTension: boolean;
     /** Temporal regularity proxy (0..1) — same formula as the repetition path. */
     regularity: number;
+    /** What kind of acoustic pattern this fragment preserves — brief voiced
+     *  runs (repetition-like) or a sustained fricative hold (stammer-like).
+     *  Additive: older fragments simply omit it. */
+    kind?: "voiced_runs" | "fricative_hold" | "generic";
+    /** Duration of a sustained fricative hold when kind === "fricative_hold". */
+    holdMs?: number;
   };
 }
 
@@ -203,12 +209,32 @@ const WINDOW = 512; // 32ms @16kHz
 const HOP_MS = 10; // ~100 feature updates / second
 const ROLLING_MS = 500; // keep last 500ms in the rolling buffer
 
-// Repetition
+// Repetition — 2-run path (kept intact) uses end→start gaps 80–250ms.
 const REP_GAP_MIN = 0.08;
 const REP_GAP_MAX = 0.25;
-const REP_MIN_ONSETS = 3;
 /** Max voiced-run length (ms) to count as a stutter-like fragment */
 const REP_VOICED_RUN_MAX_MS = 200;
+
+// ── 3+ voiced-run repetition path (FIX 1 — same voiced evidence as 2-run) ──
+/** Inter-run gap window (end→start) for the multi-run repetition path. The
+ *  old 3-onset path compared ONSET-to-ONSET (80–250ms), which silently
+ *  failed real syllables whose own duration pushed onset spacing past the
+ *  cap ("ma"(120ms)+gap(180ms)=300ms > 250ms). Inter-run gaps measure the
+ *  physical re-articulation pause — the repetition-like timing signal. */
+const REP_IRUN_GAP_MIN_MS = 60;
+const REP_IRUN_GAP_MAX_MS = 320;
+/** Longest allowed span (s) for a multi-run repetition cluster. */
+const REP_CLUSTER_WINDOW_S = 1.1;
+/** How long finished brief-run descriptors are retained for clustering
+ *  (replaces the 0.55s fast-restart prune, which killed slow clusters). */
+const RUN_FEATURE_WINDOW_S = 1.4;
+/** Voiced-similarity gate for the 3+ run path. LOWER than the 2-run gate
+ *  (0.72) because three runs corroborate each other — the mean of three
+ *  pairwise comparisons is more reliable than a single pair. Every ADJACENT
+ *  pair must also clear the MFCC floor, so "ba-na-na" (middle syllable
+ *  differs) stays fluent while "ba-ba-ba" / "ma-ma-ma" pass. */
+const VOICED_3RUN_SIM_GATE = 0.62;
+const VOICED_3RUN_MFCC_MIN = 0.62;
 
 // ── Voiced repetition similarity (2-run path: "woh-woh", "r-r-red") ──────
 /**
