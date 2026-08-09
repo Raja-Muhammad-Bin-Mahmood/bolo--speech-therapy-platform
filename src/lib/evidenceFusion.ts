@@ -509,7 +509,23 @@ export function scoreEvent(
   // ── 2) Repeated-onset shape (pattern regularity from the detector) ──
   let onsetShape = 0;
   if (evt.type === "repetition" || evt.type === "stutter" || evt.type === "stammer") {
-    onsetShape = clamp01((evt.confidence - 0.5) * 2) * 0.6 + evt.acoustic * 0.4;
+    // For voiced repetitions the detector now measures ACTUAL cross-run
+    // similarity with voiced-appropriate cues (MFCC/F0/energy/duration/
+    // voicing — NOT the fricative centroid/rolloff rule). When that
+    // evidence is present it becomes the dominant onset-shape signal: two
+    // runs of the SAME syllable are strong repetition evidence, two
+    // different syllables ("hel"-"lo") are not. `voicedSimilarity` is a
+    // 0..1 score (0 when unavailable); it never manufactures agreement.
+    const voicedShape =
+      evt.voicedSimilarity !== undefined
+        ? clamp01(evt.voicedSimilarity) * 0.8 +
+          evt.acoustic * 0.2
+        : 0;
+    if (voicedShape > 0) {
+      onsetShape = voicedShape;
+    } else {
+      onsetShape = clamp01((evt.confidence - 0.5) * 2) * 0.6 + evt.acoustic * 0.4;
+    }
   } else if (evt.type === "prolongation") {
     onsetShape = clamp01((evt.confidence - 0.5) * 2);
   }
@@ -535,6 +551,10 @@ export function scoreEvent(
     prevWordEnd,
     wordStart: match.word?.startTime ?? null,
     overlappingWords: countSpannedWords(words, evt.startTime, evt.endTime),
+    // 2-run repetitions carry the explicit run count (STRICTER gate); the
+    // 3-onset path leaves it undefined so it stays on the established path.
+    voicedRunCount: evt.voicedRepetition?.runCount,
+    voicedSimilarity: evt.voicedSimilarity,
   });
   const interruptionPassed = gate.passed;
   const interruptionSignals = gate.signals;
@@ -606,9 +626,19 @@ export function scoreEvent(
   // When `requireCorroboration` is on, uncorroborated (single-source)
   // events must clear a higher floor (`minSingleSourceScore`).
   const corroborationRequired = weights.requireCorroboration && !corroborated;
-  const visibleFloor = corroborationRequired
-    ? weights.minSingleSourceScore
-    : weights.minVisibleScore;
+  // STRICTER VISIBILITY FLOOR for a 2-RUN repetition. A 2-run candidate has
+  // less evidence than a confirmed 3-onset repetition (two runs could be two
+  // syllables of a fluent word), so it must NOT clear the same 0.70 floor —
+  // it must clear this higher bar (0.80) to render on the transcript.
+  // "hello", "about", "over", "wow", "rare", "a baby" therefore stay
+  // feed/review-only unless the acoustic evidence is genuinely strong.
+  const isTwoRunVoiced =
+    evt.type === "repetition" && evt.voicedRepetition?.runCount === 2;
+  const visibleFloor = isTwoRunVoiced
+    ? Math.max(weights.minVisibleScore, 0.8)
+    : corroborationRequired
+      ? weights.minSingleSourceScore
+      : weights.minVisibleScore;
   let visible = evidenceScore >= visibleFloor;
 
   // STAGE 1 HARD VETO — a fluent event with no interruption in the speech
@@ -652,6 +682,10 @@ export function scoreEvent(
     if (corroborationRequired) {
       reasons.push(
         "Not corroborated by a second detector — below the single-source floor"
+      );
+    } else if (isTwoRunVoiced && evidenceScore < 0.8) {
+      reasons.push(
+        "2-run repetition below the stricter visibility floor (0.80) — less evidence than a 3-onset repetition"
       );
     } else if (evidenceScore < weights.minVisibleScore) {
       reasons.push(

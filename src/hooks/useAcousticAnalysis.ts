@@ -29,6 +29,17 @@ export interface FragmentRun {
   end: number;
   /** run duration in ms */
   durMs: number;
+  /** Mean F0 of the run (Hz; undefined when no pitch evidence) — backs the
+   *  pitch-contour similarity metric. */
+  meanPitch?: number;
+  /** Peak RMS of the run — backs the energy-envelope consistency metric. */
+  peakRms?: number;
+  /** Mean MFCC vector of the run — the vocal-tract filter shape used for
+   *  cross-run similarity ("woh" vs "woh" share a vector; "hel" vs "lo" do
+   *  not). */
+  mfccMean?: number[];
+  /** Mean RMS of the run — backs the energy-envelope consistency metric. */
+  meanRms?: number;
 }
 
 /**
@@ -65,6 +76,31 @@ export interface FragmentDetail {
   };
 }
 
+/**
+ * Detail attached to a CLASSIFIED 2-run voiced repetition ("woh-woh",
+ * "r-r-red", "b-b-ball", "w-w-what"). Unlike the fricative stutter path
+ * (STUTTER_SHAPE_TOL on centroid/rolloff), voiced onsets are compared with
+ * voiced-appropriate evidence — MFCC vector similarity, F0 contour
+ * agreement, energy envelope, duration/onset structure and voicing pattern.
+ * This event only exists when the similarity gate AND the stricter 2-run
+ * emission floor were BOTH cleared at detection.
+ */
+export interface VoicedRepetitionDetail {
+  runCount: 2;
+  /** Blended voiced similarity 0..1 (see voicedRunSimilarity). */
+  similarity: number;
+  /** Per-cue sub-scores for review/debug (mfcc/pitch/energy/duration/voicing). */
+  subScores: {
+    mfcc: number;
+    pitch: number;
+    energy: number;
+    duration: number;
+    voicing: number;
+  };
+  /** The preserved-fragment structure this classification came from. */
+  fragment: FragmentDetail;
+}
+
 export interface AcousticEvent {
   type: AcousticEventType;
   /** seconds since recording start (aligned with Speechmatics clock) */
@@ -75,6 +111,14 @@ export interface AcousticEvent {
   confidence: number;
   /** 0..1 — raw feature-magnitude certainty (separate evidence source) */
   acoustic: number;
+  /** Detail attached ONLY to a confirmed 2-run voiced repetition (type ===
+   *  "repetition" with runCount 2). Absent for 3-onset repetitions and for
+   *  preserved (unclassified) fragments. */
+  voicedRepetition?: VoicedRepetitionDetail;
+  /** Mean adjacent-run voiced similarity (0..1) for 3-onset repetitions —
+   *  soft evidence for the fusion layer's onset-shape term. Absent when
+   *  per-run features were unavailable. */
+  voicedSimilarity?: number;
   /**
    * Preserved-fragment structure (only when type === "fragment"). Carries
    * run/onset/gap timing + acoustic evidence so a later classifier can
@@ -102,9 +146,54 @@ interface FeatureFrame {
   rolloff: number;
   flatness: number;
   mfcc: number; // mean MFCC energy
+  /** Raw MFCC coefficient vector (13 dims from Meyda) — kept for per-run
+   *  voiced-similarity (the scalar `mfcc` above is not enough to compare
+   *  two vowels). */
+  mfccVec: number[];
   pitch: number; // F0 in Hz, 0 when unvoiced
   voiced: boolean;
   highBand: number; // mean linear magnitude 4-8kHz
+}
+
+/** Per-run feature accumulator for the voiced-run trackers — collects the
+ *  features needed to judge whether two brief runs are the SAME syllable
+ *  (voiced-appropriate similarity, NOT the fricative centroid/rolloff rule). */
+interface VoicedRunAcc {
+  start: number;
+  end: number;
+  /** Element-wise sum of MFCC vectors seen during the run (null when none). */
+  mfccSum: number[] | null;
+  mfccCount: number;
+  pitchSum: number;
+  pitchCount: number;
+  rmsSum: number;
+  rmsCount: number;
+  rmsMax: number;
+  voicedFrames: number;
+  totalFrames: number;
+}
+
+/** Extract the similarity-relevant descriptor from a finished run. */
+function runDescriptor(r: VoicedRunAcc): {
+  mfccMean?: number[];
+  meanPitch?: number;
+  meanRms?: number;
+  peakRms?: number;
+  durMs: number;
+  voicedRatio: number;
+} {
+  const mfccMean =
+    r.mfccSum && r.mfccCount > 0
+      ? r.mfccSum.map((s) => s / r.mfccCount)
+      : undefined;
+  return {
+    mfccMean,
+    meanPitch: r.pitchCount > 0 ? r.pitchSum / r.pitchCount : undefined,
+    meanRms: r.rmsCount > 0 ? r.rmsSum / r.rmsCount : undefined,
+    peakRms: r.rmsMax,
+    durMs: Math.round((r.end - r.start) * 1000),
+    voicedRatio: r.totalFrames > 0 ? r.voicedFrames / r.totalFrames : 0,
+  };
 }
 
 // ─── Spec-driven constants ──────────────────────────────────────────────
@@ -120,6 +209,158 @@ const REP_GAP_MAX = 0.25;
 const REP_MIN_ONSETS = 3;
 /** Max voiced-run length (ms) to count as a stutter-like fragment */
 const REP_VOICED_RUN_MAX_MS = 200;
+
+// ── Voiced repetition similarity (2-run path: "woh-woh", "r-r-red") ──────
+/**
+ * Voiced-appropriate similarity gate for a 2-RUN repetition. Unlike the
+ * fricative stutter path (STUTTER_SHAPE_TOL on Δcentroid+Δrolloff — built
+ * for sustained noisy fricatives, not voiced onsets), two brief voiced runs
+ * are judged by whether they are the SAME SYLLABLE: MFCC vector distance
+ * (vocal-tract filter shape), F0 contour agreement, energy envelope
+ * consistency, duration/onset structure and voicing pattern. Ordinary
+ * two-syllable words ("hello", "about", "over", "wow", "rare", "a baby")
+ * fail this gate because their two syllables differ in MFCC shape and/or
+ * F0/energy contour — they stay preserved fragments, never repetitions.
+ */
+const VOICED_SIM_GATE = 0.72;
+/**
+ * STRICTER emission floor for a 2-run repetition. A 2-run candidate has
+ * LESS evidence than the existing 3-onset path (two runs can be two
+ * syllables of a fluent word), so it must NOT use the same 0.60 emission
+ * floor as 3-onset repetitions — it must clear this higher bar on the
+ * similarity-gated confidence or it is never emitted as a repetition.
+ */
+const VOICED_2RUN_EMIT_FLOOR = 0.72;
+/** Similarity blend weights — voiced cues only. */
+const SIM_W = {
+  mfcc: 0.45,
+  pitch: 0.25,
+  energy: 0.15,
+  duration: 0.1,
+  voicing: 0.05,
+} as const;
+
+/** L2 norm of a numeric vector (used for MFCC mean normalization). */
+function l2(v: number[]): number {
+  let s = 0;
+  for (const x of v) s += x * x;
+  return Math.sqrt(s);
+}
+
+/** Cosine similarity of two vectors in [0,1] (0 when either is empty). */
+function cosineSim(a: number[] | undefined, b: number[] | undefined): number {
+  if (!a || !b || a.length === 0 || b.length === 0 || a.length !== b.length) {
+    return 0;
+  }
+  const la = l2(a);
+  const lb = l2(b);
+  if (la <= 1e-9 || lb <= 1e-9) return 0;
+  let dot = 0;
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  return Math.max(0, Math.min(1, dot / (la * lb)));
+}
+
+/**
+ * VOICED-APPROPRIATE similarity between two brief voiced runs.
+ *
+ * This deliberately does NOT reuse the fricative rule (STUTTER_SHAPE_TOL
+ * on Δcentroid + Δrolloff). Fricatives are sustained noisy segments whose
+ * spectral-shape stability is meaningful; a voiced onset lasts ~50–200ms
+ * and its centroid/rolloff is dominated by formant structure that varies
+ * with loudness, pitch and coarticulation — it cannot distinguish
+ * "woh"-"woh" from "woh"-"wah". Instead we use:
+ *   • MFCC cosine similarity (45%) — the vocal-tract filter shape, the
+ *     strongest voiced-phoneme discriminator available here;
+ *   • F0 contour agreement (25%) — a repetition repeats near the same
+ *     pitch; two different syllables of a word usually step;
+ *   • energy envelope consistency (15%) — same syllable ⇒ same loudness
+ *     shape;
+ *   • duration/onset structure (10%) — same brief run length;
+ *   • voicing pattern (5%) — both runs fully voiced.
+ * Each cue is NEUTRAL (0.5) when its feature is unavailable, so a missing
+ * pitch or MFCC cannot manufacture similarity — it only weakens the blend.
+ */
+export function voicedRunSimilarity(
+  a: {
+    mfccMean?: number[];
+    meanPitch?: number;
+    meanRms?: number;
+    peakRms?: number;
+    durMs: number;
+    voicedRatio?: number;
+  },
+  b: {
+    mfccMean?: number[];
+    meanPitch?: number;
+    meanRms?: number;
+    peakRms?: number;
+    durMs: number;
+    voicedRatio?: number;
+  }
+): { score: number; subScores: { mfcc: number; pitch: number; energy: number; duration: number; voicing: number } } {
+  // MFCC cosine — the vocal-tract filter shape. Two syllables of the same
+  // repeated onset ("woh"-"woh") share a shape; two syllables of a word
+  // ("hel"-"lo") do not. Normalized by the MFCC mean magnitude so a quiet
+  // run doesn't collapse the distance.
+  const m1 = a.mfccMean;
+  const m2 = b.mfccMean;
+  let mfccScore = 0.5;
+  if (m1 && m2 && m1.length > 0 && m1.length === m2.length) {
+    const scale = Math.max(1e-6, l2(m1) * l2(m2));
+    const raw = cosineSim(m1, m2);
+    // Boost the raw cosine slightly for strong agreement (same vowel).
+    mfccScore = Math.min(1, raw * (0.85 + 0.3 * raw));
+    if (scale > 1e-6) {
+      // Keep a floor tied to how much spectral content both runs carried.
+      mfccScore = mfccScore * 0.85 + 0.15 * Math.min(1, scale / 50);
+    }
+  }
+
+  // F0 contour agreement — a repetition repeats at (roughly) the same
+  // pitch; two different syllables step. Neutral when pitch is missing.
+  let pitchScore = 0.5;
+  if (a.meanPitch && b.meanPitch && a.meanPitch > 40 && b.meanPitch > 40) {
+    const ratio = Math.min(a.meanPitch, b.meanPitch) / Math.max(a.meanPitch, b.meanPitch);
+    pitchScore = Math.max(0, Math.min(1, (ratio - 0.8) / 0.2));
+  }
+
+  // Energy envelope consistency — same loudness shape across runs.
+  let energyScore = 0.5;
+  if (a.peakRms && b.peakRms && a.peakRms > 0 && b.peakRms > 0) {
+    const ratio = Math.min(a.peakRms, b.peakRms) / Math.max(a.peakRms, b.peakRms);
+    energyScore = Math.max(0, Math.min(1, (ratio - 0.6) / 0.4));
+  }
+
+  // Duration / onset structure — both runs are brief AND similar in length.
+  const durDiffRatio =
+    Math.max(1, a.durMs + b.durMs) > 0
+      ? Math.abs(a.durMs - b.durMs) / Math.max(1, a.durMs + b.durMs)
+      : 0;
+  const durationScore = Math.max(0, Math.min(1, 1 - durDiffRatio * 2));
+
+  // Voicing pattern — both runs must be fully voiced.
+  const v1 = a.voicedRatio ?? 1;
+  const v2 = b.voicedRatio ?? 1;
+  const voicingScore = Math.max(0, Math.min(1, Math.min(v1, v2) * 1.2));
+
+  const score =
+    SIM_W.mfcc * mfccScore +
+    SIM_W.pitch * pitchScore +
+    SIM_W.energy * energyScore +
+    SIM_W.duration * durationScore +
+    SIM_W.voicing * voicingScore;
+
+  return {
+    score: Math.max(0, Math.min(1, score)),
+    subScores: {
+      mfcc: mfccScore,
+      pitch: pitchScore,
+      energy: energyScore,
+      duration: durationScore,
+      voicing: voicingScore,
+    },
+  };
+}
 
 // Block
 const BLOCK_MIN_MS = 200;
@@ -236,6 +477,10 @@ export function useAcousticAnalysis(
     // Repetition / fast-restart onset tracker
     onsets: [] as number[],
     voicingOnRuns: [] as { start: number; end: number }[],
+    /** Feature accumulators for the voiced-run trackers — every brief voiced
+     *  run collects MFCC/F0/energy so a 2-run pattern can be judged with
+     *  voiced-appropriate similarity instead of the fricative shape rule. */
+    voicedRunAccs: [] as VoicedRunAcc[],
 
     // Preserved short-fragment candidate (Phase 1 — pre-classification).
     // Armed when a 2nd brief voiced run appears inside the repetition gap
@@ -386,6 +631,7 @@ export function useAcousticAnalysis(
         ? feat.mfcc.reduce((a: number, b: number) => a + Math.abs(b), 0) /
           feat.mfcc.length
         : 0,
+      mfccVec: Array.isArray(feat?.mfcc) ? [...feat.mfcc] : [],
       pitch,
       voiced,
       highBand,
@@ -562,16 +808,59 @@ export function useAcousticAnalysis(
     if (onset) {
       s.onsets.push(t);
       s.voicingOnRuns.push({ start: t, end: t });
+      // A new brief voiced run starts a fresh feature accumulator (MFCC/F0/
+      // energy) — the raw material for voiced-appropriate similarity between
+      // runs ("woh-woh" vs "woh-wah").
+      s.voicedRunAccs.push({
+        start: t,
+        end: t,
+        mfccSum: null,
+        mfccCount: 0,
+        pitchSum: 0,
+        pitchCount: 0,
+        rmsSum: 0,
+        rmsCount: 0,
+        rmsMax: 0,
+        voicedFrames: 0,
+        totalFrames: 0,
+      });
       s.onsets = s.onsets.filter((o) => t - o <= FAST_RESTART_MAX + 0.05);
       s.voicingOnRuns = s.voicingOnRuns.filter(
         (r) => t - r.start <= FAST_RESTART_MAX + 0.05
       );
+      s.voicedRunAccs = s.voicedRunAccs.filter(
+        (r) => t - r.start <= FAST_RESTART_MAX + 0.05
+      );
     }
 
-    // Track end of the current voiced run
+    // Track end of the current voiced run + accumulate per-run features
+    // (MFCC vector, pitch, RMS) — only within the brief-run window; a long
+    // run is a prolongation candidate, not a repetition fragment.
     if (f.voiced && s.voicingOnRuns.length > 0) {
       const lastRun = s.voicingOnRuns[s.voicingOnRuns.length - 1];
       lastRun.end = t;
+      const acc = s.voicedRunAccs[s.voicedRunAccs.length - 1];
+      if (acc && (t - acc.start) * 1000 <= REP_VOICED_RUN_MAX_MS) {
+        acc.end = t;
+        acc.totalFrames++;
+        if (f.voiced) acc.voicedFrames++;
+        acc.rmsSum += f.rms;
+        acc.rmsCount++;
+        acc.rmsMax = Math.max(acc.rmsMax, f.rms);
+        if (f.pitch > 0) {
+          acc.pitchSum += f.pitch;
+          acc.pitchCount++;
+        }
+        if (f.mfccVec.length > 0) {
+          if (!acc.mfccSum) acc.mfccSum = f.mfccVec.slice();
+          else {
+            for (let i = 0; i < f.mfccVec.length; i++) {
+              acc.mfccSum[i] = (acc.mfccSum[i] ?? 0) + f.mfccVec[i];
+            }
+          }
+          acc.mfccCount++;
+        }
+      }
     }
 
     // ── Preserved short-fragment candidate (Phase 1 — pre-classification).
@@ -629,14 +918,51 @@ export function useAcousticAnalysis(
           const regularity = 1 - Math.min(1, Math.abs(avgGap - 0.165) / 0.1);
           const zcrAgree = windowFrames.some((fr) => fr.zcr > ZCR_TENSION);
 
-          emitFragment({
-            startTime: firstRun.start,
-            endTime: secondRun.end,
+          // ── VOICED SIMILARITY (2-run path) ─────────────────────────
+          // Resolve the feature accumulators for the two brief voiced runs
+          // (they were collected during the run; the acc list is pruned by
+          // FAST_RESTART_MAX, so find them by onset match).
+          const acc1 = s.voicedRunAccs.find(
+            (a) => Math.abs(a.start - firstRun.start) < 0.02
+          );
+          const acc2 = s.voicedRunAccs.find(
+            (a) => Math.abs(a.start - secondRun.start) < 0.02
+          );
+          const desc1 = acc1 ? runDescriptor(acc1) : null;
+          const desc2 = acc2 ? runDescriptor(acc2) : null;
+
+          const sim =
+            desc1 && desc2
+              ? voicedRunSimilarity(
+                  { ...desc1, voicedRatio: desc1.voicedRatio },
+                  { ...desc2, voicedRatio: desc2.voicedRatio }
+                )
+              : { score: 0, subScores: { mfcc: 0, pitch: 0, energy: 0, duration: 0, voicing: 0 } };
+
+          const runs: FragmentRun[] = [
+            {
+              start: firstRun.start,
+              end: firstRun.end,
+              durMs: Math.round((firstRun.end - firstRun.start) * 1000),
+              meanPitch: desc1?.meanPitch,
+              peakRms: desc1?.peakRms,
+              mfccMean: desc1?.mfccMean,
+              meanRms: desc1?.meanRms,
+            },
+            {
+              start: secondRun.start,
+              end: secondRun.end,
+              durMs: Math.round((secondRun.end - secondRun.start) * 1000),
+              meanPitch: desc2?.meanPitch,
+              peakRms: desc2?.peakRms,
+              mfccMean: desc2?.mfccMean,
+              meanRms: desc2?.meanRms,
+            },
+          ];
+
+          const fragmentDetail: FragmentDetail = {
             runCount: 2,
-            runs: [
-              { start: firstRun.start, end: firstRun.end, durMs: Math.round((firstRun.end - firstRun.start) * 1000) },
-              { start: secondRun.start, end: secondRun.end, durMs: Math.round((secondRun.end - secondRun.start) * 1000) },
-            ],
+            runs,
             onsets: [firstRun.start, secondRun.start],
             onsetGapsMs: [Math.round(onsetGap * 1000)],
             interRunGapsMs: [Math.round((secondRun.start - firstRun.end) * 1000)],
@@ -650,7 +976,74 @@ export function useAcousticAnalysis(
               zcrTension: zcrAgree,
               regularity: Math.max(0, Math.min(1, regularity)),
             },
-          });
+          };
+
+          // ── 2-RUN CLASSIFICATION — STRICTER THAN 3-ONSET ──────────
+          // A 2-run candidate has LESS evidence than a 3-onset repetition
+          // (two runs could be two syllables of a fluent word), so it must
+          // clear BOTH the voiced-similarity gate (same syllable, using
+          // voiced-appropriate cues) AND a HIGHER emission floor than the
+          // 3-onset path's 0.60. Ordinary two-syllable words ("hello",
+          // "about", "over", "wow", "rare", "a baby") fail the similarity
+          // gate and stay preserved fragments — they never become
+          // repetitions, so ordinary fluent speech is not broadened into
+          // a stutter.
+          const simGated =
+            sim.score >= VOICED_SIM_GATE &&
+            sim.subScores.mfcc >= 0.55; // MFCC must genuinely agree — a
+          // good pitch/energy alone must not manufacture a repetition.
+          const confidence =
+            simGated
+              ? Math.min(1, 0.5 + 0.3 * sim.score + 0.2 * regularity)
+              : 0.4;
+
+          if (
+            simGated &&
+            confidence >= VOICED_2RUN_EMIT_FLOOR &&
+            t - (s.lastEmitByType.repetition ?? 0) >= 0.25
+          ) {
+            // Classified 2-run voiced repetition. Confidence reflects the
+            // similarity-gated evidence — it genuinely clears the emission
+            // floor (it is NOT the preserved-fragment 0.40 cap).
+            s.lastEmitByType.repetition = t;
+            const evt: AcousticEvent = {
+              type: "repetition",
+              startTime: firstRun.start,
+              endTime: secondRun.end,
+              durationMs: Math.round((secondRun.end - firstRun.start) * 1000),
+              confidence: Math.min(1, confidence),
+              acoustic: Math.min(1, 0.5 + 0.4 * sim.score),
+              // Top-level similarity — consumed by the fusion layer's
+              // onset-shape term and the interruption gate's STRICTER 2-run
+              // branch (voicedRunCount 2 + this score are what prove the
+              // two runs are the same syllable).
+              voicedSimilarity: sim.score,
+              voicedRepetition: {
+                runCount: 2,
+                similarity: sim.score,
+                subScores: sim.subScores,
+                fragment: fragmentDetail,
+              },
+              source: "acoustic",
+            };
+            eventsRef.current = [...eventsRef.current, evt];
+            setEvents(eventsRef.current);
+          } else {
+            // Below the similarity gate or the stricter floor — preserve the
+            // fragment (with the similarity structure) for the feed/review
+            // so the evidence is never lost. It stays low-confidence and
+            // never becomes a visible repetition.
+            emitFragment({
+              startTime: firstRun.start,
+              endTime: secondRun.end,
+              runCount: 2,
+              runs,
+              onsets: [firstRun.start, secondRun.start],
+              onsetGapsMs: [Math.round(onsetGap * 1000)],
+              interRunGapsMs: [Math.round((secondRun.start - firstRun.end) * 1000)],
+              evidence: fragmentDetail.evidence,
+            });
+          }
         }
       }
     }
@@ -703,12 +1096,34 @@ export function useAcousticAnalysis(
           (fr) => fr.t >= s.onsets[0] && fr.zcr > ZCR_TENSION
         );
         const temporal = 0.55 + 0.3 * regularity + (zcrAgree ? 0.15 : 0);
+        // Adjacent-run voiced similarity — the SAME voiced-appropriate
+        // evidence as the 2-run path (MFCC/F0/energy/duration/voicing), so
+        // the fusion layer sees a real onset-shape signal for 3-onset
+        // repetitions too ("r-r-red" repeats /r/; fluent "about" does not).
+        // Absent features → neutral, so it can only weaken the event.
+        const threeAccs = s.voicedRunAccs.filter(
+          (a) => a.start >= s.onsets[0] - 0.02 && a.start <= s.onsets[s.onsets.length - 1] + 0.02
+        );
+        let voicedSimilarity: number | undefined;
+        if (threeAccs.length >= 2) {
+          let sum = 0;
+          let n = 0;
+          for (let i = 1; i < threeAccs.length; i++) {
+            sum += voicedRunSimilarity(
+              { ...runDescriptor(threeAccs[i - 1]), voicedRatio: runDescriptor(threeAccs[i - 1]).voicedRatio },
+              { ...runDescriptor(threeAccs[i]), voicedRatio: runDescriptor(threeAccs[i]).voicedRatio }
+            ).score;
+            n++;
+          }
+          voicedSimilarity = n > 0 ? sum / n : undefined;
+        }
         emitEvent(
           "repetition",
           s.onsets[0],
           s.onsets[s.onsets.length - 1],
           temporal,
-          Math.min(1, 0.5 + avgGap / 0.25)
+          Math.min(1, 0.5 + avgGap / 0.25),
+          voicedSimilarity
         );
         s.onsets = [s.onsets[s.onsets.length - 1]];
         s.voicingOnRuns = [s.voicingOnRuns[s.voicingOnRuns.length - 1]];
@@ -778,7 +1193,8 @@ export function useAcousticAnalysis(
     startTime: number,
     endTime: number,
     temporal: number,
-    acoustic: number
+    acoustic: number,
+    voicedSimilarity?: number
   ) {
     const s = stateRef.current;
     // Recall-oriented emission floor (0.60): the detector's job is to
@@ -801,6 +1217,9 @@ export function useAcousticAnalysis(
       durationMs: Math.round((endTime - startTime) * 1000),
       confidence: Math.min(1, temporal),
       acoustic: Math.min(1, acoustic),
+      ...(voicedSimilarity !== undefined
+        ? { voicedSimilarity: Math.max(0, Math.min(1, voicedSimilarity)) }
+        : {}),
       source: "acoustic",
     };
     eventsRef.current = [...eventsRef.current, evt];
@@ -866,6 +1285,7 @@ export function useAcousticAnalysis(
         prevVoiced: false,
         onsets: [],
         voicingOnRuns: [],
+        voicedRunAccs: [],
         pendingFragment: null,
         blockStart: 0,
         blockZcrAcc: 0,

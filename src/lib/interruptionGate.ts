@@ -82,6 +82,16 @@ export interface InterruptionGateInput {
   wordStart: number | null;
   /** How many finalized words the event window overlaps / flushes against. */
   overlappingWords: number;
+  /** Number of brief voiced runs when the detector measured voiced
+   *  similarity between runs (2 = the STRICTER 2-run path; 3+ = the
+   *  existing 3-onset path). Absent when no voiced similarity was computed. */
+  voicedRunCount?: number;
+  /** Mean adjacent-run voiced similarity (0..1) — present when the detector
+   *  measured the runs as the same syllable with voiced-appropriate cues.
+   *  For a 2-run candidate this is REQUIRED to pass the gate (timing alone
+   *  must never pass); for a 3-onset candidate it is supporting evidence
+   *  only and never gates. */
+  voicedSimilarity?: number;
 }
 
 export interface InterruptionVerdict {
@@ -179,19 +189,34 @@ export function evaluateInterruptionGate(
   }
 
   // 2) Repeated onset — the event itself is a cluster of ≥3 fragments with
-  //    micro-gaps ("b-b-b-ball"). A pattern that spans several finalized
-  //    words is fluent multi-word speech misread as one repetition, so it
-  //    must NOT count as an interruption signal (tightened from ≤1 spanned
-  //    word: a repeated onset flush against the boundary word is still
-  //    fine, but spanning 2+ words is never a stutter).
-  if (
-    repeatedOnset &&
-    input.durationMs >= spec.REPEATED_ONSET_MIN_MS &&
-    input.overlappingWords <= 1
-  ) {
-    signals.push(
-      `repeated-onset fragments (${input.durationMs}ms, ${input.overlappingWords} spanned word${input.overlappingWords === 1 ? "" : "s"})`
-    );
+  //    micro-gaps ("b-b-b-ball"), OR a 2-run pattern that carries REAL
+  //    voiced-similarity evidence (the detector measured the two runs as the
+  //    SAME syllable — "woh-woh" — with voiced-appropriate cues, NOT just
+  //    timing). A 2-run pattern WITHOUT that evidence ("hel"-"lo", "a"-"ba")
+  //    is ordinary fluent speech and does NOT count as an interruption.
+  //    A pattern that spans several finalized words is fluent multi-word
+  //    speech misread as one repetition, so it must NOT count either
+  //    (tightened from ≤1 spanned word).
+  if (repeatedOnset && input.durationMs >= spec.REPEATED_ONSET_MIN_MS) {
+    const twoRun = input.voicedRunCount === 2;
+    if (twoRun) {
+      // 2-run voiced repetition — ONLY an interruption when the acoustic
+      // similarity evidence is genuinely strong (STRICTER than the 3-onset
+      // path, which has more evidence). Without it, timing alone never
+      // passes the gate — "hello"/"about"/"over" stay fluent.
+      if (input.voicedSimilarity !== undefined && input.voicedSimilarity >= 0.72 && input.overlappingWords <= 1) {
+        signals.push(
+          `repeated voiced onset (2 runs, similarity ${(input.voicedSimilarity * 100).toFixed(0)}%)`
+        );
+      }
+    } else if (input.overlappingWords <= 1) {
+      // 3-onset path — unchanged: the repeated-onset cluster itself is the
+      // interruption (voiced similarity is supporting evidence only, never
+      // a gate, so an irregular-but-real 3-onset stutter is not rejected).
+      signals.push(
+        `repeated-onset fragments (${input.durationMs}ms, ${input.overlappingWords} spanned word${input.overlappingWords === 1 ? "" : "s"})`
+      );
+    }
   }
 
   // 3a) Sustained prolongation — a held vowel/sound ≥ 350 ms.

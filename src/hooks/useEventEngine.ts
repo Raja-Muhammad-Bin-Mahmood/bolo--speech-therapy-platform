@@ -214,6 +214,8 @@ export function useEventEngine(options: EventEngineOptions): EventEngineOutput {
         prevWordEnd,
         wordStart: null,
         overlappingWords: countSpannedWords(words, evt.startTime, evt.endTime),
+        voicedRunCount: evt.voicedRepetition?.runCount,
+        voicedSimilarity: evt.voicedSimilarity,
       });
       if (!gate.passed) {
         console.debug(
