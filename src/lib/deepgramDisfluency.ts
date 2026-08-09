@@ -14,6 +14,8 @@
  *   4. word_repetition    — "I I I", "the the" (intra-token form)
  *   5. phrase_repetition  — detected at sequence level (hook)
  *   6. revision           — abandoned/revised word (hook, interim-vs-final)
+ *   7. block              — Deepgram word-timing gap gated by the BOLO
+ *      RMS/isSpeaking energy gate (hook) so ordinary silence is NOT a block
  */
 
 export type DeepgramDisfluencyType =
@@ -22,7 +24,8 @@ export type DeepgramDisfluencyType =
   | "filler"
   | "word_repetition"
   | "phrase_repetition"
-  | "revision";
+  | "revision"
+  | "block";
 
 export interface DeepgramDisfluencyVerdict {
   isDisfluency: boolean;

@@ -4,8 +4,9 @@
  * Owns the STRUCTURED LIVE TRANSCRIPT TOKEN ARRAY (the source of truth for
  * the visible live transcript). Both providers feed it:
  *
- *   • Speechmatics FINAL chunks  → fluent tokens (primary source)
- *   • Deepgram FINAL disfluency tokens → fast-tracked, locked tokens
+ *   • Deepgram FINAL words (fluent AND disfluent) → PRIMARY source tokens
+ *     (disfluent ones are fast-tracked and locked)
+ *   • Speechmatics FINAL chunks → secondary/fallback tokens (gaps, clarity)
  *
  * Every token passes through reconcileIncoming() (lib/transcriptTokens):
  *   1. reconcile tokens
@@ -14,9 +15,8 @@
  *   4. render (the page renders this array + hides Speechmatics words that
  *      lost a locked Deepgram slot via hiddenSpeechmaticsKeys)
  *
- * Speechmatics PARTIAL results never enter the array (display-only), and
- * Deepgram INTERIM results never enter it either — only FINAL disfluency
- * results create permanent tokens.
+ * Deepgram INTERIM results never enter the array (display-only ghost), and
+ * Speechmatics PARTIAL results never enter it either.
  */
 import { useRef, useCallback, useEffect, useState } from "react";
 import type { TranscriptChunk } from "./useSpeechmaticsWS";
@@ -80,7 +80,38 @@ export function useTranscriptReconciler(
     if (!active) return;
     let changed = false;
 
-    // Speechmatics FINAL words → fluent tokens (primary source).
+    // ── Deepgram FINAL words → PRIMARY tokens (fluent + disfluent).
+    // Disfluent tokens are locked (Speechmatics can never overwrite them);
+    // fluent tokens are normal permanent tokens. Deepgram is the primary
+    // live transcript source.
+    for (const d of deepgramFinals) {
+      const seenKey = `${Math.round(d.startTimeMs)}-${Math.round(
+        d.endTimeMs
+      )}-${normWord(d.rawWord || d.word)}`;
+      if (seenDgRef.current.has(seenKey)) continue;
+      seenDgRef.current.add(seenKey);
+      changed = true;
+
+      const incoming: TranscriptToken = {
+        id: d.id,
+        word: d.word,
+        rawWord: d.rawWord ?? d.word,
+        startTimeMs: d.startTimeMs,
+        endTimeMs: Math.max(d.endTimeMs, d.startTimeMs + 1),
+        source: "deepgram",
+        isDisfluency: d.isDisfluency,
+        locked: d.isDisfluency, // only disfluencies are locked
+        disfluencyType: d.disfluencyType,
+        confidence: d.confidence,
+      };
+      const res = reconcileIncoming(tokensRef.current, incoming);
+      tokensRef.current = res.tokens;
+      for (const k of res.hiddenKeys) hiddenRef.current.add(k);
+    }
+
+    // ── Speechmatics FINAL words → secondary/fallback tokens (gaps).
+    // Only fills slots Deepgram has NOT already covered; a competing word
+    // for a locked Deepgram slot is discarded (hidden).
     for (const chunk of transcripts) {
       if (!chunk.isFinal) continue;
       for (const w of chunk.words) {
@@ -111,32 +142,6 @@ export function useTranscriptReconciler(
         tokensRef.current = res.tokens;
         for (const k of res.hiddenKeys) hiddenRef.current.add(k);
       }
-    }
-
-    // Deepgram FINAL disfluency tokens → fast-tracked, locked tokens.
-    for (const d of deepgramFinals) {
-      const seenKey = `${Math.round(d.startTimeMs)}-${Math.round(
-        d.endTimeMs
-      )}-${normWord(d.rawWord || d.word)}`;
-      if (seenDgRef.current.has(seenKey)) continue;
-      seenDgRef.current.add(seenKey);
-      changed = true;
-
-      const incoming: TranscriptToken = {
-        id: d.id,
-        word: d.word,
-        rawWord: d.rawWord ?? d.word,
-        startTimeMs: d.startTimeMs,
-        endTimeMs: Math.max(d.endTimeMs, d.startTimeMs + 1),
-        source: "deepgram",
-        isDisfluency: true,
-        locked: true,
-        disfluencyType: d.disfluencyType,
-        confidence: d.confidence,
-      };
-      const res = reconcileIncoming(tokensRef.current, incoming);
-      tokensRef.current = res.tokens;
-      for (const k of res.hiddenKeys) hiddenRef.current.add(k);
     }
 
     if (changed) {

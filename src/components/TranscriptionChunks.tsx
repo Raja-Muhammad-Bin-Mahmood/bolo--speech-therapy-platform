@@ -297,15 +297,23 @@ function WordSpan({ word }: { word: LineWord }) {
     );
   }
 
-  // Reconciled Deepgram disfluency token — the NORMALIZED lexical word with
-  // the BOLO disfluency marker. The raw phonetic spelling ("sssslap",
-  // "b-b-ball") is NEVER shown; the marker is the visual disfluency signal.
+  // Reconciled Deepgram tokens — PRIMARY source (fluent + disfluent). The
+  // disfluent one renders as the NORMALIZED lexical word with a visible
+  // PURPLE UNDERLINE (the underline IS the disfluency marker). The raw
+  // phonetic spelling ("sssslap", "b-b-ball") is NEVER shown.
   if (word.deepgram) {
+    const isDgDisfluency = word.deepgram.isDisfluency || word.deepgram.locked;
     return (
       <span className="inline-flex items-center gap-1 align-middle">
         <span
-          className="inline-block rounded px-1 underline decoration-dotted underline-offset-2 bg-[#BD8CFF]/10 text-[#BD8CFF]/90 transition-colors duration-200"
-          title={`Deepgram disfluency${word.deepgram.disfluencyType ? ` · ${word.deepgram.disfluencyType}` : ""}${word.deepgram.rawWord && word.deepgram.rawWord !== word.deepgram.word ? ` · raw: ${word.deepgram.rawWord}` : ""}`}
+          className={
+            isDgDisfluency
+              ? "inline-block rounded px-1 underline decoration-2 decoration-purple-400 underline-offset-4 bg-[#BD8CFF]/10 text-[#BD8CFF]/90 transition-colors duration-200"
+              : "inline-block rounded px-1 text-white/85 transition-colors duration-200"
+          }
+          title={isDgDisfluency
+            ? `Deepgram disfluency${word.deepgram.disfluencyType ? ` · ${word.deepgram.disfluencyType}` : ""}${word.deepgram.rawWord && word.deepgram.rawWord !== word.deepgram.word ? ` · raw: ${word.deepgram.rawWord}` : ""}`
+            : undefined}
         >
           {word.deepgram.word}
         </span>
@@ -388,13 +396,11 @@ function buildLines(
   const lines: { id: string; items: LineItem[] }[] = [];
   let lineId = 0;
 
-  // Reconciled Deepgram disfluency tokens — fast-tracked, locked. A
+  // Reconciled Deepgram tokens — PRIMARY source (fluent + disfluent). A
   // Speechmatics partial/final word that competes for the same spoken slot
-  // is suppressed (never flickers between "slap" and "rap").
-  const lockedDg = deepgramTokens.filter(
-    (t) => t.source === "deepgram" && t.isDisfluency && t.locked
-  );
-  const dgByStartMs = [...lockedDg].sort((a, b) => a.startTimeMs - b.startTimeMs);
+  // is suppressed (Deepgram wins; never flickers between "slap" and "rap").
+  const dgTokens = deepgramTokens.filter((t) => t.source === "deepgram");
+  const dgByStartMs = [...dgTokens].sort((a, b) => a.startTimeMs - b.startTimeMs);
 
   // Finals grouped by utterance index
   const finals = transcripts.filter((t) => t.isFinal);
@@ -416,7 +422,7 @@ function buildLines(
       // same spoken slot is suppressed — Deepgram (which carries the
       // disfluency evidence) must win.
       if (
-        lockedDg.some((dg) =>
+        dgTokens.some((dg) =>
           suppressedByLock(
             {
               startTimeMs: Math.round(w.startTime * 1000),
@@ -509,14 +515,14 @@ function buildLines(
       const text = (w as any).text || w.word || "";
       if (!text) return [];
       // Partial collision rule: a Speechmatics PARTIAL word overlapping a
-      // locked Deepgram disfluency token is suppressed — partials are
-      // lower priority than a confirmed Deepgram disfluency.
+      // Deepgram token (fluent or locked disfluent) is suppressed —
+      // partials are lower priority than a confirmed Deepgram word.
       const wStartMs = Math.round((w.startTime ?? 0) * 1000);
       const wEndMs = Math.round(
         (w.endTime ?? (w.startTime ?? 0) + 0.3) * 1000
       );
       if (
-        lockedDg.some((dg) =>
+        dgTokens.some((dg) =>
           suppressedByLock({ startTimeMs: wStartMs, endTimeMs: wEndMs }, dg)
         )
       ) {
@@ -687,11 +693,11 @@ function buildLines(
     }
   }
 
-  // ── Inject reconciled Deepgram disfluency tokens chronologically ────
-  // Fast-track rendering: the moment a Deepgram final disfluency token
-  // exists it is inserted at its chronological position (normalized word +
-  // BOLO disfluency marker). Speechmatics backfills the surrounding fluent
-  // words afterward; the token array is the source of truth.
+  // ── Inject reconciled Deepgram tokens chronologically ────────────
+  // Fast-track rendering (PRIMARY source): the moment a Deepgram final
+  // word exists it is inserted at its chronological position (normalized
+  // word; disfluent ones carry the purple underline). Speechmatics
+  // backfills only gaps afterward; the token array is the source of truth.
   if (dgByStartMs.length > 0) {
     const dgWordSpans: { text: string; startTime: number; endTime: number }[] =
       dgByStartMs.map((d) => ({

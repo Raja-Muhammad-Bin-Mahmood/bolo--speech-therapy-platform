@@ -3,8 +3,9 @@
  * Temporal Reconciliation Engine
  *
  * The live transcript is an ARRAY of structured tokens, never a single
- * concatenated string. Speechmatics is the PRIMARY clean transcription
- * source; Deepgram is a SECONDARY real-time disfluency/lexical source.
+ * concatenated string. Deepgram is the PRIMARY live transcription source
+ * (its FINAL words — fluent and disfluent — are permanent tokens);
+ * Speechmatics is the SECONDARY/fallback source for missing/unclear words.
  *
  * Every update to the array goes through reconcileIncoming() which:
  *   1. reconciles the incoming token against the existing array
@@ -182,22 +183,18 @@ export interface ReconcileResult {
 /**
  * Reconcile ONE incoming token against the current array.
  *
- * Speechmatics (fluent final):
+ * Deepgram (PRIMARY source, fluent + disfluent finals):
+ *   • disfluent → locked token (fast-track; Speechmatics can never
+ *     overwrite it); replaces a competing Speechmatics word in the slot
+ *   • fluent → normal permanent token; competing Speechmatics words for
+ *     the same slot are removed (Deepgram wins the spoken slot)
+ *
+ * Speechmatics (secondary/fallback):
  *   • competing with a locked Deepgram disfluency token → DISCARD
  *     (rule: Speechmatics cannot overwrite a confirmed disfluency)
+ *   • competing with a fluent Deepgram token → DISCARD (Deepgram primary)
  *   • exact slot+word duplicate → never rendered twice
- *   • otherwise → committed normally
- *
- * Deepgram disfluency (final):
- *   • candidate Speechmatics token inside the reconciliation window →
- *     REPLACE (remove the Speechmatics token, insert the Deepgram token);
- *     same lexical word → MERGE into one token (source deepgram, locked)
- *   • no candidate → INSERT as a new locked token (fast-track)
- *   • other Speechmatics tokens overlapping the Deepgram interval are
- *     competing duplicates → removed
- *
- * Fluent Deepgram words never enter the permanent transcript — Speechmatics
- * remains the primary source for normal fluent transcription.
+ *   • otherwise → committed normally (fills gaps Deepgram missed)
  */
 export function reconcileIncoming(
   tokens: TranscriptToken[],
@@ -206,111 +203,109 @@ export function reconcileIncoming(
   const hiddenKeys: string[] = [];
   let next = tokens;
 
-  // Fluent Deepgram words must NOT override Speechmatics — skip entirely.
-  if (incoming.source === "deepgram" && !incoming.isDisfluency) {
-    return { tokens: next, hiddenKeys };
-  }
+  // ── Deepgram final word (PRIMARY — fluent AND disfluent) ────────────
+  if (incoming.source === "deepgram") {
+    const dg: TranscriptToken = {
+      ...incoming,
+      isDisfluency: incoming.isDisfluency,
+      locked: incoming.isDisfluency, // only disfluencies lock the slot
+    };
 
-  // ── Speechmatics final word ─────────────────────────────────────────
-  if (incoming.source === "speechmatics") {
-    // Locked-DG protection: a competing SM word for the same slot is
-    // discarded from the LIVE transcript (never overwrites the marker).
-    for (const lk of next) {
-      if (
-        lk.source === "deepgram" &&
-        lk.isDisfluency &&
-        lk.locked &&
-        suppressedByLock(incoming, lk)
-      ) {
-        hiddenKeys.push(tokenKey(incoming));
-        return { tokens: next, hiddenKeys };
+    // Disfluent: replace a competing Speechmatics candidate (same slot).
+    if (dg.isDisfluency) {
+      const candidate = findReplacementCandidate(next, dg);
+      if (candidate) {
+        hiddenKeys.push(tokenKey(candidate));
+        next = next.filter((t) => t !== candidate);
+        if (normWord(candidate.word) === normWord(dg.word)) {
+          // Same lexical word: merge into ONE token. Retain deepgram
+          // source + locked so Speechmatics can never overwrite it later.
+          dg.rawWord = dg.rawWord ?? candidate.rawWord ?? candidate.word;
+          dg.word = dg.word || candidate.word;
+        }
       }
     }
-    // Exact duplicate (same slot + same lexical word) — never twice.
-    const key = tokenKey(incoming);
-    const dup = next.some(
+
+    // Competing Speechmatics tokens overlapping the Deepgram interval
+    // directly are duplicates of the same spoken word — remove them all
+    // (Deepgram is primary; it wins the spoken slot).
+    const competing = next.filter(
       (t) =>
         t.source === "speechmatics" &&
-        tokenKey(t) === key &&
-        normWord(t.word) === normWord(incoming.word)
+        overlapMs(
+          dg.startTimeMs,
+          dg.endTimeMs,
+          t.startTimeMs,
+          t.endTimeMs
+        ) > 0
     );
-    if (dup) {
-      hiddenKeys.push(key);
-      return { tokens: next, hiddenKeys };
-    }
-    // Near-duplicate: same lexical word occupying ~the same slot (>50%
-    // overlap of the shorter interval) — keep the first, hide the second.
-    const inDur = Math.max(1, incoming.endTimeMs - incoming.startTimeMs);
-    const nearDup = next.some((t) => {
-      if (t.source !== "speechmatics") return false;
-      if (normWord(t.word) !== normWord(incoming.word)) return false;
-      const ov = overlapMs(
-        incoming.startTimeMs,
-        incoming.endTimeMs,
-        t.startTimeMs,
-        t.endTimeMs
+    for (const c of competing) hiddenKeys.push(tokenKey(c));
+    next = next.filter((t) => !competing.includes(t));
+
+    // Dedupe against an existing identical Deepgram token (re-finalized word).
+    const dgKey = tokenKey(dg);
+    const existing = next.find(
+      (t) => t.source === "deepgram" && tokenKey(t) === dgKey
+    );
+    if (existing) {
+      next = next.map((t) =>
+        t === existing
+          ? {
+              ...existing,
+              locked: t.isDisfluency || dg.isDisfluency,
+              isDisfluency: t.isDisfluency || dg.isDisfluency,
+              disfluencyType: existing.disfluencyType ?? dg.disfluencyType,
+              rawWord: existing.rawWord ?? dg.rawWord,
+            }
+          : t
       );
-      const tDur = Math.max(1, t.endTimeMs - t.startTimeMs);
-      return ov / Math.min(inDur, tDur) >= 0.5;
-    });
-    if (nearDup) {
-      hiddenKeys.push(key);
-      return { tokens: next, hiddenKeys };
+    } else {
+      next = [...next, dg];
     }
-    next = [...next, { ...incoming, locked: false }];
+
     return { tokens: sortTokens(next), hiddenKeys };
   }
 
-  // ── Deepgram disfluency final (the fast-track path) ─────────────────
-  const dg: TranscriptToken = { ...incoming, locked: true, isDisfluency: true };
-
-  const candidate = findReplacementCandidate(next, dg);
-  if (candidate) {
-    hiddenKeys.push(tokenKey(candidate));
-    next = next.filter((t) => t !== candidate);
-    if (normWord(candidate.word) === normWord(dg.word)) {
-      // Rule 7 — same lexical word: merge into ONE token. Retain deepgram
-      // source + locked so Speechmatics can never overwrite it later.
-      dg.rawWord = dg.rawWord ?? candidate.rawWord ?? candidate.word;
-      dg.word = dg.word || candidate.word;
+  // ── Speechmatics final word (secondary/fallback) ────────────────────
+  // Locked-DG protection + fluent-DG protection: a competing SM word for
+  // the same slot is discarded (never overwrites the Deepgram token).
+  for (const lk of next) {
+    if (lk.source === "deepgram" && suppressedByLock(incoming, lk)) {
+      hiddenKeys.push(tokenKey(incoming));
+      return { tokens: next, hiddenKeys };
     }
   }
-
-  // Competing Speechmatics tokens overlapping the Deepgram interval
-  // directly are duplicates of the same spoken word — remove them all.
-  const competing = next.filter(
+  // Exact duplicate (same slot + same lexical word) — never twice.
+  const key = tokenKey(incoming);
+  const dup = next.some(
     (t) =>
       t.source === "speechmatics" &&
-      overlapMs(
-        dg.startTimeMs,
-        dg.endTimeMs,
-        t.startTimeMs,
-        t.endTimeMs
-      ) > 0
+      tokenKey(t) === key &&
+      normWord(t.word) === normWord(incoming.word)
   );
-  for (const c of competing) hiddenKeys.push(tokenKey(c));
-  next = next.filter((t) => !competing.includes(t));
-
-  // Dedupe against an existing identical Deepgram token (re-finalized word).
-  const dgKey = tokenKey(dg);
-  const existing = next.find(
-    (t) => t.source === "deepgram" && tokenKey(t) === dgKey
-  );
-  if (existing) {
-    next = next.map((t) =>
-      t === existing
-        ? {
-            ...existing,
-            locked: true,
-            isDisfluency: true,
-            disfluencyType: existing.disfluencyType ?? dg.disfluencyType,
-            rawWord: existing.rawWord ?? dg.rawWord,
-          }
-        : t
-    );
-  } else {
-    next = [...next, dg];
+  if (dup) {
+    hiddenKeys.push(key);
+    return { tokens: next, hiddenKeys };
   }
-
+  // Near-duplicate: same lexical word occupying ~the same slot (>50%
+  // overlap of the shorter interval) — keep the first, hide the second.
+  const inDur = Math.max(1, incoming.endTimeMs - incoming.startTimeMs);
+  const nearDup = next.some((t) => {
+    if (t.source !== "speechmatics") return false;
+    if (normWord(t.word) !== normWord(incoming.word)) return false;
+    const ov = overlapMs(
+      incoming.startTimeMs,
+      incoming.endTimeMs,
+      t.startTimeMs,
+      t.endTimeMs
+    );
+    const tDur = Math.max(1, t.endTimeMs - t.startTimeMs);
+    return ov / Math.min(inDur, tDur) >= 0.5;
+  });
+  if (nearDup) {
+    hiddenKeys.push(key);
+    return { tokens: next, hiddenKeys };
+  }
+  next = [...next, { ...incoming, locked: false }];
   return { tokens: sortTokens(next), hiddenKeys };
 }

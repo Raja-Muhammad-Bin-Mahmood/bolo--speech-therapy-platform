@@ -38,6 +38,7 @@ import TelemetryPanel from "../components/TelemetryPanel";
 import { useAudioCapture } from "../hooks/useAudioCapture";
 import { useAnalyserSensor } from "../hooks/useAnalyserSensor";
 import { useSpeechmaticsWS } from "../hooks/useSpeechmaticsWS";
+import type { TranscriptChunk } from "../hooks/useSpeechmaticsWS";
 import { useDeepgramWS } from "../hooks/useDeepgramWS";
 import { useTranscriptReconciler } from "../hooks/useTranscriptReconciler";
 import {
@@ -112,7 +113,10 @@ export default function RecordingSession() {
   // ── Detection pipeline ──────────────────────────────────────────────
   const audio = useAudioCapture();
   const ws = useSpeechmaticsWS();
-  const dg = useDeepgramWS();
+  // Deepgram is the PRIMARY live transcription engine. It consumes the SAME
+  // PCM as Speechmatics (no second mic stream) and gets the shared analyser
+  // so its block detection can use the BOLO RMS isSpeaking gate.
+  const dg = useDeepgramWS({ getAnalyser: audio.getAnalyser });
   const acoustic = useAcousticAnalysis(audio.getAnalyser, isRecording);
   // RMS / ZCR / ΔEnergy lane — same shared analyser, drives stutter/stammer
   const sensor = useAnalyserSensor(audio.getAnalyser, isRecording);
@@ -126,7 +130,68 @@ export default function RecordingSession() {
     [acoustic.events, sensor.events]
   );
 
-  const analysis = useSessionAnalysis(ws.transcripts, allAcoustic);
+  // ── Analysis over the PRIMARY (Deepgram) transcript ────────────────
+  // Deepgram FINAL words are the source of truth for scoring/pacing; if
+  // Deepgram is silent, Speechmatics finals fill the gaps (fallback).
+  const dgFinalChunks = useMemo(() => {
+    const finals: TranscriptChunk[] = [];
+    const dgSorted = [...dg.finals].sort((a, b) => a.startTimeMs - b.startTimeMs);
+    let curUtterance = 0;
+    dgSorted.forEach((w: (typeof dg.finals)[number], i) => {
+      const startSec = w.startTimeMs / 1000;
+      const endSec = w.endTimeMs / 1000;
+      // New utterance when there's a >1.5s gap from the previous word end.
+      if (i > 0 && startSec - dgSorted[i - 1].endTimeMs / 1000 > 1.5) {
+        curUtterance += 1;
+      }
+      finals.push({
+        text: w.word,
+        isFinal: true,
+        isPartial: false,
+        words: [
+          {
+            word: w.word,
+            startTime: startSec,
+            endTime: endSec,
+            confidence: w.confidence,
+          },
+        ],
+        utterance: curUtterance,
+        startTime: startSec,
+        endTime: endSec,
+      });
+    });
+    return finals;
+  }, [dg.finals]);
+
+  // Merge SM finals into the SAME timeline when they DON'T collide with a
+  // Deepgram word (fallback only — Deepgram wins overlapping slots).
+  const mergedFinalChunks = useMemo(() => {
+    const smFinals = ws.transcripts.filter((c) => c.isFinal);
+    if (dgFinalChunks.length === 0) return smFinals;
+    const dgSpans = dgFinalChunks.flatMap((c) =>
+      c.words.map((w) => [w.startTime, w.endTime] as [number, number])
+    );
+    const merged = [...dgFinalChunks];
+    for (const chunk of smFinals) {
+      const words = chunk.words.filter((w) => {
+        const s = w.startTime ?? 0;
+        const e = w.endTime ?? s;
+        const collides = dgSpans.some(
+          ([ds, de]) => Math.min(e, de) - Math.max(s, ds) > 0.05
+        );
+        return !collides;
+      });
+      if (words.length > 0) {
+        merged.push({ ...chunk, words });
+      }
+    }
+    return merged.sort(
+      (a, b) => (a.words[0]?.startTime ?? 0) - (b.words[0]?.startTime ?? 0)
+    );
+  }, [dgFinalChunks, ws.transcripts]);
+
+  const analysis = useSessionAnalysis(mergedFinalChunks, allAcoustic);
   const pace = usePaceEngine();
   const paceSnapshot = usePaceSnapshot(pace.engine);
 
@@ -149,18 +214,20 @@ export default function RecordingSession() {
     [recovery.duplicateKeys]
   );
 
-  // ── Secondary real-time disfluency/lexical source (Deepgram) ───────
+  // ── Primary real-time transcription engine (Deepgram) ───────────────
   // Consumes the SAME PCM the Speechmatics socket consumes (no second mic
-  // stream). Final disfluency tokens fast-track into the live transcript
-  // via the temporal reconciler; Speechmatics stays the primary source.
+  // stream). EVERY final word (fluent + disfluent) fast-tracks into the
+  // ONE live transcript via the temporal reconciler; disfluent ones are
+  // locked and render with the purple underline immediately.
   // ALWAYS-ON (user rule): Deepgram connects + listens whenever recording
   // is active — it NEVER waits for Speechmatics to connect (or to fail),
-  // and its disfluency tokens enter the ONE live transcript independently.
+  // and its tokens enter the ONE live transcript independently.
   // The reconciler therefore keys off `isRecording` alone (not ws.status):
-  // Speechmatics words join the same token array whenever they arrive and
-  // are evicted by a locked Deepgram token when they collide. Gating this
-  // on Speechmatics would both delay Deepgram's underlined word until SM
-  // connects AND wipe injected tokens if SM dropped mid-session.
+  // Speechmatics words join the same token array as secondary/fallback
+  // whenever they arrive and are evicted by a Deepgram token when they
+  // collide. Gating this on Speechmatics would both delay Deepgram's
+  // underlined word until SM connects AND wipe injected tokens if SM
+  // dropped mid-session.
   const reconciler = useTranscriptReconciler({
     active: isRecording,
     transcripts: ws.transcripts,
@@ -259,10 +326,10 @@ export default function RecordingSession() {
     if (ws.status === "connected") audio.pinClock();
   }, [ws.status, audio]);
 
-  // Feed the shared pace engine live (words + pauses)
+  // Feed the shared pace engine live (words + pauses) — PRIMARY transcript
   useEffect(() => {
-    pace.feedTranscripts(ws.transcripts);
-  }, [ws.transcripts, pace]);
+    pace.feedTranscripts(mergedFinalChunks);
+  }, [mergedFinalChunks, pace]);
   useEffect(() => {
     pace.feedPauses(analysis.pauseEvents);
   }, [analysis.pauseEvents, pace]);
@@ -317,7 +384,10 @@ export default function RecordingSession() {
 
     // Capture final data BEFORE the pipeline resets (acoustic events live in
     // a ref that clears when `active` flips false).
-    const finalTranscripts = ws.snapshotTranscripts();
+    // PRIMARY transcript = Deepgram finals (with SM fallback merged in).
+    const smSnapshot = ws.snapshotTranscripts();
+    const finalTranscripts =
+      mergedFinalChunks.length > 0 ? mergedFinalChunks : smSnapshot;
     const finalAcoustic = acoustic.getEvents();
     // ── Fuse in the RMS/ZCR/ΔEnergy sensor events (stutter/stammer) ──
     // via the SAME shared merge the live view uses — the review payload
@@ -458,7 +528,7 @@ export default function RecordingSession() {
         },
       });
     }, 900);
-  }, [ws, acoustic, sensor, pace, selectedTopic, navigate, saveSessionData, recovery.annotations]);
+  }, [ws, acoustic, sensor, pace, selectedTopic, navigate, saveSessionData, recovery.annotations, mergedFinalChunks]);
 
   const handleStopRecording = useCallback(() => {
     audio.stop();
@@ -566,6 +636,13 @@ export default function RecordingSession() {
                     : ws.status === "connecting"
                       ? "Connecting to transcription…"
                       : "Preparing microphone…"}
+                  {dg.status === "connected"
+                    ? " · Deepgram live"
+                    : dg.status === "connecting"
+                      ? " · Deepgram connecting…"
+                      : dg.status === "error"
+                        ? " · Deepgram error"
+                        : ""}
                 </p>
               </div>
 

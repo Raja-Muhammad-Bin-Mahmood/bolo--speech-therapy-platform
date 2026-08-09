@@ -1,24 +1,27 @@
 /**
- * BOLO — useDeepgramWS: Secondary real-time disfluency / lexical source
+ * BOLO — useDeepgramWS: PRIMARY live transcription engine
  *
- * Deepgram is NOT a second microphone stream — it consumes the SAME PCM the
- * Speechmatics socket consumes (the page tees the shared Float32 buffer).
- * Both providers therefore share the ONE BOLO session clock: Deepgram word
- * times (seconds, relative to its stream start) are mapped onto the session
+ * Deepgram is the PRIMARY live transcript source. It consumes the SAME PCM
+ * the Speechmatics socket consumes (the page tees the shared Float32 buffer),
+ * so both providers live on the ONE BOLO session clock: Deepgram word times
+ * (seconds, relative to its stream start) are mapped onto the session
  * timeline via the session-clock time captured when the first audio buffer
- * was sent, so a Deepgram "slap" and a Speechmatics "rap" are compared on
- * identical millisecond axes (never raw provider timestamps).
+ * was sent.
  *
- * Config (exact): model=nova-2, language=en-US, smart_format=true,
- * filler_words=true, punctuate=true, interim_results=true,
- * utterance_end_ms=1200, vad_events=true, no_delay=true.
+ * Config (exact, per spec — no smart_format / no cleanup / no smoothing):
+ *   model=nova-2, language=en-US, filler_words=true, interim_results=true,
+ *   punctuate=true, vad_events=true, no_delay=true, utterance_end_ms=1200.
  *
  * RULES
- *   • FINAL Deepgram word results are the only source of PERMANENT tokens,
- *     and only when a disfluency is detected (isDisfluency=true).
- *   • Interim results are used for live diagnostics + revision detection —
- *     they NEVER create permanent transcript tokens.
- *   • Raw word → detection → lexical normalization → visible word.
+ *   • EVERY FINAL Deepgram word becomes a permanent transcript token —
+ *     fluent words AND disfluent words (this is the PRIMARY engine).
+ *   • Interim results are display-only (interimWords/interimText) — they
+ *     NEVER create permanent tokens and never duplicate finalized words.
+ *   • Disfluency detection runs on the RAW token FIRST (never normalized),
+ *     then the raw phonetic spelling is normalized to the intended lexical
+ *     word so the live transcript never shows "ssssslap"/"b-b-ball".
+ *   • Block detection uses Deepgram word-timing gaps gated by the BOLO
+ *     RMS/isSpeaking energy gate — ordinary silence is NOT a block.
  *   • The raw API key never leaves the `deepgram-token` Edge Function; the
  *     browser receives a short-lived temporary key via the WebSocket URL.
  */
@@ -47,13 +50,26 @@ export interface DeepgramFinalWord {
   disfluencyType?: DeepgramDisfluencyType;
 }
 
+/** Latest interim hypothesis word — display-only ghost (never permanent). */
+export interface DeepgramInterimWord {
+  word: string;
+  startMs: number;
+}
+
 export interface DeepgramWSState {
   status: "idle" | "connecting" | "connected" | "disconnected" | "error";
   error: string | null;
-  /** Final disfluency tokens — fed to the transcript reconciler. */
+  /** FINAL words (fluent + disfluent) — fed to the transcript reconciler. */
   finals: DeepgramFinalWord[];
-  /** Latest interim hypothesis (diagnostics only — never permanent). */
+  /** Latest interim hypothesis words (display-only). */
+  interimWords: DeepgramInterimWord[];
+  /** Latest interim hypothesis text (display-only). */
   interimText: string;
+}
+
+export interface UseDeepgramWSOptions {
+  /** Shared analyser (RMS) — the BOLO isSpeaking gate for block detection. */
+  getAnalyser?: () => AnalyserNode | null;
 }
 
 // ─── Endpoint + config (spec: exact params) ─────────────────────────────
@@ -63,13 +79,12 @@ const DG_WS_URL = "wss://api.deepgram.com/v1/listen";
 const DG_QUERY = [
   "model=nova-2",
   "language=en-US",
-  "smart_format=true",
   "filler_words=true",
-  "punctuate=true",
   "interim_results=true",
-  "utterance_end_ms=1200",
+  "punctuate=true",
   "vad_events=true",
   "no_delay=true",
+  "utterance_end_ms=1200",
   "encoding=linear16",
   "sample_rate=16000",
   "channels=1",
@@ -77,13 +92,22 @@ const DG_QUERY = [
 
 /** Float32 PCM (-1..1) → PCM16 little-endian bytes for Deepgram. */
 function toPcm16(buffer: Float32Array): ArrayBuffer {
-  const i16 = new Int16Array(buffer.length);
-  for (let i = 0; i < buffer.length; i++) {
-    const s = Math.max(-1, Math.min(1, buffer[i]));
+  const copy = new Float32Array(buffer); // normalize to ArrayBuffer-backed
+  const i16 = new Int16Array(copy.length);
+  for (let i = 0; i < copy.length; i++) {
+    const s = Math.max(-1, Math.min(1, copy[i]));
     i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
   return i16.buffer;
 }
+
+// ─── Block gate: RMS voice-activity (shared with the DSP lane) ──────────
+// Ordinary silence must NOT become a block — only a timing gap while the
+// mic energy says the user is (or just was) speaking counts.
+
+const SPEAK_ON_RMS = 0.02;
+const SPEAK_OFF_RMS = 0.01;
+const SPEAK_SAMPLE_MS = 120;
 
 interface RecentWord {
   norm: string;
@@ -91,20 +115,16 @@ interface RecentWord {
   startMs: number;
 }
 
-interface InterimWord {
-  norm: string;
-  startMs: number;
-}
-
 let dgUid = 0;
 
 // ─── Hook ───────────────────────────────────────────────────────────────
 
-export function useDeepgramWS() {
+export function useDeepgramWS(options?: UseDeepgramWSOptions) {
   const [state, setState] = useState<DeepgramWSState>({
     status: "idle",
     error: null,
     finals: [],
+    interimWords: [],
     interimText: "",
   });
   const wsRef = useRef<WebSocket | null>(null);
@@ -116,10 +136,32 @@ export function useDeepgramWS() {
   /** Rolling recent FINAL words — sequence-level repetition detection. */
   const recentRef = useRef<RecentWord[]>([]);
   /** Latest interim hypothesis — revision (abandoned word) detection. */
-  const interimRef = useRef<InterimWord[]>([]);
+  const interimRef = useRef<{ norm: string; startMs: number }[]>([]);
   const watchdogRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastActivityRef = useRef(0);
   const SILENCE_TIMEOUT_MS = 15000;
+  /** Block detection state. */
+  const lastWordEndMsRef = useRef<number | null>(null);
+  const speakingRef = useRef(false);
+  const speechSampleRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const rmsBufRef = useRef<Float32Array<ArrayBuffer>>(new Float32Array(0));
+
+  // ── RMS isSpeaking gate (BOLO energy gate, hysteresis) ──────────────
+  const sampleSpeaking = useCallback(() => {
+    const analyser = options?.getAnalyser?.();
+    if (!analyser) return;
+    let buf = rmsBufRef.current;
+    if (buf.length !== analyser.fftSize) {
+      buf = new Float32Array(analyser.fftSize);
+      rmsBufRef.current = buf;
+    }
+    analyser.getFloatTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    const rms = Math.sqrt(sum / Math.max(1, buf.length));
+    if (!speakingRef.current && rms > SPEAK_ON_RMS) speakingRef.current = true;
+    else if (speakingRef.current && rms < SPEAK_OFF_RMS) speakingRef.current = false;
+  }, [options]);
 
   // ── Connect (mint temp key → open socket) ──────────────────────────
   const connect = useCallback(async () => {
@@ -137,10 +179,13 @@ export function useDeepgramWS() {
     seenFinalRef.current = new Set();
     recentRef.current = [];
     interimRef.current = [];
+    lastWordEndMsRef.current = null;
+    speakingRef.current = false;
     setState({
       status: "connecting",
       error: null,
       finals: [],
+      interimWords: [],
       interimText: "",
     });
 
@@ -189,6 +234,9 @@ export function useDeepgramWS() {
             }
           }
         }, 2000);
+        // BOLO isSpeaking gate — sampled while the lane is live.
+        if (speechSampleRef.current) clearInterval(speechSampleRef.current);
+        speechSampleRef.current = setInterval(sampleSpeaking, SPEAK_SAMPLE_MS);
       };
 
       ws.onmessage = (event) => {
@@ -222,7 +270,8 @@ export function useDeepgramWS() {
 
           const base = streamStartMsRef.current ?? 0;
           if (msg.is_final) {
-            // FINAL → disfluency detection → permanent token candidates.
+            // FINAL → disfluency detection → PERMANENT token (fluent too —
+            // Deepgram is the PRIMARY transcript source).
             for (const w of words) {
               const raw = (w.word ?? "").trim();
               if (!raw) continue;
@@ -240,6 +289,18 @@ export function useDeepgramWS() {
               const verdict = classifyDeepgramWord(raw);
               let type = verdict.disfluencyType;
               const norm = normalizeLexicalWord(raw).toLowerCase().replace(/[^a-z0-9']/g, "");
+
+              // ── Block: Deepgram word-timing gap gated by the BOLO
+              //    RMS/isSpeaking gate — ordinary silence is NOT a block.
+              if (
+                !type &&
+                lastWordEndMsRef.current != null &&
+                startMs - lastWordEndMsRef.current > 450 &&
+                speakingRef.current
+              ) {
+                type = "block";
+              }
+              lastWordEndMsRef.current = endMs;
 
               // Sequence-level detection (needs context across tokens):
               // word repetition "I I I" (separate tokens) + phrase repetition.
@@ -291,23 +352,21 @@ export function useDeepgramWS() {
                 { norm, raw, startMs },
               ].slice(-60);
 
-              if (verdict.isDisfluency || type) {
-                const final: DeepgramFinalWord = {
-                  id: `dg-${Date.now().toString(36)}-${(dgUid++).toString(36)}`,
-                  word: normalizeLexicalWord(raw),
-                  rawWord: raw,
-                  startTimeMs: startMs,
-                  endTimeMs: endMs,
-                  confidence: conf,
-                  isDisfluency: true,
-                  disfluencyType: type,
-                };
-                finalsRef.current = [...finalsRef.current, final];
-                setState((prev) => ({ ...prev, finals: finalsRef.current }));
-              }
+              const final: DeepgramFinalWord = {
+                id: `dg-${Date.now().toString(36)}-${(dgUid++).toString(36)}`,
+                word: normalizeLexicalWord(raw),
+                rawWord: raw,
+                startTimeMs: startMs,
+                endTimeMs: endMs,
+                confidence: conf,
+                isDisfluency: verdict.isDisfluency || type != null,
+                disfluencyType: type,
+              };
+              finalsRef.current = [...finalsRef.current, final];
+              setState((prev) => ({ ...prev, finals: finalsRef.current }));
             }
           } else {
-            // INTERIM → diagnostics + revision detection only. Never tokens.
+            // INTERIM → display-only ghost + revision detection. Never tokens.
             interimRef.current = words
               .filter((w) => w.word && w.word.trim())
               .map((w) => ({
@@ -318,6 +377,12 @@ export function useDeepgramWS() {
               }));
             setState((prev) => ({
               ...prev,
+              interimWords: words
+                .filter((w) => w.word && w.word.trim())
+                .map((w) => ({
+                  word: w.word!.trim(),
+                  startMs: Math.round(base + (w.start ?? 0) * 1000),
+                })),
               interimText: words.map((w) => w.word).join(" "),
             }));
           }
@@ -339,6 +404,10 @@ export function useDeepgramWS() {
           clearInterval(watchdogRef.current);
           watchdogRef.current = null;
         }
+        if (speechSampleRef.current) {
+          clearInterval(speechSampleRef.current);
+          speechSampleRef.current = null;
+        }
         readyRef.current = false;
         setState((prev) => ({ ...prev, status: "disconnected" }));
         wsRef.current = null;
@@ -350,7 +419,7 @@ export function useDeepgramWS() {
         error: err.message || "Unknown Deepgram error",
       }));
     }
-  }, []);
+  }, [options, sampleSpeaking]);
 
   // ── Send the SAME audio the Speechmatics socket receives ────────────
   const sendAudio = useCallback((buffer: Float32Array) => {
@@ -373,6 +442,10 @@ export function useDeepgramWS() {
       clearInterval(watchdogRef.current);
       watchdogRef.current = null;
     }
+    if (speechSampleRef.current) {
+      clearInterval(speechSampleRef.current);
+      speechSampleRef.current = null;
+    }
     if (wsRef.current) {
       wsRef.current.close(1000, "Session ended");
       wsRef.current = null;
@@ -386,6 +459,10 @@ export function useDeepgramWS() {
       if (watchdogRef.current) {
         clearInterval(watchdogRef.current);
         watchdogRef.current = null;
+      }
+      if (speechSampleRef.current) {
+        clearInterval(speechSampleRef.current);
+        speechSampleRef.current = null;
       }
       if (wsRef.current) {
         wsRef.current.close(1000, "Component unmount");
