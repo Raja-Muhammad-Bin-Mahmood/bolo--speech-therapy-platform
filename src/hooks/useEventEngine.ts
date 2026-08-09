@@ -40,6 +40,7 @@ import {
 } from "../lib/speechEvents";
 import { recognizeInWorker } from "../lib/fallbackAsr";
 import { FEED_LABELS } from "../lib/feedEvents";
+import { diag } from "../lib/diagnosticLog";
 import {
   evaluateInterruptionGate,
   findPrevWordEnd,
@@ -221,6 +222,16 @@ export function useEventEngine(options: EventEngineOptions): EventEngineOutput {
         console.debug(
           `[BOLO·event] gate: ${evt.type}@${evt.startTime.toFixed(2)}s rejected — ${gate.rejectionReason}`
         );
+        diag("gate", {
+          type: evt.type,
+          startTime: +evt.startTime.toFixed(3),
+          endTime: evt.endTime != null ? +evt.endTime.toFixed(3) : null,
+          durationMs: evt.durationMs,
+          confidence: +evt.confidence.toFixed(3),
+          passed: false,
+          rejectionReason: gate.rejectionReason,
+          prevWordEnd: prevWordEnd != null ? +prevWordEnd.toFixed(3) : null,
+        });
         continue;
       }
 
@@ -228,6 +239,15 @@ export function useEventEngine(options: EventEngineOptions): EventEngineOutput {
       se.holdDeadlineMs = now + EVENT_SPEC.HOLD_MS;
       se.createdAtMs = now;
       eventMapRef.current.set(se.id, se);
+      diag("gate", {
+        type: evt.type,
+        startTime: +evt.startTime.toFixed(3),
+        endTime: evt.endTime != null ? +evt.endTime.toFixed(3) : null,
+        durationMs: evt.durationMs,
+        confidence: +evt.confidence.toFixed(3),
+        passed: true,
+        signals: gate.signals,
+      });
       log(
         se,
         `OPEN — DSP candidate (conf ${(evt.confidence * 100) | 0}%, ${evt.durationMs}ms) · gate: ${gate.signals.join("; ")}`

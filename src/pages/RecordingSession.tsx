@@ -54,6 +54,7 @@ import { useAuth } from "../context/AuthContext";
 import { toFeedEvents } from "../lib/feedEvents";
 import { visibleRecoveredFor, visibleFeedEventsFor } from "../lib/evidenceGating";
 import { mergeAcousticEvents } from "../lib/mergeAcousticEvents";
+import { diagBanner } from "../lib/diagnosticLog";
 
 type Phase = "topic" | "recording" | "processing";
 
@@ -246,6 +247,11 @@ export default function RecordingSession() {
       setIsRecording(true);
       audio.start();
       ws.connect();
+      diagBanner("SESSION START — recording", {
+        topic,
+        ts: new Date().toISOString(),
+        diag: "feature-level trace enabled (see [BOLO·diag] lines below)",
+      });
     },
     [audio, ws, pace]
   );
@@ -339,6 +345,20 @@ export default function RecordingSession() {
       stammers,
       pauses: finalScore.pauses.total,
     };
+
+    diagBanner("SESSION END — summary", {
+      topic: selectedTopic,
+      ts: new Date().toISOString(),
+      words: finalTranscripts.reduce((n, c) => n + (c.isFinal ? c.words.length : 0), 0),
+      detectorAEvents: finalAcoustic.map((e) => `${e.type}:${e.durationMs}ms@${e.startTime.toFixed(2)}`),
+      sensorEvents: sensorEvents.map((e) => `${e.type}:${e.durationMs}ms@${e.startTime.toFixed(2)}`),
+      mergedEvents: allAcoustic.map((e) => `${e.type}${e.corroborated ? "*" : ""}@${e.startTime.toFixed(2)}`),
+      pauseEvents: pauseEvents.map((p) => `${p.type} ${p.durationMs}ms@${p.startTime.toFixed(2)}`),
+      recoveryAnnotations: recoverySnapshot.map((r) => `${r.type}:"${r.recoveredText}"@${r.startTime.toFixed(2)}`),
+      stutters,
+      stammers,
+      score: finalScore.score,
+    });
 
     try {
       saveSessionData(finalScore.score);

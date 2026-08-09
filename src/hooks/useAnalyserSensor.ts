@@ -19,6 +19,7 @@
 import { useRef, useCallback, useEffect, useState } from "react";
 import type { LiveSensorState } from "./useLiveSensor";
 import type { AcousticEvent } from "./useAcousticAnalysis";
+import { diag } from "../lib/diagnosticLog";
 
 // ─── Live meter state (compatible with SensorSidebar / TelemetryPanel) ───
 
@@ -145,11 +146,24 @@ export function useAnalyserSensor(
         inBurstRef.current = false;
         const durMs = (t - burstStartRef.current) * 1000;
 
-        if (
-          durMs >= BURST_MIN_MS &&
-          durMs <= BURST_MAX_MS &&
-          shapeFramesRef.current >= BURST_SHAPE_MIN_FRAMES
-        ) {
+        const durOkB = durMs >= BURST_MIN_MS && durMs <= BURST_MAX_MS;
+        const shapeOkB = shapeFramesRef.current >= BURST_SHAPE_MIN_FRAMES;
+        diag("sensor-burst", {
+          stage: "end",
+          at: +t.toFixed(3),
+          startTime: +burstStartRef.current.toFixed(3),
+          durMs: Math.round(durMs),
+          minMs: BURST_MIN_MS,
+          maxMs: BURST_MAX_MS,
+          shapeFrames: shapeFramesRef.current,
+          shapeMin: BURST_SHAPE_MIN_FRAMES,
+          rms: +rms.toFixed(4),
+          zcr: +zcr.toFixed(3),
+          delta: +delta.toFixed(4),
+          floor: +floor.toFixed(4),
+          accepted: durOkB && shapeOkB,
+        });
+        if (durOkB && shapeOkB) {
           const bursts = burstRef.current;
           const last = bursts.length > 0 ? bursts[bursts.length - 1] : null;
           const gapMs = last
@@ -162,12 +176,37 @@ export function useAnalyserSensor(
               end: t,
               durMs: Math.round(durMs),
             });
+            diag("sensor-stutter", {
+              stage: "burst-append",
+              at: +t.toFixed(3),
+              burstCount: bursts.length,
+              burstDurMs: Math.round(durMs),
+              gapMs: Math.round(gapMs),
+              shapeFrames: shapeFramesRef.current,
+            });
 
             if (bursts.length >= MIN_BURSTS) {
               const spanMs = (t - bursts[0].start) * 1000;
               if (spanMs <= STUTTER_WINDOW_MS) {
+                diag("sensor-stutter", {
+                  stage: "emit",
+                  startTime: +bursts[0].start.toFixed(3),
+                  endTime: +t.toFixed(3),
+                  burstCount: bursts.length,
+                  spanMs: Math.round(spanMs),
+                  windowMs: STUTTER_WINDOW_MS,
+                });
                 emitEvent("stutter", bursts[0].start, t);
                 burstRef.current = [bursts[bursts.length - 1]];
+              } else {
+                diag("sensor-stutter", {
+                  stage: "span-too-wide",
+                  startTime: +bursts[0].start.toFixed(3),
+                  endTime: +t.toFixed(3),
+                  burstCount: bursts.length,
+                  spanMs: Math.round(spanMs),
+                  windowMs: STUTTER_WINDOW_MS,
+                });
               }
             }
           } else {
@@ -192,12 +231,35 @@ export function useAnalyserSensor(
       // ── Stammer machine (sustained tense hold) ──────────────────────
       const tense = rms > voiceRms * 1.15 && zcr > STAMMER_ZCR_MIN;
       if (tense) {
-        if (stammerStartRef.current === 0) stammerStartRef.current = t;
+        if (stammerStartRef.current === 0) {
+          stammerStartRef.current = t;
+          diag("sensor-stammer", {
+            stage: "hold-open",
+            at: +t.toFixed(3),
+            rms: +rms.toFixed(4),
+            voiceRms: +voiceRms.toFixed(4),
+            rmsGate: +(voiceRms * 1.15).toFixed(4),
+            zcr: +zcr.toFixed(3),
+            zcrMin: STAMMER_ZCR_MIN,
+          });
+        }
         stammerPeakRef.current = Math.max(stammerPeakRef.current, rms);
       } else if (stammerStartRef.current > 0) {
         const durMs = (t - stammerStartRef.current) * 1000;
         const sustained =
           stammerPeakRef.current > voiceRms * STAMMER_RMS_FACTOR * 0.6;
+        diag("sensor-stammer", {
+          stage: "hold-end",
+          startTime: +stammerStartRef.current.toFixed(3),
+          endTime: +t.toFixed(3),
+          durMs: Math.round(durMs),
+          minMs: STAMMER_MIN_MS,
+          maxMs: STAMMER_MAX_MS,
+          peakRms: +stammerPeakRef.current.toFixed(4),
+          sustainedGate: +(voiceRms * STAMMER_RMS_FACTOR * 0.6).toFixed(4),
+          sustained,
+          emit: durMs >= STAMMER_MIN_MS && durMs <= STAMMER_MAX_MS && sustained,
+        });
         if (durMs >= STAMMER_MIN_MS && durMs <= STAMMER_MAX_MS && sustained) {
           emitEvent("stammer", stammerStartRef.current, t);
         }

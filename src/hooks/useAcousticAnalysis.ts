@@ -1,5 +1,6 @@
 import { useRef, useCallback, useEffect, useState } from "react";
 import Meyda from "meyda";
+import { diag, pct } from "../lib/diagnosticLog";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -791,6 +792,17 @@ export function useAcousticAnalysis(
           strength: burstStrength,
         };
         s.pendingStammerTick = t;
+        diag("stammer", {
+          stage: "armed",
+          startTime: +s.fricStart.toFixed(3),
+          endTime: +t.toFixed(3),
+          runDurMs: Math.round(runDurMs),
+          minMs: STAMMER_MIN_MS,
+          maxMs: STAMMER_MAX_MS,
+          strength: +burstStrength.toFixed(3),
+          normCentroid: +normCentroid.toFixed(3),
+          normRolloff: +normRolloff.toFixed(3),
+        });
       }
       // Runs < 25ms or > 600ms — ignore
     }
@@ -802,6 +814,25 @@ export function useAcousticAnalysis(
     ) {
       const p = s.pendingStammer;
       const longHold = p.durMs >= STAMMER_HOLD_MIN_MS && p.strength >= 0.7;
+      const confirmedBy = f.voiced
+        ? longHold
+          ? "voiced_release + longHold"
+          : "voiced_release"
+        : longHold
+          ? "longHold_no_release"
+          : "none";
+      diag("stammer", {
+        stage: "confirm",
+        startTime: +p.start.toFixed(3),
+        runDurMs: p.durMs,
+        strength: +p.strength.toFixed(3),
+        fricativeVoiced: f.voiced,
+        confirmedBy,
+        holdMinMs: STAMMER_HOLD_MIN_MS,
+        holdStrengthMin: 0.7,
+        releaseWindowMs: STAMMER_RELEASE_WINDOW_MS,
+        emit: f.voiced || longHold,
+      });
       if (f.voiced || longHold) {
         const durNorm = Math.min(1, p.durMs / 400);
         const temporal = 0.5 + 0.3 * durNorm + 0.2 * p.strength;
@@ -1008,11 +1039,52 @@ export function useAcousticAnalysis(
               ? Math.min(1, 0.5 + 0.3 * sim.score + 0.2 * regularity)
               : 0.4;
 
-          if (
-            simGated &&
-            confidence >= VOICED_2RUN_EMIT_FLOOR &&
-            t - (s.lastEmitByType.repetition ?? 0) >= 0.25
-          ) {
+          const cooldownOk =
+            t - (s.lastEmitByType.repetition ?? 0) >= 0.25;
+          const emit2run = simGated && confidence >= VOICED_2RUN_EMIT_FLOOR && cooldownOk;
+          diag("repetition", {
+            stage: "2run-classify",
+            startTime: +firstRun.start.toFixed(3),
+            endTime: +secondRun.end.toFixed(3),
+            onsetGapMs: Math.round(onsetGap * 1000),
+            interRunGapMs: Math.round((secondRun.start - firstRun.end) * 1000),
+            run1Ms: Math.round((firstRun.end - firstRun.start) * 1000),
+            run2Ms: Math.round((secondRun.end - secondRun.start) * 1000),
+            run1Acc: !!acc1,
+            run2Acc: !!acc2,
+            run1Desc: desc1
+              ? {
+                  durMs: desc1.durMs,
+                  pitch: desc1.meanPitch ? +desc1.meanPitch.toFixed(0) : null,
+                  mfcc: desc1.mfccMean ? +desc1.mfccMean.reduce((a, b) => a + Math.abs(b), 0).toFixed(3) : null,
+                  voicedRatio: +desc1.voicedRatio.toFixed(2),
+                }
+              : null,
+            run2Desc: desc2
+              ? {
+                  durMs: desc2.durMs,
+                  pitch: desc2.meanPitch ? +desc2.meanPitch.toFixed(0) : null,
+                  mfcc: desc2.mfccMean ? +desc2.mfccMean.reduce((a, b) => a + Math.abs(b), 0).toFixed(3) : null,
+                  voicedRatio: +desc2.voicedRatio.toFixed(2),
+                }
+              : null,
+            similarity: +sim.score.toFixed(3),
+            simGate: VOICED_SIM_GATE,
+            subScores: {
+              mfcc: +sim.subScores.mfcc.toFixed(3),
+              pitch: +sim.subScores.pitch.toFixed(3),
+              energy: +sim.subScores.energy.toFixed(3),
+              duration: +sim.subScores.duration.toFixed(3),
+              voicing: +sim.subScores.voicing.toFixed(3),
+            },
+            simGated,
+            confidence: +confidence.toFixed(3),
+            emitFloor: VOICED_2RUN_EMIT_FLOOR,
+            cooldownOk,
+            verdict: emit2run ? "REPETITION" : "preserved-fragment",
+          });
+
+          if (emit2run) {
             // Classified 2-run voiced repetition. Confidence reflects the
             // similarity-gated evidence — it genuinely clears the emission
             // floor (it is NOT the preserved-fragment 0.40 cap).
@@ -1073,13 +1145,23 @@ export function useAcousticAnalysis(
       const run1Brief =
         firstRun.end >= firstRun.start &&
         (firstRun.end - firstRun.start) * 1000 <= REP_VOICED_RUN_MAX_MS;
-      if (
-        run1Brief &&
-        secondRun.start - firstRun.end >= REP_GAP_MIN &&
-        secondRun.start - firstRun.end <= REP_GAP_MAX
-      ) {
+      const gapMs = (secondRun.start - firstRun.end) * 1000;
+      const armOk =
+        run1Brief && gapMs >= REP_GAP_MIN * 1000 && gapMs <= REP_GAP_MAX * 1000;
+      if (armOk) {
         s.pendingFragment = { run1: firstRun, run2: secondRun };
       }
+      diag("repetition", {
+        stage: "2run-arm",
+        secondOnsetAt: +secondRun.start.toFixed(3),
+        run1Ms: Math.round((firstRun.end - firstRun.start) * 1000),
+        run2Ms: Math.round((secondRun.end - secondRun.start) * 1000),
+        interRunGapMs: Math.round(gapMs),
+        gapMinMs: Math.round(REP_GAP_MIN * 1000),
+        gapMaxMs: Math.round(REP_GAP_MAX * 1000),
+        runMaxMs: REP_VOICED_RUN_MAX_MS,
+        armed: armOk,
+      });
     }
 
     // Repetition: ≥3 onsets spaced 80–250ms apart, brief runs. The stutter
@@ -1107,6 +1189,21 @@ export function useAcousticAnalysis(
           (fr) => fr.t >= s.onsets[0] && fr.zcr > ZCR_TENSION
         );
         const temporal = 0.55 + 0.3 * regularity + (zcrAgree ? 0.15 : 0);
+        diag("repetition", {
+          stage: "3onset-confirm",
+          startTime: +s.onsets[0].toFixed(3),
+          endTime: +s.onsets[s.onsets.length - 1].toFixed(3),
+          onsetCount: s.onsets.length,
+          gapsMs: gaps.map((g) => Math.round(g * 1000)),
+          allInRange,
+          runsBrief,
+          noStutterOverlap,
+          avgGapMs: Math.round(avgGap * 1000),
+          regularity: +regularity.toFixed(3),
+          zcrAgree,
+          temporal: +temporal.toFixed(3),
+          floor: EMIT_FLOOR,
+        });
         // Adjacent-run voiced similarity — the SAME voiced-appropriate
         // evidence as the 2-run path (MFCC/F0/energy/duration/voicing), so
         // the fusion layer sees a real onset-shape signal for 3-onset
@@ -1149,6 +1246,16 @@ export function useAcousticAnalysis(
         s.blockStart = t;
         s.blockZcrAcc = 0;
         s.blockCount = 0;
+        diag("block", {
+          stage: "gap-open",
+          startTime: +t.toFixed(3),
+          rms: +f.rms.toFixed(4),
+          voiceThresh: +voiceThresh.toFixed(4),
+          rmsGate: +(voiceThresh * 0.5).toFixed(4),
+          zcr: +f.zcr.toFixed(3),
+          zcrGate: +(ZCR_TENSION * 0.9).toFixed(3),
+          voiced: f.voiced,
+        });
       }
       s.blockZcrAcc += f.zcr;
       s.blockCount++;
@@ -1156,7 +1263,23 @@ export function useAcousticAnalysis(
       const durMs = (t - s.blockStart) * 1000;
       const avgZcr = s.blockZcrAcc / Math.max(1, s.blockCount);
       const released = f.rms > voiceThresh * BLOCK_RELEASE_RATIO;
-      if (durMs >= BLOCK_MIN_MS && released && avgZcr > ZCR_TENSION) {
+      const durOk = durMs >= BLOCK_MIN_MS;
+      const zcrOk = avgZcr > ZCR_TENSION;
+      diag("block", {
+        stage: "release",
+        startTime: +s.blockStart.toFixed(3),
+        endTime: +t.toFixed(3),
+        durMs: Math.round(durMs),
+        minMs: BLOCK_MIN_MS,
+        avgZcr: +avgZcr.toFixed(3),
+        zcrMin: ZCR_TENSION,
+        released,
+        releaseRatio: BLOCK_RELEASE_RATIO,
+        releaseRms: +f.rms.toFixed(4),
+        releaseGate: +(voiceThresh * BLOCK_RELEASE_RATIO).toFixed(4),
+        emit: durOk && released && zcrOk,
+      });
+      if (durOk && released && zcrOk) {
         const durationSig = Math.min(1, durMs / 600);
         const zcrSig = Math.min(1, avgZcr / 0.5);
         const releaseSig = Math.min(1, f.rms / (voiceThresh * 4));
@@ -1212,14 +1335,43 @@ export function useAcousticAnalysis(
     // CATCH candidates — the fusion layer's fused evidence score decides
     // visibility. Regularity-tuned floors (0.75) made irregular real
     // stutters never emit at all.
-    if (temporal < EMIT_FLOOR) return;
+    if (temporal < EMIT_FLOOR) {
+      diag("emit-drop", {
+        type,
+        startTime: +startTime.toFixed(3),
+        endTime: +endTime.toFixed(3),
+        temporal: +temporal.toFixed(3),
+        floor: EMIT_FLOOR,
+        reason: `temporal ${pct(temporal)} < EMIT_FLOOR ${pct(EMIT_FLOOR)}`,
+      });
+      return;
+    }
 
     // Per-type de-dupe: no two events of the SAME type within 250ms.
     // (Was a global 250ms cooldown that ate real multi-type clusters —
     // a stutter followed by a block 200ms later simply disappeared.)
     const lastForType = s.lastEmitByType[type] ?? 0;
-    if (endTime - lastForType < 0.25) return;
+    if (endTime - lastForType < 0.25) {
+      diag("emit-drop", {
+        type,
+        startTime: +startTime.toFixed(3),
+        endTime: +endTime.toFixed(3),
+        reason: `per-type cooldown — last ${type} at ${lastForType.toFixed(3)}s, need ≥ ${(lastForType + 0.25).toFixed(3)}s`,
+      });
+      return;
+    }
     s.lastEmitByType[type] = endTime;
+
+    diag("emit", {
+      type,
+      startTime: +startTime.toFixed(3),
+      endTime: +endTime.toFixed(3),
+      temporal: +temporal.toFixed(3),
+      acoustic: +acoustic.toFixed(3),
+      ...(voicedSimilarity !== undefined
+        ? { voicedSimilarity: +voicedSimilarity.toFixed(3) }
+        : {}),
+    });
 
     const evt: AcousticEvent = {
       type,
