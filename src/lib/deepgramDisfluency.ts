@@ -304,6 +304,28 @@ export class DeepgramDisfluencyDetector {
     this.lastWordEndMs = null;
   }
 
+  /**
+   * Rebase every internally-tracked timestamp onto a new axis (the shared
+   * session-clock pin event). When the ASR origin lands, the session clock
+   * shifts every provisional timestamp by the same delta
+   * (sessionTime = provisionalTime − shift); the detector's history
+   * (finalized words, interim hypothesis, previous-word end) must move with
+   * it so the sequence rules (C word repetition, D phrase repetition,
+   * F block) keep comparing times on ONE axis.
+   */
+  rebase(deltaMs: number): void {
+    if (deltaMs === 0) return;
+    this.recent = this.recent.map((r) => ({
+      ...r,
+      startMs: r.startMs + deltaMs,
+    }));
+    this.interim = this.interim.map((i) => ({
+      ...i,
+      startMs: i.startMs + deltaMs,
+    }));
+    if (this.lastWordEndMs != null) this.lastWordEndMs += deltaMs;
+  }
+
   private tag(type: DeepgramDisfluencyType): DeepgramDisfluencyTag {
     return { type, confidence: RULE_CONFIDENCE[type] };
   }

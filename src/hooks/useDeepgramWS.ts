@@ -27,7 +27,10 @@
  */
 import { useRef, useCallback, useEffect, useState } from "react";
 import { supabase, SUPABASE_URL } from "../lib/supabase";
-import * as sessionClock from "../lib/sessionClock";
+import {
+  onPin,
+  shiftValue,
+} from "../lib/sessionClock";
 import {
   normalizeLexicalWord,
   DeepgramDisfluencyDetector,
@@ -123,29 +126,65 @@ const SPEAK_SAMPLE_MS = 120;
 let dgUid = 0;
 
 /**
- * Map the closest BOLO acoustic/DSP-lane event overlapping a Deepgram word
- * window to the nearest Deepgram disfluency type. Used ONLY when Deepgram
- * already normalized the phonetic stutter away ("ssssslap" → "slap") so the
- * lexical string carries no evidence — the acoustic lane is the independent
- * physical evidence that the word was disfluent.
+ * Map the closest BOLO acoustic/DSP-lane event to a Deepgram word window to
+ * the nearest Deepgram disfluency type. Used ONLY when Deepgram already
+ * normalized the phonetic stutter away ("ssssslap" → "slap") so the lexical
+ * string carries no evidence — the acoustic lane is the independent physical
+ * evidence that the word was disfluent.
+ *
+ * Three tolerance sources are handled here so corroboration actually fires:
+ *   1. Clock-axis offset    — handled by the pin rebase in the hook (both
+ *      axes aligned); nothing to do here.
+ *   2. ASR word-latency lag — Deepgram word starts land later than the true
+ *      speech time (network + processing), so an acoustic event usually
+ *      ENDS before the word BEGINS. The event is eligible when its window
+ *      OVERLAPS the word OR ends within a small lookbehind of the word
+ *      start (the event is physical evidence for the speech that produced
+ *      this word).
+ *   3. Preserved fragments  — 2-run voiced repetitions ("woh-woh") are the
+ *      most common stutter form; their acoustic event carries the run
+ *      structure. They are mapped to `sound_repetition` exactly like
+ *      classified repetitions/stutters.
  */
 function mapAcousticEvidence(
   events: AcousticEvent[],
   startMs: number,
   endMs: number
 ): DeepgramDisfluencyType | null {
+  // Deepgram word starts lag the true speech time by network + processing;
+  // a corroborating acoustic event typically ends shortly BEFORE the word
+  // start. Allow that lag (the event must still overlap the word window OR
+  // end within this lookbehind of the word start).
+  const ASR_LAG_TOLERANCE_MS = 700;
   let best: AcousticEvent | null = null;
-  let bestOverlapMs = 0;
+  let bestScore = -1;
   const s = startMs / 1000;
   const e = endMs / 1000;
   for (const evt of events) {
+    if (evt.type === "fragment" && !evt.fragmentDetail) continue;
     const ov = Math.max(0, Math.min(e, evt.endTime) - Math.max(s, evt.startTime));
-    if (ov > bestOverlapMs) {
-      bestOverlapMs = ov;
-      best = evt;
+    if (ov > 0) {
+      const score = ov; // strict interval overlap
+      if (score > bestScore) {
+        bestScore = score;
+        best = evt;
+      }
+      continue;
+    }
+    // No overlap — allow the ASR-latency lookbehind: the event's END falls
+    // within [start − tolerance, start). Prefer the event closest to the
+    // word start.
+    const evEnd = evt.endTime;
+    const startS = s;
+    if (evEnd <= startS && startS - evEnd <= ASR_LAG_TOLERANCE_MS / 1000) {
+      const proximity = 1 - (startS - evEnd) / (ASR_LAG_TOLERANCE_MS / 1000);
+      if (proximity > bestScore) {
+        bestScore = proximity;
+        best = evt;
+      }
     }
   }
-  if (!best || bestOverlapMs <= 0) return null;
+  if (!best) return null;
   switch (best.type) {
     case "prolongation":
       return "prolongation";
@@ -175,7 +214,14 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
   const readyRef = useRef(false);
   const finalsRef = useRef<DeepgramFinalWord[]>([]);
   const seenFinalRef = useRef<Set<string>>(new Set());
-  /** Session-relative ms at the moment Deepgram's stream started. */
+  /**
+   * Session-relative ms at the moment Deepgram's stream started, on the
+   * PROVISIONAL axis. Deepgram is treated like every other producer: the
+   * pin event rebases it to the pinned axis (sessionClock.shiftValue()).
+   * Without that rebase the acoustic-event axis shifts away from the
+   * Deepgram-word axis at the pin, and acoustic corroboration (the purple
+   * underline's main evidence source) can never overlap a word.
+   */
   const streamStartMsRef = useRef<number | null>(null);
   /**
    * Persistent, history-aware disfluency detector (ONE per recording
@@ -206,6 +252,24 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
    */
   const acousticEventsRef = useRef<AcousticEvent[]>([]);
   acousticEventsRef.current = options?.acousticEvents ?? [];
+
+  // ── Pin rebase (session-clock origin lands) ──────────────────────────
+  // Deepgram's stream origin was captured on the PROVISIONAL axis; when the
+  // shared clock pins, every provisional timestamp shifts by the same delta.
+  // Rebase the stream origin AND the detector's internal history so both
+  // Deepgram words and acoustic events live on ONE axis thereafter — without
+  // this, the acoustic corroboration (purple underline) can never overlap a
+  // Deepgram word emitted after the pin.
+  useEffect(() => {
+    return onPin(() => {
+      const deltaMs = Math.round(shiftValue() * 1000); // −shift, 0 pre-pin
+      if (deltaMs === 0) return;
+      if (streamStartMsRef.current != null) {
+        streamStartMsRef.current += deltaMs;
+      }
+      detectorRef.current?.rebase(deltaMs);
+    });
+  }, []);
 
   // ── RMS isSpeaking gate (BOLO energy gate, hysteresis) ──────────────
   const sampleSpeaking = useCallback(() => {
