@@ -29,6 +29,11 @@ export interface FragmentRun {
   end: number;
   /** run duration in ms */
   durMs: number;
+  /** Mean F0 of the run (Hz; undefined when no pitch evidence) — backs the
+   *  pitch-contour similarity metric. */
+  meanPitch?: number;
+  /** Peak RMS of the run — backs the energy-envelope consistency metric. */
+  peakRms?: number;
 }
 
 /**
