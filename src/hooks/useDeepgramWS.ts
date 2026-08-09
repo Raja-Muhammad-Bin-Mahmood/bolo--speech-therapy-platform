@@ -30,6 +30,7 @@ import { supabase, SUPABASE_URL } from "../lib/supabase";
 import {
   onPin,
   shiftValue,
+  now as sessionClockNow,
 } from "../lib/sessionClock";
 import {
   normalizeLexicalWord,
@@ -93,6 +94,7 @@ const DG_WS_URL = "wss://api.deepgram.com/v1/listen";
 const DG_QUERY = [
   "model=nova-2",
   "language=en-US",
+  "smart_format=true",
   "filler_words=true",
   "interim_results=true",
   "punctuate=true",
@@ -190,9 +192,12 @@ function mapAcousticEvidence(
       return "prolongation";
     case "block":
       return "block";
+    case "stammer":
+      // A STAMMER is a SUSTAINED fricative hold ("ssssssslap" = a long /s/),
+      // not a bursty repetition — the acoustic equivalent of a prolongation.
+      return "prolongation";
     case "repetition":
     case "stutter":
-    case "stammer":
     case "fragment":
       return "sound_repetition";
     default:
@@ -385,6 +390,8 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
 
           const words: {
             word?: string;
+            /** smart_format=true: the punctuated display form ("Hello."). */
+            punctuated_word?: string;
             start?: number;
             end?: number;
             confidence?: number;
@@ -396,8 +403,14 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
             // FINAL → disfluency detection → PERMANENT token (fluent too —
             // Deepgram is the PRIMARY transcript source).
             for (const w of words) {
+              // KEEP BOTH VALUES (spec): the RAW Deepgram word (which may
+              // preserve phonetic stutter spelling "ssssslap") AND the
+              // normalized display form ("slap"). The detector inspects
+              // rawWord; the transcript renders word. punctuated_word
+              // (smart_format=true) is preserved for display when present.
               const raw = (w.word ?? "").trim();
               if (!raw) continue;
+              const punctuated = (w.punctuated_word ?? "").trim() || raw;
               const startMs = Math.round(base + (w.start ?? 0) * 1000);
               const endMs = Math.max(
                 startMs + 1,
@@ -416,8 +429,9 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
               const norm = normalizeLexicalWord(raw)
                 .toLowerCase()
                 .replace(/[^a-z0-9']/g, "");
+              const displayWord = normalizeLexicalWord(raw);
               const wordToken = {
-                word: w.word ?? raw,
+                word: displayWord,
                 normalizedWord: norm,
                 rawWord: raw,
                 startTimeMs: startMs,
@@ -442,13 +456,35 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
               const tag = processed.disfluency;
               const type = tag?.type;
 
-              console.debug(
-                `[DEEPGRAM] raw="${raw}" → word="${processed.token.word}" norm="${norm}" | [DETECTOR] rule=${processed.rule} type=${type ?? "none"} conf=${tag?.confidence ?? 0} | [TRANSCRIPT] isDisfluency=${tag != null} | [RENDERER] underline=${tag != null}`
+              // ── MANDATORY DEBUG TRACE (spec: "ssssslap" test) ─────────
+              // Log the FULL 13-point path so a miss is diagnosable without
+              // guessing: raw → punctuated → normalized → timing →
+              // confidence → WordToken → rules evaluated → matched rule →
+              // verdict → TranscriptToken → isDisfluency → renderer.
+              console.info(
+                `[DG·TRACE] raw="${raw}" punctuated="${punctuated}" norm="${norm}"` +
+                  ` start=${startMs}ms end=${endMs}ms conf=${conf.toFixed(3)}` +
+                  ` | WordToken=${JSON.stringify({
+                    word: wordToken.word,
+                    normalizedWord: wordToken.normalizedWord,
+                    rawWord: wordToken.rawWord,
+                    startTimeMs: wordToken.startTimeMs,
+                    endTimeMs: wordToken.endTimeMs,
+                    confidence: wordToken.confidence,
+                    source: wordToken.source,
+                    isFinal: wordToken.isFinal,
+                  })}` +
+                  ` | acousticEvidence=${processed.acousticEvidence ?? "none"}` +
+                  ` | rulesEvaluated=${processed.evaluated.join(",") || "none"}` +
+                  ` | matchedRule=${processed.rule}` +
+                  ` | verdict=${type ?? "FLUENT"}` +
+                  ` | isDisfluency=${tag != null}` +
+                  ` | rendererUnderline=${tag != null}`
               );
 
               const final: DeepgramFinalWord = {
                 id: `dg-${Date.now().toString(36)}-${(dgUid++).toString(36)}`,
-                word: normalizeLexicalWord(raw),
+                word: displayWord,
                 rawWord: raw,
                 startTimeMs: startMs,
                 endTimeMs: endMs,
@@ -527,8 +563,11 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
     // Pin Deepgram's stream origin to the shared session clock on the FIRST
     // audio buffer. Both providers consume the same PCM from the same
     // instant, so Deepgram word times now live on the BOLO session timeline.
+    // The origin is captured on the PROVISIONAL axis and rebased onto the
+    // pinned axis when the session clock pins (onPin listener above) — so
+    // Deepgram words and acoustic events always share ONE timeline.
     if (streamStartMsRef.current == null) {
-      const now = sessionClock.now();
+      const now = sessionClockNow();
       streamStartMsRef.current = now != null ? now * 1000 : 0;
     }
     ws.send(toPcm16(buffer));

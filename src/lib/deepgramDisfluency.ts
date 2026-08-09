@@ -216,6 +216,21 @@ export interface DeepgramProcessedToken {
   disfluency: DeepgramDisfluencyTag | null;
   /** Rule family that produced the tag ("none" when fluent). Debug only. */
   rule: DeepgramDisfluencyType | "none";
+  /**
+   * Every rule family evaluated for this token, IN ORDER (A sound
+   * repetition + B prolongation + filler are grouped as the raw-spelling
+   * pass; then C word repetition, D phrase repetition, E revision, F
+   * block, then acoustic corroboration). Trace/debug only — the LIVE
+   * TRANSCRIPT renderer never reads this.
+   */
+  evaluated: DeepgramDisfluencyType[];
+  /**
+   * The BOLO acoustic/DSP-lane evidence mapped for this token (echo of the
+   * `ctx.acousticEvidence` input; null when the pool had nothing in
+   * tolerance). Lets the trace log show exactly what acoustic evidence
+   * existed when no lexical/timing rule matched.
+   */
+  acousticEvidence: DeepgramDisfluencyType | null;
 }
 
 export interface DeepgramDetectorContext {
@@ -419,30 +434,61 @@ export class DeepgramDisfluencyDetector {
     ctx?: DeepgramDetectorContext
   ): DeepgramProcessedToken {
     const raw = token.rawWord ?? token.word;
-    let disfluency = this.classifyRaw(raw); // A + B + filler (raw evidence)
-    let rule: DeepgramDisfluencyType | "none" =
-      disfluency?.type ?? "none";
+    const evaluated: DeepgramDisfluencyType[] = [];
+    let disfluency: DeepgramDisfluencyTag | null = null;
+    let rule: DeepgramDisfluencyType | "none" = "none";
 
-    if (!disfluency && this.wordRepetition(token)) {
-      disfluency = this.tag("word_repetition"); // C
-      rule = "word_repetition";
+    // A + B + filler: single-token rules on RAW evidence. Detection runs on
+    // the raw form FIRST — normalization happens later, so lexical
+    // normalization never destroys "b-b-ball" / "ssssslap" evidence.
+    disfluency = this.classifyRaw(raw);
+    if (disfluency) {
+      rule = disfluency.type;
+    } else {
+      // Record that the raw-spelling pass evaluated (and did NOT match) —
+      // the trace log needs to show WHY a normalized word wasn't flagged.
+      evaluated.push("sound_repetition", "prolongation", "filler");
     }
-    if (!disfluency && this.phraseRepetition(token)) {
-      disfluency = this.tag("phrase_repetition"); // D
-      rule = "phrase_repetition";
+
+    // C. Word repetition — consecutive identical normalized finals.
+    if (!disfluency) {
+      evaluated.push("word_repetition");
+      if (this.wordRepetition(token)) {
+        disfluency = this.tag("word_repetition");
+        rule = "word_repetition";
+      }
     }
-    if (!disfluency && this.revision(token)) {
-      disfluency = this.tag("revision"); // E
-      rule = "revision";
+    // D. Phrase repetition — a 2–3 word sequence that occurred earlier.
+    if (!disfluency) {
+      evaluated.push("phrase_repetition");
+      if (this.phraseRepetition(token)) {
+        disfluency = this.tag("phrase_repetition");
+        rule = "phrase_repetition";
+      }
     }
-    if (!disfluency && this.block(token)) {
-      disfluency = this.tag("block"); // F (timing + speaking gate)
-      rule = "block";
+    // E. Revision — an interim word occupied this interval with a DIFFERENT
+    //    lexical form (the speaker abandoned/restarted the word).
+    if (!disfluency) {
+      evaluated.push("revision");
+      if (this.revision(token)) {
+        disfluency = this.tag("revision");
+        rule = "revision";
+      }
+    }
+    // F. Block — Deepgram word-timing gap gated by the BOLO RMS/isSpeaking
+    //    gate so ordinary silence is NOT a block.
+    if (!disfluency) {
+      evaluated.push("block");
+      if (this.block(token)) {
+        disfluency = this.tag("block");
+        rule = "block";
+      }
     }
     // Acoustic/DSP corroboration: Deepgram already normalized the phonetic
     // spelling away ("ssssslap" → "slap") — the BOLO acoustic lane carries
     // the evidence the lexical string no longer does.
     if (!disfluency && ctx?.acousticEvidence) {
+      evaluated.push(ctx.acousticEvidence);
       disfluency = this.tag(ctx.acousticEvidence);
       rule = ctx.acousticEvidence;
     }
@@ -456,6 +502,12 @@ export class DeepgramDisfluencyDetector {
     ].slice(-60);
     this.lastWordEndMs = token.endTimeMs;
 
-    return { token, disfluency, rule };
+    return {
+      token,
+      disfluency,
+      rule,
+      evaluated,
+      acousticEvidence: ctx?.acousticEvidence ?? null,
+    };
   }
 }
