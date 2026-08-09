@@ -125,6 +125,8 @@ export function buildStutterPrefix(
       return sound ? `${sound}-${sound}-${sound}-` : "b-b-b-";
     case "block":
       return "…"; // silent onset — a marker, never a made-up sound
+    case "fragment":
+      return undefined; // preserved candidate — no fabricated stutter prefix
     default:
       return undefined;
   }
@@ -141,6 +143,8 @@ export function placeholderFor(type: AcousticEventType): string {
       return "[blocked onset]";
     case "repetition":
       return "[repeated onset]";
+    case "fragment":
+      return "[short fragment]"; // preserved candidate — never a confirmed label
     default:
       return "[unrecognized stutter]";
   }

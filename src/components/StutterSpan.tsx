@@ -32,6 +32,7 @@ const BADGE_COLORS: Record<AcousticEventType, string> = {
   prolongation: "#F9A8D4",
   stutter: "#F87171",
   stammer: "#BD8CFF",
+  fragment: "#A3A3B5",
 };
 
 /** Label shown on the badge (structured marker, never phonetic text). */
@@ -41,6 +42,7 @@ const BADGE_LABELS: Record<AcousticEventType, string> = {
   prolongation: "Prolong",
   stutter: "Stutter",
   stammer: "Stammer",
+  fragment: "Fragment",
 };
 
 interface StutterSpanProps {

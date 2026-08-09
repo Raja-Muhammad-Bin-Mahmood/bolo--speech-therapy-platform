@@ -65,6 +65,7 @@ const ACOUSTIC_LABELS: Record<AcousticEventType, string> = {
   prolongation: "Prolong",
   stutter: "Stutter",
   stammer: "Stammer",
+  fragment: "Fragment",
 };
 
 const ACOUSTIC_COLORS: Record<AcousticEventType, string> = {
@@ -73,6 +74,7 @@ const ACOUSTIC_COLORS: Record<AcousticEventType, string> = {
   prolongation: "#F9A8D4",
   stutter: "#F87171",
   stammer: "#BD8CFF",
+  fragment: "#A3A3B5",
 };
 
 interface TickerItem {

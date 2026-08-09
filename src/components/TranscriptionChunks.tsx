@@ -161,6 +161,7 @@ const TAG_STYLES: Record<DisfluencyTag, string> = {
   prolongation: "text-pink-300/90 bg-pink-400/10",
   stutter: "text-red-300/90 bg-red-500/10",
   stammer: "text-[#BD8CFF]/90 bg-[#BD8CFF]/10",
+  fragment: "text-[#A3A3B5]/90 bg-[#A3A3B5]/10",
 };
 
 const PAUSE_LABELS: Record<PauseEvent["type"], string> = {

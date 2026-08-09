@@ -164,6 +164,19 @@ export function evaluateInterruptionGate(
   const sustained = type === "prolongation";
   const stammerHold = type === "stammer";
   const onsetBlock = type === "block" || type === "tense_block";
+  // Phase 1 — preserved short-fragment candidate: pre-classification, NOT a
+  // stutter/repetition verdict. It is hard-rejected here so it never enters
+  // the event engine's hold window / fallback ASR machinery in this phase.
+  // Phase 2 (classification) will decide the verdict and let it through.
+  const preservedFragment = type === "fragment";
+  if (preservedFragment) {
+    return {
+      passed: false,
+      signals: [],
+      rejectionReason:
+        "Preserved short-fragment candidate — pre-classification (Phase 1), not yet classified",
+    };
+  }
 
   // 2) Repeated onset — the event itself is a cluster of ≥3 fragments with
   //    micro-gaps ("b-b-b-ball"). A pattern that spans several finalized

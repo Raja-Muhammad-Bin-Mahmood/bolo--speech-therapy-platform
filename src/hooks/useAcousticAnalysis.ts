@@ -8,7 +8,62 @@ export type AcousticEventType =
   | "repetition"
   | "prolongation"
   | "stutter"
-  | "stammer";
+  | "stammer"
+  /**
+   * PRESERVED SHORT-FRAGMENT CANDIDATE (Phase 1 — pre-classification).
+   * A 2-iteration voiced pattern ("woh-woh") sits below the repetition
+   * classifier's 3-onset floor (REP_MIN_ONSETS) and was previously
+   * structurally incapable of becoming ANY event. It is preserved as a
+   * low-confidence `fragment` candidate with its full run/onset/gap
+   * structure in `fragmentDetail`, so a LATER classification stage can
+   * decide "short repetition" vs "fluent speech". It is deliberately NOT
+   * a repetition/stutter: `confidence` stays below every downstream
+   * classification band and the event carries structure, not a verdict.
+   */
+  | "fragment";
+
+/** One short voiced run inside a preserved fragment. */
+export interface FragmentRun {
+  /** seconds since recording start (session clock) */
+  start: number;
+  end: number;
+  /** run duration in ms */
+  durMs: number;
+}
+
+/**
+ * Structural detail of a preserved short-fragment candidate — everything a
+ * later classifier needs to distinguish a short repetition from ordinary
+ * fluent speech. Purely additive metadata (only present when type ===
+ * "fragment"); no consumer depends on it in this phase.
+ */
+export interface FragmentDetail {
+  /** Number of separate brief voiced runs (2 in this phase). */
+  runCount: number;
+  /** Each brief voiced run with its own timing. */
+  runs: FragmentRun[];
+  /** Onset timestamps (session clock, seconds) — one per run. */
+  onsets: number[];
+  /** Onset-to-onset gaps in ms (the existing repetition classifier's metric). */
+  onsetGapsMs: number[];
+  /** End-of-run → start-of-next-run gaps in ms (physical inter-run silence). */
+  interRunGapsMs: number[];
+  /** Detector-A acoustic evidence accumulated over the fragment window. */
+  evidence: {
+    /** Peak RMS across the window (0..1). */
+    maxRms: number;
+    /** Peak ZCR across the window (0..1) — tension cue. */
+    maxZcr: number;
+    /** Mean spectral centroid across the window (Hz) — phoneme-ish shape. */
+    meanCentroid: number;
+    /** Mean spectral flatness across the window (0..1). */
+    meanFlatness: number;
+    /** A high-ZCR (tension) frame was observed — mirrors the repetition path's zcrAgree. */
+    zcrTension: boolean;
+    /** Temporal regularity proxy (0..1) — same formula as the repetition path. */
+    regularity: number;
+  };
+}
 
 export interface AcousticEvent {
   type: AcousticEventType;
@@ -20,6 +75,13 @@ export interface AcousticEvent {
   confidence: number;
   /** 0..1 — raw feature-magnitude certainty (separate evidence source) */
   acoustic: number;
+  /**
+   * Preserved-fragment structure (only when type === "fragment"). Carries
+   * run/onset/gap timing + acoustic evidence so a later classifier can
+   * judge the candidate. Additive — never read by this phase's consumers
+   * beyond carrying it through the shared merge/feed/review pipeline.
+   */
+  fragmentDetail?: FragmentDetail;
   /** Which detector lane produced this event (A = worklet/Meyda analysis,
    *  B = RMS/ZCR/ΔEnergy sensor, or BOTH after the shared merge deduped a
    *  same-type event). Used by the fusion layer for cross-detector
@@ -174,6 +236,17 @@ export function useAcousticAnalysis(
     // Repetition / fast-restart onset tracker
     onsets: [] as number[],
     voicingOnRuns: [] as { start: number; end: number }[],
+
+    // Preserved short-fragment candidate (Phase 1 — pre-classification).
+    // Armed when a 2nd brief voiced run appears inside the repetition gap
+    // window; finalized once no 3rd in-range onset can arrive. A 2-run
+    // pattern ("woh-woh") can never reach REP_MIN_ONSETS=3, so without this
+    // it is discarded with zero trace. Holds REFERENCES to the live run
+    // objects (voicingOnRuns entries are mutated in place as runs extend).
+    pendingFragment: null as {
+      run1: { start: number; end: number };
+      run2: { start: number; end: number };
+    } | null,
 
     // Block tracker
     blockStart: 0,
@@ -485,7 +558,8 @@ export function useAcousticAnalysis(
     s.prevFric = fricative;
 
     // ── 2) Onset detection + Repetition (voiced rising edge) ──────
-    if (f.voiced && !s.prevVoiced) {
+    const onset = f.voiced && !s.prevVoiced;
+    if (onset) {
       s.onsets.push(t);
       s.voicingOnRuns.push({ start: t, end: t });
       s.onsets = s.onsets.filter((o) => t - o <= FAST_RESTART_MAX + 0.05);
@@ -498,6 +572,110 @@ export function useAcousticAnalysis(
     if (f.voiced && s.voicingOnRuns.length > 0) {
       const lastRun = s.voicingOnRuns[s.voicingOnRuns.length - 1];
       lastRun.end = t;
+    }
+
+    // ── Preserved short-fragment candidate (Phase 1 — pre-classification).
+    //    A 2-iteration voiced pattern ("woh-woh") sits below the repetition
+    //    classifier's 3-onset floor and was previously discarded with zero
+    //    trace. The moment a SECOND brief voiced run appears inside the
+    //    repetition gap window, arm a candidate; finalize it as a
+    //    low-confidence `fragment` once no 3rd in-range onset can arrive.
+    //    It is deliberately NOT classified (never a repetition/stutter) —
+    //    `fragmentDetail` carries the structure a later stage judges.
+    if (
+      s.pendingFragment &&
+      (onset || t - s.pendingFragment.run2.start >= REP_GAP_MAX)
+    ) {
+      // A 3rd onset just arrived in range → the repetition classifier owns
+      // this cluster; drop the pending fragment (no double counting).
+      if (onset && t - s.pendingFragment.run2.start <= REP_GAP_MAX) {
+        s.pendingFragment = null;
+      } else {
+        // No 3rd in-range onset can arrive — finalize the 2-run candidate.
+        const p = s.pendingFragment;
+        s.pendingFragment = null;
+
+        // Re-validate the existing conditions on the FINAL run boundaries
+        // (the run objects are live — their end times have since extended).
+        const firstRun = p.run1;
+        const secondRun = p.run2;
+        if (
+          (secondRun.start - firstRun.end) * 1000 >= REP_GAP_MIN &&
+          (secondRun.start - firstRun.end) * 1000 <= REP_GAP_MAX &&
+          (firstRun.end - firstRun.start) * 1000 <= REP_VOICED_RUN_MAX_MS &&
+          (secondRun.end - secondRun.start) * 1000 <= REP_VOICED_RUN_MAX_MS
+        ) {
+          const windowFrames = ringRef.current.filter(
+            (fr) => fr.t >= p.run1.start && fr.t <= t
+          );
+          const maxRms = windowFrames.reduce(
+            (m, fr) => Math.max(m, fr.rms),
+            0
+          );
+          const maxZcr = windowFrames.reduce(
+            (m, fr) => Math.max(m, fr.zcr),
+            0
+          );
+          const centroidSum = windowFrames.reduce(
+            (acc, fr) => acc + fr.centroid,
+            0
+          );
+          const flatnessSum = windowFrames.reduce(
+            (acc, fr) => acc + fr.flatness,
+            0
+          );
+          const onsetGap = secondRun.start - firstRun.start;
+          const avgGap = onsetGap;
+          const regularity = 1 - Math.min(1, Math.abs(avgGap - 0.165) / 0.1);
+          const zcrAgree = windowFrames.some((fr) => fr.zcr > ZCR_TENSION);
+
+          emitFragment({
+            startTime: firstRun.start,
+            endTime: secondRun.end,
+            runCount: 2,
+            runs: [
+              { start: firstRun.start, end: firstRun.end, durMs: Math.round((firstRun.end - firstRun.start) * 1000) },
+              { start: secondRun.start, end: secondRun.end, durMs: Math.round((secondRun.end - secondRun.start) * 1000) },
+            ],
+            onsets: [firstRun.start, secondRun.start],
+            onsetGapsMs: [Math.round(onsetGap * 1000)],
+            interRunGapsMs: [Math.round((secondRun.start - firstRun.end) * 1000)],
+            evidence: {
+              maxRms,
+              maxZcr,
+              meanCentroid:
+                windowFrames.length > 0 ? centroidSum / windowFrames.length : 0,
+              meanFlatness:
+                windowFrames.length > 0 ? flatnessSum / windowFrames.length : 0,
+              zcrTension: zcrAgree,
+              regularity: Math.max(0, Math.min(1, regularity)),
+            },
+          });
+        }
+      }
+    }
+
+    // ── Arm the candidate when a 2nd brief voiced run appears inside the
+    //    repetition gap window (only Detector A; Detector B is untouched).
+    if (
+      onset &&
+      !s.pendingFragment &&
+      s.voicingOnRuns.length >= 2 &&
+      s.lastStutterEnd + STUTTER_OVERLAP_COOLDOWN_S <
+        s.voicingOnRuns[s.voicingOnRuns.length - 2].start
+    ) {
+      const firstRun = s.voicingOnRuns[s.voicingOnRuns.length - 2];
+      const secondRun = s.voicingOnRuns[s.voicingOnRuns.length - 1];
+      const run1Brief =
+        firstRun.end >= firstRun.start &&
+        (firstRun.end - firstRun.start) * 1000 <= REP_VOICED_RUN_MAX_MS;
+      if (
+        run1Brief &&
+        secondRun.start - firstRun.end >= REP_GAP_MIN &&
+        secondRun.start - firstRun.end <= REP_GAP_MAX
+      ) {
+        s.pendingFragment = { run1: firstRun, run2: secondRun };
+      }
     }
 
     // Repetition: ≥3 onsets spaced 80–250ms apart, brief runs. The stutter
@@ -517,6 +695,8 @@ export function useAcousticAnalysis(
       const noStutterOverlap = s.onsets[0] > s.lastStutterEnd + STUTTER_OVERLAP_COOLDOWN_S;
 
       if (allInRange && runsBrief && noStutterOverlap) {
+        // A confirmed ≥3-onset repetition subsumes the 2-run candidate.
+        s.pendingFragment = null;
         const avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
         const regularity = 1 - Math.min(1, Math.abs(avgGap - 0.165) / 0.1);
         const zcrAgree = ringRef.current.some(
@@ -627,6 +807,51 @@ export function useAcousticAnalysis(
     setEvents(eventsRef.current);
   }
 
+  /**
+   * Emit a PRESERVED short-fragment candidate. Unlike `emitEvent`, this
+   * intentionally BYPASSES the 0.60 emission floor — a preserved candidate
+   * must survive even at low confidence (it is pre-classification evidence,
+   * not a verdict). Confidence is capped at 0.40 so it can never cross any
+   * downstream classification/visibility band (fusion floor 0.70, script
+   * matcher 0.75, interruption gate pass floor). `fragmentDetail` carries
+   * the full structure a later classification stage judges.
+   */
+  function emitFragment(input: {
+    startTime: number;
+    endTime: number;
+    runCount: number;
+    runs: FragmentRun[];
+    onsets: number[];
+    onsetGapsMs: number[];
+    interRunGapsMs: number[];
+    evidence: FragmentDetail["evidence"];
+  }) {
+    const s = stateRef.current;
+    const lastForType = s.lastEmitByType.fragment ?? 0;
+    if (input.endTime - lastForType < 0.25) return;
+    s.lastEmitByType.fragment = input.endTime;
+
+    const evt: AcousticEvent = {
+      type: "fragment",
+      startTime: input.startTime,
+      endTime: input.endTime,
+      durationMs: Math.round((input.endTime - input.startTime) * 1000),
+      confidence: 0.4, // deliberately below every classification band
+      acoustic: 0.4,
+      fragmentDetail: {
+        runCount: input.runCount,
+        runs: input.runs,
+        onsets: input.onsets,
+        onsetGapsMs: input.onsetGapsMs,
+        interRunGapsMs: input.interRunGapsMs,
+        evidence: input.evidence,
+      },
+      source: "acoustic",
+    };
+    eventsRef.current = [...eventsRef.current, evt];
+    setEvents(eventsRef.current);
+  }
+
   const rafRef = useRef(0);
 
   useEffect(() => {
@@ -641,6 +866,7 @@ export function useAcousticAnalysis(
         prevVoiced: false,
         onsets: [],
         voicingOnRuns: [],
+        pendingFragment: null,
         blockStart: 0,
         blockZcrAcc: 0,
         blockCount: 0,

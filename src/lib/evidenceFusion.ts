@@ -479,6 +479,7 @@ const MISSION_MAP: Record<AcousticEventType, RefinedEventType> = {
   block: "block",
   stutter: "repetition", // repeated onset shape (s-s-s-)
   stammer: "prolongation", // sustained sound (ssssss)
+  fragment: "uncertain", // preserved candidate — pre-classification, never a verdict
 };
 
 function refineType(evt: AcousticEvent, band: EvidenceBand): RefinedEventType {
