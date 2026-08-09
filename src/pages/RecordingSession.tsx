@@ -38,6 +38,8 @@ import TelemetryPanel from "../components/TelemetryPanel";
 import { useAudioCapture } from "../hooks/useAudioCapture";
 import { useAnalyserSensor } from "../hooks/useAnalyserSensor";
 import { useSpeechmaticsWS } from "../hooks/useSpeechmaticsWS";
+import { useDeepgramWS } from "../hooks/useDeepgramWS";
+import { useTranscriptReconciler } from "../hooks/useTranscriptReconciler";
 import {
   useAcousticAnalysis,
   type AcousticEventType,
@@ -110,6 +112,7 @@ export default function RecordingSession() {
   // ── Detection pipeline ──────────────────────────────────────────────
   const audio = useAudioCapture();
   const ws = useSpeechmaticsWS();
+  const dg = useDeepgramWS();
   const acoustic = useAcousticAnalysis(audio.getAnalyser, isRecording);
   // RMS / ZCR / ΔEnergy lane — same shared analyser, drives stutter/stammer
   const sensor = useAnalyserSensor(audio.getAnalyser, isRecording);
@@ -139,8 +142,29 @@ export default function RecordingSession() {
     events: allAcoustic,
   });
   // Speechmatics word keys the engine recovered locally first (hidden in the
-  // transcript so a word never renders twice).
-  const duplicateKeys = useMemo(() => recovery.duplicateKeys, [recovery.duplicateKeys]);
+  // transcript so a word never renders twice). Unioned with the Deepgram
+  // reconciler's hidden keys below.
+  const recoveryDuplicateKeys = useMemo(
+    () => recovery.duplicateKeys,
+    [recovery.duplicateKeys]
+  );
+
+  // ── Secondary real-time disfluency/lexical source (Deepgram) ───────
+  // Consumes the SAME PCM the Speechmatics socket consumes (no second mic
+  // stream). Final disfluency tokens fast-track into the live transcript
+  // via the temporal reconciler; Speechmatics stays the primary source.
+  const reconciler = useTranscriptReconciler({
+    active: isRecording && ws.status === "connected",
+    transcripts: ws.transcripts,
+    deepgramFinals: dg.finals,
+  });
+  // Speechmatics word keys the Deepgram lane replaced — unioned with the
+  // recovery engine's keys so nothing renders twice.
+  const mergedDuplicateKeys = useMemo(() => {
+    const merged = new Set(recoveryDuplicateKeys);
+    for (const k of reconciler.hiddenSpeechmaticsKeys) merged.add(k);
+    return merged;
+  }, [recoveryDuplicateKeys, reconciler.hiddenSpeechmaticsKeys]);
 
   // Existing detector events in the Detection Feed vocabulary — the same
   // list the Detection Feed renders, mapped onto finalized transcript words.
@@ -213,10 +237,14 @@ export default function RecordingSession() {
     return items.sort((a, b) => a.t - b.t).slice(-16).reverse();
   }, [allAcoustic, analysis.pauseEvents]);
 
-  // Wire PCM → Speechmatics
+  // Wire PCM → Speechmatics (+ the SAME audio → Deepgram; both lanes share
+  // the one microphone stream and the one session clock).
   useEffect(() => {
-    audio.setOnAudioData(ws.sendAudio);
-  }, [audio, ws.sendAudio]);
+    audio.setOnAudioData((buf) => {
+      ws.sendAudio(buf);
+      dg.sendAudio(buf);
+    });
+  }, [audio, ws.sendAudio, dg.sendAudio]);
 
   // Pin the stutter clock the moment Speechmatics confirms it's ready
   useEffect(() => {
@@ -236,6 +264,7 @@ export default function RecordingSession() {
     return () => {
       audio.stop();
       ws.disconnect();
+      dg.disconnect();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -262,6 +291,7 @@ export default function RecordingSession() {
       setIsRecording(true);
       audio.start();
       ws.connect();
+      dg.connect();
       diagBanner("SESSION START — recording", {
         topic,
         ts: new Date().toISOString(),
@@ -676,7 +706,8 @@ export default function RecordingSession() {
                   pauseEvents={analysis.pauseEvents}
                   events={gatedFeedForTranscript}
                   recovered={gatedRecovered}
-                  duplicateKeys={duplicateKeys}
+                  duplicateKeys={mergedDuplicateKeys}
+                  deepgramTokens={reconciler.tokens}
                   pending={recovery.pending}
                 />
               </div>
