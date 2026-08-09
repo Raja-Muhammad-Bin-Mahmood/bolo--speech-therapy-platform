@@ -1,6 +1,7 @@
 import { useRef, useCallback, useEffect, useState } from "react";
 import type { StutterCandidate, TimelineFrame } from "../lib/stutterTypes";
 import { TimelineEngine } from "../lib/timelineEngine";
+import * as sessionClock from "../lib/sessionClock";
 
 interface AudioCaptureState {
   level: number; // 0–1 normalized RMS
@@ -63,20 +64,15 @@ export function useAudioCapture() {
   // Raw PCM tap for the recovery ring buffer (worklet clock, same stream
   // that feeds Speechmatics — so timestamps share one clock).
   const onPcmRef = useRef<((msg: { t: number; buffer: Float32Array }) => void) | null>(null);
-  // Worklet-clock anchor: (workletT, wallNow) of the most recent message,
-  // used to extrapolate a smooth "now" on the worklet/stream clock.
-  const clockAnchorRef = useRef<{ workletT: number; wallNow: number } | null>(null);
 
   // ── Timeline Engine (main-thread pattern detector) ─────────────────────
   const timelineEngineRef = useRef<TimelineEngine | null>(null);
   const timelineEventsRef = useRef<StutterCandidate[]>([]);
 
-  // ── Stutter clock alignment ──────────────────────────────────────────
-  // asrT0 = worklet-relative time when the first PCM chunk was forwarded
-  // after the page signalled readiness. All candidate timestamps are
-  // shifted by this value to produce session-relative time.
-  const asrT0Ref = useRef<number | null>(null);
-  const pinPendingRef = useRef(false);
+  // ── Session clock (SINGLE shared timeline — see lib/sessionClock.ts) ──
+  // All worklet anchors, the ASR pin and stream-time reads now live in the
+  // module; this hook only forwards worklet messages to it. No second
+  // clock exists in the app.
   const pendingCandidatesRaw = useRef<
     { evt: StutterCandidate; rawStart: number }[]
   >([]);
@@ -85,6 +81,11 @@ export function useAudioCapture() {
   // ── Start ──────────────────────────────────────────────────────────
   const start = useCallback(async () => {
     try {
+      // Begin the shared session clock (provisional phase — the origin is
+      // pinned when Speechmatics is ready). All detectors timestamp against
+      // this single timeline.
+      sessionClock.start();
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
@@ -212,34 +213,20 @@ export function useAudioCapture() {
   });
 
   self.current._handlePcmMessage = (msg: { t: number; buffer: Float32Array }) => {
-    // Anchor the worklet clock for the shared-stream-time extrapolator
-    clockAnchorRef.current = { workletT: msg.t, wallNow: performance.now() };
+    // Anchor the worklet clock — the shared session clock extrapolates its
+    // smooth "now" from these anchors (single timeline, lib/sessionClock).
+    sessionClock.anchor(msg.t);
+
+    // Pin session t=0 on the FIRST PCM after the page signalled ASR-ready.
+    // The module applies ONE deterministic shift to all provisional
+    // timestamps; worklet time is the pinned origin everywhere after this.
+    if (sessionClock.isPinPending()) {
+      sessionClock.pin();
+    }
 
     // Tap raw PCM for the recovery ring buffer (before the ASR forward)
     if (onPcmRef.current) {
       onPcmRef.current({ t: msg.t, buffer: new Float32Array(msg.buffer) });
-    }
-
-    // Pin clock on first PCM after pinClock() was called
-    if (pinPendingRef.current) {
-      asrT0Ref.current = msg.t;
-      pinPendingRef.current = false;
-
-      // Flush pending candidates that arrived before alignment
-      const raw = pendingCandidatesRaw.current;
-      const asrT0 = asrT0Ref.current;
-      for (const r of raw) {
-        const sessionStart = r.rawStart - asrT0;
-        if (sessionStart >= 0) {
-          candidatesRef.current.push({
-            ...r.evt,
-            startTime: sessionStart,
-            endTime: r.evt.endTime - asrT0,
-          });
-        }
-      }
-      pendingCandidatesRaw.current = [];
-      setState((prev) => ({ ...prev, stutterCandidates: [...candidatesRef.current] }));
     }
 
     // Forward PCM to the Speechmatics callback
@@ -250,7 +237,7 @@ export function useAudioCapture() {
 
   self.current._handleFrameMessage = (frame: TimelineFrame) => {
     // Frames arrive every ~10ms — a finer anchor for the stream clock
-    clockAnchorRef.current = { workletT: frame.t, wallNow: performance.now() };
+    sessionClock.anchor(frame.t);
 
     // Update live frame state for UI
     setState((prev) => ({ ...prev, latestFrame: frame }));
@@ -258,15 +245,15 @@ export function useAudioCapture() {
     // Feed frame into the timeline engine for pattern detection
     const engine = timelineEngineRef.current;
     if (engine) {
-      const asrT0 = asrT0Ref.current;
-      if (asrT0 !== null) {
-        // Convert worklet timestamp to session-relative time
-        const sessionT = frame.t - asrT0;
-        if (sessionT >= 0) {
-          engine.pushFrame({ ...frame, t: sessionT });
-        }
+      // Convert the worklet timestamp onto the SHARED session clock. The
+      // module owns the worklet→session mapping (single origin); the
+      // engine only ever sees session-relative time.
+      const sessionT = sessionClock.toWorkletSession(frame.t);
+      if (sessionT != null) {
+        if (sessionT >= 0) engine.pushFrame({ ...frame, t: sessionT });
       } else {
-        // Clock not pinned yet — feed raw timestamp, engine uses relative offsets
+        // Clock not pinned yet — feed raw timestamp, engine uses relative
+        // offsets until the origin is known.
         engine.pushFrame(frame);
       }
     }
@@ -275,8 +262,7 @@ export function useAudioCapture() {
   // ── Pin clock to ASR-ready moment ─────────────────────────────────
   // Called by the page (e.g. RecordingSession) when ws.status becomes "connected".
   const pinClock = useCallback(() => {
-    if (asrT0Ref.current !== null) return; // already pinned
-    pinPendingRef.current = true;
+    sessionClock.requestPin();
   }, []);
 
   const setOnAudioData = useCallback(
@@ -296,23 +282,18 @@ export function useAudioCapture() {
 
   /**
    * Shared session clock: current time on the SAME timeline Speechmatics
-   * word timestamps use (worklet clock − ASR pin offset). Returns null until
-   * the clock is pinned (Speechmatics connected) — callers fall back to a
-   * wall-clock base until then. The value is smooth (extrapolated from the
-   * latest worklet anchor), so the detector's hop gating is unaffected.
+   * word timestamps use (worklet clock − ASR pin offset). The single
+   * implementation lives in lib/sessionClock — this is just the hook's
+   * stable handle for pages that need a "now" (smooth, extrapolated from
+   * the latest worklet anchor).
    */
   const getStreamTime = useCallback((): number | null => {
-    const anchor = clockAnchorRef.current;
-    const asrT0 = asrT0Ref.current;
-    if (!anchor || asrT0 === null) return null;
-    const estWorklet = anchor.workletT + (performance.now() - anchor.wallNow) / 1000;
-    const sessionT = estWorklet - asrT0;
-    return sessionT >= 0 ? sessionT : null;
+    return sessionClock.now();
   }, []);
 
-  /** Worklet time of the first PCM chunk after pinClock() (stream t=0). */
+  /** Worklet time at session t=0 (the pinned origin), or null pre-pin. */
   const getAsrT0 = useCallback((): number | null => {
-    return asrT0Ref.current;
+    return sessionClock.workletT0Value();
   }, []);
 
   const getAnalyser = useCallback(() => analyserRef.current, []);
@@ -356,12 +337,12 @@ export function useAudioCapture() {
     scriptRef.current = null;
     onAudioDataRef.current = null;
     onPcmRef.current = null;
-    clockAnchorRef.current = null;
-    asrT0Ref.current = null;
-    pinPendingRef.current = false;
     pendingCandidatesRaw.current = [];
     candidatesRef.current = [];
     stutterSupportedRef.current = false;
+
+    // End the shared session clock (idle → next start() begins fresh).
+    sessionClock.reset();
 
     setState({
       level: 0,

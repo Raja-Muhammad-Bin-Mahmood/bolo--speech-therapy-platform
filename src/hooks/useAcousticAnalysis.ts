@@ -1,6 +1,7 @@
 import { useRef, useCallback, useEffect, useState } from "react";
 import Meyda from "meyda";
 import { diag, pct } from "../lib/diagnosticLog";
+import { onPin, provisionalWallBase, shiftValue, toSessionPair } from "../lib/sessionClock";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -551,6 +552,12 @@ export function useAcousticAnalysis(
     if (analyser) {
       const now = performance.now();
       const s = stateRef.current;
+      // The internal frame clock IS the session clock's provisional phase:
+      // `t` is seconds since recording start, so toSession() maps every
+      // emission onto the single shared timeline (identity pre-pin, −shift
+      // after). No second clock exists.
+      const base = provisionalWallBase();
+      if (base != null) s.startTime = base;
       if (!s.startTime) s.startTime = now;
       const t = (now - s.startTime) / 1000;
 
@@ -1089,10 +1096,14 @@ export function useAcousticAnalysis(
             // similarity-gated evidence — it genuinely clears the emission
             // floor (it is NOT the preserved-fragment 0.40 cap).
             s.lastEmitByType.repetition = t;
+            // Map the provisional window onto the SHARED session clock —
+            // the same mapping emitEvent() applies to every other type.
+            const [sStart, sEnd] = toSessionPair(firstRun.start, secondRun.end);
+            const shiftS = sStart - firstRun.start; // −shift after pin, 0 before
             const evt: AcousticEvent = {
               type: "repetition",
-              startTime: firstRun.start,
-              endTime: secondRun.end,
+              startTime: sStart,
+              endTime: sEnd,
               durationMs: Math.round((secondRun.end - firstRun.start) * 1000),
               confidence: Math.min(1, confidence),
               acoustic: Math.min(1, 0.5 + 0.4 * sim.score),
@@ -1105,7 +1116,17 @@ export function useAcousticAnalysis(
                 runCount: 2,
                 similarity: sim.score,
                 subScores: sim.subScores,
-                fragment: fragmentDetail,
+                fragment: {
+                  ...fragmentDetail,
+                  // Inner run/onset timing on the SAME session clock as the
+                  // event envelope (shifted once, at the origin level).
+                  runs: fragmentDetail.runs.map((r) => ({
+                    ...r,
+                    start: r.start + shiftS,
+                    end: r.end + shiftS,
+                  })),
+                  onsets: fragmentDetail.onsets.map((o) => o + shiftS),
+                },
               },
               source: "acoustic",
             };
@@ -1373,10 +1394,14 @@ export function useAcousticAnalysis(
         : {}),
     });
 
+    // Map the provisional [start,end] pair onto the SHARED session clock
+    // (identity pre-pin; −shift after the origin lands). The single
+    // timeline is preserved — no layer re-bases later.
+    const [sStart, sEnd] = toSessionPair(startTime, endTime);
     const evt: AcousticEvent = {
       type,
-      startTime,
-      endTime,
+      startTime: sStart,
+      endTime: sEnd,
       durationMs: Math.round((endTime - startTime) * 1000),
       confidence: Math.min(1, temporal),
       acoustic: Math.min(1, acoustic),
@@ -1413,17 +1438,27 @@ export function useAcousticAnalysis(
     if (input.endTime - lastForType < 0.25) return;
     s.lastEmitByType.fragment = input.endTime;
 
+    // Map the provisional window onto the SHARED session clock.
+    const [sStart, sEnd] = toSessionPair(input.startTime, input.endTime);
+    const shiftS = sStart - input.startTime; // −shift after the pin, 0 before
     const evt: AcousticEvent = {
       type: "fragment",
-      startTime: input.startTime,
-      endTime: input.endTime,
+      startTime: sStart,
+      endTime: sEnd,
       durationMs: Math.round((input.endTime - input.startTime) * 1000),
       confidence: 0.4, // deliberately below every classification band
       acoustic: 0.4,
       fragmentDetail: {
         runCount: input.runCount,
-        runs: input.runs,
-        onsets: input.onsets,
+        // Run/onset/gap timing must stay on the SAME session clock as the
+        // event envelope — every internal timestamp is shifted once, at the
+        // origin level, never per-layer.
+        runs: input.runs.map((r) => ({
+          ...r,
+          start: r.start + shiftS,
+          end: r.end + shiftS,
+        })),
+        onsets: input.onsets.map((o) => o + shiftS),
         onsetGapsMs: input.onsetGapsMs,
         interRunGapsMs: input.interRunGapsMs,
         evidence: input.evidence,
@@ -1435,6 +1470,61 @@ export function useAcousticAnalysis(
   }
 
   const rafRef = useRef(0);
+
+  // ── Pin rebase: events emitted BEFORE the ASR pin landed carry
+  //    provisional timestamps (identity — shift was still 0). The moment
+  //    the shared session clock pins its origin, rebase every emitted
+  //    event ONCE so the whole pool sits on the single session timeline
+  //    (the same clock Speechmatics words use). Never recomputed per-layer.
+  useEffect(() => {
+    return onPin(() => {
+      const delta = shiftValue(); // −shift after the pin, 0 before
+      if (delta === 0) return;
+      eventsRef.current = eventsRef.current.map((e) => {
+        if (e.type === "fragment" && e.fragmentDetail) {
+          return {
+            ...e,
+            startTime: e.startTime + delta,
+            endTime: e.endTime + delta,
+            fragmentDetail: {
+              ...e.fragmentDetail,
+              runs: e.fragmentDetail.runs.map((r) => ({
+                ...r,
+                start: r.start + delta,
+                end: r.end + delta,
+              })),
+              onsets: e.fragmentDetail.onsets.map((o) => o + delta),
+            },
+          };
+        }
+        if (e.type === "repetition" && e.voicedRepetition) {
+          return {
+            ...e,
+            startTime: e.startTime + delta,
+            endTime: e.endTime + delta,
+            voicedRepetition: {
+              ...e.voicedRepetition,
+              fragment: {
+                ...e.voicedRepetition.fragment,
+                runs: e.voicedRepetition.fragment.runs.map((r) => ({
+                  ...r,
+                  start: r.start + delta,
+                  end: r.end + delta,
+                })),
+                onsets: e.voicedRepetition.fragment.onsets.map((o) => o + delta),
+              },
+            },
+          };
+        }
+        return {
+          ...e,
+          startTime: e.startTime + delta,
+          endTime: e.endTime + delta,
+        };
+      });
+      setEvents(eventsRef.current);
+    });
+  }, []);
 
   useEffect(() => {
     if (!active) {

@@ -84,6 +84,11 @@ interface TickerItem {
   label: string;
   durMs: number;
   color: string;
+  /** Structured token state — the feed renders CONFIRMED events immediately
+   *  (even before the transcript resolves); candidates stay diagnostic. */
+  confirmed?: boolean;
+  resolving?: boolean;
+  source?: string;
 }
 
 export default function RecordingSession() {
@@ -176,6 +181,10 @@ export default function RecordingSession() {
     const items: TickerItem[] = [];
     // The Detection Feed renders the SHARED merged pool (deduped, so a
     // single disfluency detected by both lanes shows once, not twice).
+    // Feed and transcript are SEPARATE outputs: the feed shows a
+    // confirmed event the moment the detector knows it is real, even
+    // while its transcript word is still resolving (Speechmatics /
+    // fallback). The transcript badge attaches later — never the reverse.
     for (const e of allAcoustic) {
       items.push({
         key: `a-${e.startTime}-${e.type}`,
@@ -183,6 +192,11 @@ export default function RecordingSession() {
         label: ACOUSTIC_LABELS[e.type] ?? e.type,
         durMs: e.durationMs,
         color: ACOUSTIC_COLORS[e.type] ?? "#8B93A7",
+        // Detector-level confirmation: emission floor cleared. Preserved
+        // candidates (fragment) stay unconfirmed — feed-only evidence.
+        confirmed: e.type !== "fragment" && e.confidence >= 0.55,
+        resolving: true,
+        source: e.source,
       });
     }
     for (const p of analysis.pauseEvents) {
@@ -193,6 +207,7 @@ export default function RecordingSession() {
         label: p.type === "hesitation_sequence" ? "Hesitation" : "Pause",
         durMs: p.durationMs,
         color: p.colorToken,
+        confirmed: true,
       });
     }
     return items.sort((a, b) => a.t - b.t).slice(-16).reverse();
@@ -686,16 +701,32 @@ export default function RecordingSession() {
                           color: item.color,
                           backgroundColor: `${item.color}18`,
                           border: `1px solid ${item.color}30`,
+                          // Confirmed events render solid; candidates stay
+                          // dashed — diagnostic evidence, never promoted.
+                          borderStyle:
+                            item.confirmed === false ? "dashed" : undefined,
                         }}
+                        title={`${item.label} · ${(item.durMs / 1000).toFixed(1)}s${
+                          item.confirmed === false
+                            ? " · candidate (not yet confirmed)"
+                            : ""
+                        }${item.source ? ` · ${item.source}` : ""}`}
                       >
                         <span
-                          className="w-1.5 h-1.5 rounded-full"
+                          className={`w-1.5 h-1.5 rounded-full ${
+                            item.resolving ? "animate-pulse" : ""
+                          }`}
                           style={{ backgroundColor: item.color }}
                         />
                         {item.label}
                         <span className="opacity-80">
                           {(item.durMs / 1000).toFixed(1)}s
                         </span>
+                        {item.resolving && (
+                          <span className="opacity-60 text-[9px] uppercase tracking-wide">
+                            resolving
+                          </span>
+                        )}
                       </span>
                     ))}
                   </div>

@@ -41,6 +41,7 @@ import {
 import { recognizeInWorker } from "../lib/fallbackAsr";
 import { FEED_LABELS } from "../lib/feedEvents";
 import { diag } from "../lib/diagnosticLog";
+import { workletT0Value } from "../lib/sessionClock";
 import {
   evaluateInterruptionGate,
   findPrevWordEnd,
@@ -670,9 +671,10 @@ export function useEventEngine(options: EventEngineOptions): EventEngineOutput {
  * Crop the suspicious region from the ring buffer with DYNAMIC boundaries
  * (spec): 300ms pre-roll, ≥800ms minimum context, ~2s preferred, 6s hard cap.
  * A shifted second window (shiftS) is used for snippet consensus.
- * Ring timestamps are worklet-clock; the event is on the session clock, so
- * we anchor with the worklet offset of the newest chunk (the fallback runs
- * within ~1.5s of the event, so the drift is negligible).
+ *
+ * CLOCK: the ring holds WORKLET timestamps and the event is on the SHARED
+ * session clock — the module owns the single worklet→session mapping
+ * (sessionTime = workletTime − workletT0). No per-layer offset estimate.
  */
 function cropClip(
   evt: SpeechEvent,
@@ -680,19 +682,30 @@ function cropClip(
   shiftS: number
 ): Float32Array | null {
   if (ring.length === 0) return null;
+  const t0 = workletT0Value();
+  if (t0 == null) return null; // origin unknown — never guess
+
   const newestT = ring[ring.length - 1].t;
   const chunkDur = ring[ring.length - 1].buffer.length / SAMPLE_RATE;
   const newestEnd = newestT + chunkDur;
   const eEnd = evt.endTime ?? evt.startTime + 0.5;
-  const offset = newestEnd - eEnd; // worklet-clock estimate of event end
 
-  let start = evt.startTime - EVENT_SPEC.PREROLL_S + shiftS - offset;
-  let end = eEnd + EVENT_SPEC.POSTROLL_S + shiftS - offset;
+  // Event session time → worklet time (same clock, inverted at the origin).
+  const eStartWorklet = evt.startTime + t0;
+  const eEndWorklet = eEnd + t0;
+
+  // Clip boundaries in WORKLET time, relative to the newest PCM chunk.
+  let start = eStartWorklet - EVENT_SPEC.PREROLL_S + shiftS;
+  let end = eEndWorklet + EVENT_SPEC.POSTROLL_S + shiftS;
   if (end - start < EVENT_SPEC.MIN_CLIP_S) end = start + EVENT_SPEC.MIN_CLIP_S;
   if (end - start > EVENT_SPEC.PREF_CLIP_S) end = start + EVENT_SPEC.PREF_CLIP_S;
   if (end - start > EVENT_SPEC.MAX_CLIP_S) end = start + EVENT_SPEC.MAX_CLIP_S;
   start = Math.max(0, start);
   if (end <= start) return null;
+
+  // Sanity: the clip must lie within the ring we actually hold. The newest
+  // chunk's END is the ring frontier — require the clip to end before it.
+  if (end > newestEnd + 0.05) return null;
 
   const samples: number[] = [];
   for (const c of ring) {

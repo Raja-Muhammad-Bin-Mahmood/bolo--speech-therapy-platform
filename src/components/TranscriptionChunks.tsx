@@ -175,11 +175,24 @@ const PAUSE_LABELS: Record<PauseEvent["type"], string> = {
 /** Pure sentence markers — rendered as faint separators, NEVER error boxes */
 const SENTENCE_MARKERS = new Set([".", "!", "?", "…"]);
 
-/** Inline marker for a detector event that has no transcript word yet
- *  (e.g. a block before the following word finalizes). Renders the type +
- *  duration exactly like the Detection Feed chip, so the transcript NEVER
- *  loses a detected disfluency — it stays visible until its word lands. */
+/**
+ * Inline marker for a detector event that has no transcript word yet
+ * (e.g. a block before the following word finalizes). Renders the type +
+ * duration exactly like the Detection Feed chip, so the transcript NEVER
+ * loses a detected disfluency — it stays visible until its word lands.
+ *
+ * Structured token rendering (feed/transcript split):
+ *   • confirmed events  → solid dot + label + duration (feed-visible NOW,
+ *     transcript badge may attach later when the word lands)
+ *   • resolving events  → subtle pulsing indicator while the word is
+ *     still being recovered
+ *   • candidates        → dashed border, never promoted into a confirmed
+ *     transcript tag
+ */
 function InlineEventChip({ evt }: { evt: FeedEvent }) {
+  const confirmed = evt.confirmed !== false;
+  const resolving = evt.resolving === true;
+  const borderStyle = confirmed ? undefined : ("dashed" as const);
   return (
     <span
       className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-mono select-none border transition-colors duration-200"
@@ -187,17 +200,33 @@ function InlineEventChip({ evt }: { evt: FeedEvent }) {
         color: evt.color,
         backgroundColor: `${evt.color}14`,
         borderColor: `${evt.color}30`,
+        borderStyle: borderStyle,
       }}
-      title={`${evt.label} · ${(evt.durationMs / 1000).toFixed(1)}s`}
+      title={`${evt.label} · ${(evt.durationMs / 1000).toFixed(1)}s${
+        evt.confidence != null
+          ? ` · ${Math.round(evt.confidence * 100)}%${
+              evt.source ? ` · ${evt.source}` : ""
+            }`
+          : ""
+      }${resolving ? " · resolving word…" : ""}${
+        evt.baseWord ? ` · ${evt.baseWord}` : ""
+      }`}
     >
       <span
-        className="w-1.5 h-1.5 rounded-full shrink-0"
+        className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+          resolving ? "animate-pulse" : ""
+        }`}
         style={{ backgroundColor: evt.color }}
       />
       {evt.label}
       <span className="opacity-80">
         {(evt.durationMs / 1000).toFixed(1)}s
       </span>
+      {resolving && (
+        <span className="opacity-60 text-[9px] uppercase tracking-wide">
+          resolving
+        </span>
+      )}
     </span>
   );
 }

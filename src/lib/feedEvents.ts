@@ -4,16 +4,28 @@
  * The Detection Feed (live practice screen) renders detector events as
  * colored chips. These SAME event objects — and ONLY these — are mapped
  * onto finalized transcript words so the feed and the transcript always
- * agree. This module holds the vocabulary (labels/colors) and the pure
- * timestamp-overlap mapping. It performs NO detection, NO re-classification
- * and NO threshold/confidence changes — it only visualizes events that
- * already exist.
+ * agree. This module holds the vocabulary (labels/colors), the structured
+ * token data that keeps FEED visibility and TRANSCRIPT representation as
+ * two separate outputs, and the pure timestamp-overlap mapping. It
+ * performs NO detection, NO re-classification and NO threshold/confidence
+ * changes — it only visualizes events that already exist.
  */
 
 import type { AcousticEvent, AcousticEventType } from "../hooks/useAcousticAnalysis";
 
 // ─── Feed vocabulary (identical to the Detection Feed chips) ─────────────
 
+/**
+ * Structured FEED token — the representation unit of the Detection Feed.
+ *
+ * The feed and the transcript are TWO separate outputs of the same event
+ * system. Every token carries BOTH:
+ *   • feed fields  → immediate visibility (label/color/duration)
+ *   • token fields → the transcript badge it MAY later attach to
+ *
+ * A confirmed event appears in the feed the moment the detector knows it
+ * is real, even while `resolving` is still true and no word is attached.
+ */
 export interface FeedEvent {
   id: string;
   type: AcousticEventType;
@@ -32,6 +44,34 @@ export interface FeedEvent {
   suppressed?: boolean;
   visible?: boolean;
   evidenceScore?: number;
+
+  // ── Structured token data (feed/transcript split) ─────────────────
+  /**
+   * 0..1 detector confidence — the feed shows the acoustic evidence
+   * strength independent of transcript resolution.
+   */
+  confidence?: number;
+  /** Where this token's evidence came from (acoustic / sensor / both). */
+  source?: "acoustic" | "sensor" | "acoustic+sensor";
+  /**
+   * true when the detector has CONFIRMED the event (cleared its emission
+   * floor / interruption gate). Confirmed events MUST appear in the feed
+   * immediately and MAY attach a transcript badge. False (or absent) =
+   * candidate/fragment — diagnostic feed evidence only, never promoted
+   * into a confirmed transcript tag.
+   */
+  confirmed?: boolean;
+  /**
+   * true while the transcript word for this event is still resolving
+   * (Speechmatics hasn't landed a word yet, or the recovery path is
+   * running). The feed chip stays visible the whole time — only the
+   * transcript badge waits.
+   */
+  resolving?: boolean;
+  /** The base word this token attaches to (when known), else undefined. */
+  baseWord?: string;
+  /** Human-readable WHY (tooltips / review). */
+  reason?: string[];
 }
 
 export const FEED_LABELS: Record<AcousticEventType, string> = {
@@ -52,7 +92,15 @@ export const FEED_COLORS: Record<AcousticEventType, string> = {
   fragment: "#A3A3B5",
 };
 
-/** Convert raw detector events into the feed vocabulary (no filtering). */
+/**
+ * Convert raw detector events into the feed vocabulary (no filtering).
+ * The feed ALWAYS shows every raw event — `confirmed` marks whether the
+ * detector itself considers it real (emission floor cleared) vs a
+ * preserved candidate/fragment, and `resolving` is true while the
+ * transcript word has not landed yet. Both are feed-visibility concerns:
+ * the feed renders immediately; the transcript badge is a SEPARATE output
+ * that waits for word alignment.
+ */
 export function toFeedEvents(events: AcousticEvent[]): FeedEvent[] {
   return events.map((e, i) => ({
     id: `evt-${e.type}-${e.startTime.toFixed(3)}-${i}`,
@@ -62,6 +110,15 @@ export function toFeedEvents(events: AcousticEvent[]): FeedEvent[] {
     startTime: e.startTime,
     endTime: e.endTime,
     durationMs: e.durationMs,
+    confidence: e.confidence,
+    source: e.source,
+    // The detector confirms an event when its emission floor was cleared.
+    // Preserved candidates ("fragment") and sub-floor patterns stay
+    // `confirmed: false` — feed-only diagnostic evidence, never a badge.
+    confirmed: e.type !== "fragment" && e.confidence >= 0.55,
+    // While the event exists, its transcript word is by definition still
+    // resolving — the feed shows it NOW; the transcript attaches later.
+    resolving: true,
   }));
 }
 

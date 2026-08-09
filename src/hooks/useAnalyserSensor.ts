@@ -20,6 +20,7 @@ import { useRef, useCallback, useEffect, useState } from "react";
 import type { LiveSensorState } from "./useLiveSensor";
 import type { AcousticEvent } from "./useAcousticAnalysis";
 import { diag } from "../lib/diagnosticLog";
+import { onPin, provisionalWallBase, shiftValue, toSessionPair } from "../lib/sessionClock";
 
 // ─── Live meter state (compatible with SensorSidebar / TelemetryPanel) ───
 
@@ -275,10 +276,14 @@ export function useAnalyserSensor(
     (type: "stutter" | "stammer", start: number, end: number) => {
       if (end - lastEmitRef.current < COOLDOWN_MS / 1000) return;
       lastEmitRef.current = end;
+      // Map the provisional [start,end] pair onto the SHARED session clock
+      // (identity pre-pin; −shift after the origin lands). The single
+      // timeline is preserved — no layer re-bases later.
+      const [sStart, sEnd] = toSessionPair(start, end);
       const evt: AcousticEvent = {
         type,
-        startTime: start,
-        endTime: end,
+        startTime: sStart,
+        endTime: sEnd,
         durationMs: Math.round((end - start) * 1000),
         confidence: 0.85,
         acoustic: 0.8,
@@ -295,6 +300,11 @@ export function useAnalyserSensor(
     const analyser = getAnalyser();
     if (analyser) {
       const now = performance.now();
+      // The internal frame clock IS the session clock's provisional phase:
+      // `t` is seconds since recording start, so toSessionPair() maps every
+      // emission onto the single shared timeline. No second clock exists.
+      const base = provisionalWallBase();
+      if (base != null) startRef.current = base;
       if (!startRef.current) startRef.current = now;
       const t = (now - startRef.current) / 1000;
 
@@ -352,6 +362,23 @@ export function useAnalyserSensor(
     }
     rafRef.current = requestAnimationFrame(tick);
   }, [getAnalyser, detect]);
+
+  // ── Pin rebase: events emitted BEFORE the ASR pin landed carry
+  //    provisional timestamps (identity — shift was still 0). The moment
+  //    the shared session clock pins its origin, rebase every emitted
+  //    event ONCE so the whole pool sits on the single session timeline.
+  useEffect(() => {
+    return onPin(() => {
+      const delta = shiftValue(); // −shift after the pin, 0 before
+      if (delta === 0) return;
+      eventsRef.current = eventsRef.current.map((e) => ({
+        ...e,
+        startTime: e.startTime + delta,
+        endTime: e.endTime + delta,
+      }));
+      setEvents(eventsRef.current);
+    });
+  }, []);
 
   // ── Lifecycle ────────────────────────────────────────────────────────
   useEffect(() => {
