@@ -53,8 +53,9 @@ function p90Sorted(sorted: number[]): number {
 interface Unit {
   onsetMs: number;
   endMs: number;
+  /** Time of the last SPEECH frame inside the unit (sound, excl. gap). */
+  soundEndMs: number;
   onsetStrength: number;
-  n: number;
   zcrSum: number;
   centSum: number;
   bwSum: number;
@@ -153,6 +154,7 @@ export class DspEngine {
   private chainSims: number[] = []; // adjacent similarities inside chain
   private localRmsRing: number[] = [];
   private prevFrame: AudioFrame | null = null;
+  private lastUnitEndMs: number | null = null;
 
   // Block
   private blockPhase: BlockPhase = "idle";
@@ -278,6 +280,7 @@ export class DspEngine {
     this.chainSims = [];
     this.localRmsRing = [];
     this.prevFrame = null;
+    this.lastUnitEndMs = null;
     this.blockPhase = "idle";
     this.preBlock = null;
     this.recentSpeechRms = 0;
@@ -360,8 +363,10 @@ export class DspEngine {
       s.centArr.push(frame.spectralCentroid);
       s.fluxArr.push(frame.spectralFlux);
       if (frame.voiced) s.voicedCount++;
-      // Keep ~60 frames (600ms) — enough for the trailing stability window.
-      if (s.rmsArr.length > 60) {
+      // Keep up to ~12s of segment history (early-confirm uses the trailing
+      // 450ms window; close-time evaluation uses the FULL segment so a long
+      // fluent sentence is judged as a whole, not just its stable tail).
+      if (s.rmsArr.length > 1200) {
         s.rmsArr.shift();
         s.zcrArr.shift();
         s.centArr.shift();
@@ -398,6 +403,10 @@ export class DspEngine {
     const seg = this.seg;
     if (!seg || seg.rmsArr.length < 4) return;
     if (!seg.confirmed) {
+      // Ordinary syllables (< the log floor) are not prolongation candidates
+      // and are silently dropped — only segments long enough to be one are
+      // scored and logged.
+      if (endMs - seg.startMs < this.tuning.PROLONG_LOG_MIN_MS) return;
       this.evaluateProlongationSegment(seg, windowStats(seg, 0), endMs, false);
     }
   }
@@ -532,11 +541,12 @@ export class DspEngine {
       this.onsets.push(ons);
       this.onsets = this.onsets.filter((o) => frame.timestampMs - o.timestampMs <= 1600);
 
-      this.completeUnit(ons.timestampMs, false);
+      this.completeUnit(ons.timestampMs);
       this.startUnit(ons);
     } else if (this.unit && !isSpeech) {
-      // Speech decayed — the unit (and any chain) is final
-      this.completeUnit(frame.timestampMs, true);
+      // Speech decayed — the unit is complete (the chain stays open until a
+      // long silence or a dissimilar unit closes it).
+      this.completeUnit(frame.timestampMs);
     }
 
     // Accumulate the current frame into the active unit (its acoustic shape
@@ -544,7 +554,7 @@ export class DspEngine {
     if (this.unit) {
       const u = this.unit;
       u.endMs = frame.timestampMs;
-      u.n++;
+      if (isSpeech) u.soundEndMs = frame.timestampMs;
       const inProfile = frame.timestampMs - u.onsetMs <= t.UNIT_PROFILE_MS;
       if (inProfile) {
         u.zcrSum += frame.zcr;
@@ -555,14 +565,29 @@ export class DspEngine {
       u.env.push(frame.rms);
       if (u.env.length > 60) u.env.shift(); // cap at ~600ms
     }
+
+    // ── Chain timeout: a long silence ends the disfluency episode. Any
+    //    chain of ≥2 repeated units that has not been extended since then
+    //    is now final and scored. This keeps 3-unit chains alive across the
+    //    short micro-gaps between repeated fragments.
+    if (
+      !this.unit &&
+      this.chain.length >= 2 &&
+      this.lastUnitEndMs != null &&
+      frame.timestampMs - this.lastUnitEndMs > t.CHAIN_TIMEOUT_MS
+    ) {
+      this.closeChain(this.chain[this.chain.length - 1].endMs);
+      this.chain = [];
+      this.chainSims = [];
+    }
   }
 
   private startUnit(ons: Onset): void {
     this.unit = {
       onsetMs: ons.timestampMs,
       endMs: ons.timestampMs,
+      soundEndMs: ons.timestampMs,
       onsetStrength: ons.strength,
-      n: 0,
       zcrSum: 0,
       centSum: 0,
       bwSum: 0,
@@ -571,12 +596,13 @@ export class DspEngine {
     };
   }
 
-  /** Close the current unit; decide chain membership; evaluate when final. */
-  private completeUnit(endMs: number, isFinal: boolean): void {
+  /** Close the current unit; decide chain membership (chain stays open). */
+  private completeUnit(endMs: number): void {
     const t = this.tuning;
     const unit = this.unit;
     if (!unit) return;
     unit.endMs = endMs;
+    this.lastUnitEndMs = endMs;
 
     const prev = this.chain.length > 0 ? this.chain[this.chain.length - 1] : null;
     if (prev) {
@@ -598,15 +624,6 @@ export class DspEngine {
     }
 
     this.unit = null;
-
-    // A DECAY completion means no new unit can follow — the chain (if ≥2)
-    // is final and is scored now. Onset completions keep the chain open for
-    // the unit that just started.
-    if (isFinal && this.chain.length >= 2) {
-      this.closeChain(this.chain[this.chain.length - 1].endMs);
-      this.chain = [];
-      this.chainSims = [];
-    }
   }
 
   /** Evaluate a finished chain of ≥2 repeated units → confirm or reject. */
@@ -672,7 +689,7 @@ export class DspEngine {
 
     if (count === 2) {
       // LESS evidence — stricter gate + brief-fragment requirement
-      const firstDur = chain[0].endMs - chain[0].onsetMs;
+      const firstDur = chain[0].soundEndMs - chain[0].onsetMs;
       if (unitSim < t.REPETITION_SIMILARITY_2UNIT_MIN) {
         reasons.push(`2-unit similarity ${unitSim.toFixed(2)} < ${t.REPETITION_SIMILARITY_2UNIT_MIN}`);
       }
@@ -1007,7 +1024,7 @@ export class DspEngine {
       this.seg = null;
     }
     if (this.unit) {
-      this.completeUnit(this.unit.endMs, true);
+      this.completeUnit(this.unit.endMs);
     }
     if (this.chain.length >= 2) {
       this.closeChain(this.chain[this.chain.length - 1].endMs);

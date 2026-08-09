@@ -12,10 +12,17 @@ export interface TranscriptWord {
 
 export interface TranscriptChunk {
   text: string;
+  /** True for AddPartialTranscript (interim hypothesis), false for AddTranscript (final). */
   isFinal: boolean;
+  /** Alias of !isFinal — structured token metadata for the UI. */
+  isPartial: boolean;
   words: TranscriptWord[];
   /** Index of the utterance this chunk belongs to (increments on EndOfUtterance) */
   utterance?: number;
+  /** Start time (seconds) of the first word in this chunk — as returned by the API. */
+  startTime: number;
+  /** End time (seconds) of the last word in this chunk — as returned by the API. */
+  endTime: number;
 }
 
 export interface SpeechmaticsWSState {
@@ -30,19 +37,13 @@ export interface SpeechmaticsWSState {
 
 const WS_URL = "wss://eu2.rt.speechmatics.com/v2/en";
 
-// ─── Disfluency markers ─────────────────────────────────────────────────
-
-const DISFLUENCIES = [
-  "um", "uh", "ah", "er", "hmm", "like", "you know", "sort of",
-  "kind of", "actually", "basically", "literally", "i mean",
-  "you see", "well", "so yeah", "right", "okay", "anyway",
-];
-
-export function isDisfluent(word: string): boolean {
-  return DISFLUENCIES.includes(word.toLowerCase().replace(/[^a-z]/g, ""));
-}
-
 // ─── Hook ───────────────────────────────────────────────────────────────
+//
+// NOTE — no disfluency/filler filtering exists in this module, on purpose.
+// The Speechmatics request disables filtering (remove_disfluencies: false)
+// and the parser below stores the returned word text VERBATIM. Nothing in
+// BOLO removes, normalizes, deduplicates, or "corrects" Speechmatics output
+// before it reaches the transcript UI.
 
 export function useSpeechmaticsWS() {
   const [state, setState] = useState<SpeechmaticsWSState>({
@@ -137,12 +138,17 @@ export function useSpeechmaticsWS() {
         lastActivityRef.current = Date.now();
 
         // 3. Send StartRecognition message.
-        //    Transcript filtering keeps disfluencies in the text (the acoustic
-        //    layer handles blocks/repetitions/prolongations; Speechmatics tags
-        //    fillers like "um" which we read directly). conversation_config
-        //    makes the server emit EndOfUtterance after ~0.7s of real silence
-        //    — the native "wait until fully stopped" signal. max_delay must
-        //    stay above end_of_utterance_silence_trigger (API requirement).
+        //    V2 SCHEMA (validated against the official Realtime API reference):
+        //    `transcript_filtering_config` is a TOP-LEVEL StartRecognition field
+        //    (sibling of `transcription_config`) — NOT nested inside it. It
+        //    controls disfluency removal. `remove_disfluencies: false` keeps
+        //    fillers ("um", "uh") AND all raw disfluent forms verbatim — the
+        //    rawest lexical output the API provides. `enable_partials: true`
+        //    streams AddPartialTranscript (interim) results so the UI sees a
+        //    word while it's still being spoken. `conversation_config` makes
+        //    the server emit EndOfUtterance after ~0.7s of real silence.
+        //    `max_delay` stays above end_of_utterance_silence_trigger (API
+        //    requirement). No LLM, no cleanup, no normalization of results.
         const config = {
           message: "StartRecognition",
           audio_format: {
@@ -155,8 +161,12 @@ export function useSpeechmaticsWS() {
             operating_point: "enhanced",
             enable_partials: true,
             max_delay: 0.8,
-            transcript_filtering_config: { remove_disfluencies: false },
-            conversation_config: { end_of_utterance_silence_trigger: 0.7 },
+            conversation_config: {
+              end_of_utterance_silence_trigger: 0.7,
+            },
+          },
+          transcript_filtering_config: {
+            remove_disfluencies: false, // keep ALL disfluencies verbatim
           },
         };
         ws.send(JSON.stringify(config));
@@ -244,13 +254,21 @@ export function useSpeechmaticsWS() {
             endTime: r.end_time || 0,
             confidence: r.alternatives?.[0]?.confidence ?? 0.9,
           }));
+          // Verbatim join — no cleanup, no normalization, no dedup. "sssslap"
+          // stays "sssslap"; "rhrhrhro" stays "rhrhrhro"; repeated lexical
+          // material is preserved exactly as Speechmatics returned it.
           const text = words.map((w: any) => w.word).join(" ");
 
           const chunk: TranscriptChunk = {
             text,
             isFinal,
+            isPartial: !isFinal,
             words,
             utterance: utteranceCountRef.current,
+            // Structured token metadata (seconds, as returned by the API).
+            startTime: words.length > 0 ? words[0].startTime : 0,
+            endTime:
+              words.length > 0 ? words[words.length - 1].endTime : 0,
           };
 
           // For partials, replace the last partial; for finals, append

@@ -53,6 +53,8 @@ export interface DspTuning {
   MAX_REPETITION_GAP_MS: number;
   /** Minimum unit similarity for two units to join a chain (0..1). */
   CHAIN_SIMILARITY_GATE: number;
+  /** Long silence (ms) that ends a disfluency episode and closes the chain. */
+  CHAIN_TIMEOUT_MS: number;
   /** Confirm threshold for 3+ unit repetitions (product score 0..1). */
   REPETITION_CONFIRM_THRESHOLD: number;
   /** STRICTER confirm threshold for 2-unit repetitions (less evidence). */
@@ -108,6 +110,7 @@ export const DEFAULT_DSP_TUNING: DspTuning = {
   MIN_REPETITION_GAP_MS: 80,
   MAX_REPETITION_GAP_MS: 450,
   CHAIN_SIMILARITY_GATE: 0.55,
+  CHAIN_TIMEOUT_MS: 300,
   REPETITION_CONFIRM_THRESHOLD: 0.5,
   REPETITION_CONFIRM_THRESHOLD_2UNIT: 0.62,
   REPETITION_SIMILARITY_2UNIT_MIN: 0.75,
