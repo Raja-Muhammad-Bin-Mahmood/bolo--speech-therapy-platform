@@ -52,10 +52,9 @@ import {
 } from "../hooks/useSessionAnalysis";
 import { usePaceEngine, usePaceSnapshot } from "../hooks/usePaceEngine";
 import { useEventEngine } from "../hooks/useEventEngine";
-import { useLiveEvidenceFusion, buildVisibleTags } from "../hooks/useEvidenceFusion";
+import { useLiveEvidenceFusion } from "../hooks/useEvidenceFusion";
 import { useAuth } from "../context/AuthContext";
 import { toFeedEvents } from "../lib/feedEvents";
-import { visibleRecoveredFor, visibleFeedEventsFor } from "../lib/evidenceGating";
 import { mergeAcousticEvents } from "../lib/mergeAcousticEvents";
 import { diagBanner } from "../lib/diagnosticLog";
 
@@ -254,32 +253,17 @@ export default function RecordingSession() {
     [allAcoustic]
   );
 
-  // ── Evidence Fusion Layer: scores every raw event and gates what may
-  // become a VISIBLE transcript annotation. The base detector output is
-  // never modified — raw events still reach the Detection Feed below and
-  // the full review on /analysis. ─────────────────────────────────────
-  const fusion = useLiveEvidenceFusion(ws.transcripts, allAcoustic, analysis.pauseEvents);
+  // ── Evidence Fusion Layer ────────────────────────────────────────────
+  // Kept RUNNING for its side effects (dev-panel report + structured fusion
+  // log), but the LIVE TRANSCRIPT no longer consumes its visibility gates.
+  useLiveEvidenceFusion(ws.transcripts, allAcoustic, analysis.pauseEvents);
 
-  // Gated word-tags for the visible transcript (suppressed events render
-  // as plain words). The Review Screen still receives the full raw tags.
-  const gatedWordTags = useMemo(
-    () => buildVisibleTags(ws.transcripts, fusion.scored),
-    [ws.transcripts, fusion.scored]
-  );
-
-  // Recovery annotations whose source event passed the fusion layer.
-  // Suppressed annotations stay in the feed + review, not the transcript.
-  const gatedRecovered = useMemo(
-    () => visibleRecoveredFor(recovery.annotations, fusion.scored),
-    [recovery.annotations, fusion.scored]
-  );
-
-  // Inline transcript chips: only visible events. The Detection Feed
-  // (tickerItems below) still renders EVERY raw event — it is separate.
-  const gatedFeedForTranscript = useMemo(
-    () => visibleFeedEventsFor(feedEvents, fusion.scored),
-    [feedEvents, fusion.scored]
-  );
+  // RAW word-tags for the live transcript (free-speech rule): ALWAYS SHOW
+  // ALL TEXT — the tag map from session analysis passes straight through
+  // with NO fusion visibility floor (no minVisibleScore /
+  // minSingleSourceScore / 2-run-0.80 gating, no confidence-band/zHR/A
+  // suppression). Every detector-tagged word renders with its tag.
+  const rawWordTags = useMemo(() => analysis.wordTags, [analysis.wordTags]);
 
   // ── Fused event feed (stutter/stammer from A + B, deduped) ─────────
   const tickerItems = useMemo<TickerItem[]>(() => {
@@ -791,12 +775,19 @@ export default function RecordingSession() {
                     </span>
                   )}
                 </div>
+                {/* ALWAYS SHOW ALL TEXT (free-speech rule): the live
+                    transcript renders every word with NO filters. No fusion
+                    visibility floor (minVisibleScore / minSingleSourceScore /
+                    2-run 0.80), no confidence-band/zHR/A suppression, no
+                    lexical-veto hiding — raw word tags, ALL acoustic feed
+                    events, ALL recovery annotations pass straight through.
+                    The Detection Feed below is unchanged. */}
                 <TranscriptionChunks
                   transcripts={ws.transcripts}
-                  wordTags={gatedWordTags}
+                  wordTags={rawWordTags}
                   pauseEvents={analysis.pauseEvents}
-                  events={gatedFeedForTranscript}
-                  recovered={gatedRecovered}
+                  events={feedEvents}
+                  recovered={recovery.annotations}
                   duplicateKeys={mergedDuplicateKeys}
                   deepgramTokens={reconciler.tokens}
                   pending={recovery.pending}

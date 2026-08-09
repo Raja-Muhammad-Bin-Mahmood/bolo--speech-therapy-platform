@@ -8,18 +8,36 @@
  * timeline via the session-clock time captured when the first audio buffer
  * was sent.
  *
- * Config (exact, per spec — no smart_format / no cleanup / no smoothing):
- *   model=nova-2, language=en-US, filler_words=true, interim_results=true,
- *   punctuate=true, vad_events=true, no_delay=true, utterance_end_ms=1200.
+ * Config (exact, per spec):
+ *   model=nova-2, language=en-US, smart_format=true, filler_words=true,
+ *   interim_results=true, punctuate=true, vad_events=true, no_delay=true,
+ *   utterance_end_ms=1200, encoding=linear16, sample_rate=16000, channels=1.
+ *
+ * DISFLUENCY REPORTING (free-speech rule): Deepgram's listen API has NO
+ * dedicated `disfluencies=true` query parameter (verified against the
+ * streaming API reference — no disfluency option exists in the param list).
+ * Reporting is therefore achieved two ways:
+ *   1. `filler_words=true` keeps every filler ("um", "uh", "er"…) in the
+ *      word stream — without it Deepgram would drop them entirely.
+ *   2. The RAW `word` field IS Deepgram's own verdict on how the word was
+ *      spoken. smart_format=true only affects the `punctuated_word` display
+ *      form — the raw `word` field still carries stutter spellings
+ *      ("ssssslap", "b-b-ball"), so they remain inspectable. When the raw
+ *      token is itself disfluent, the word is tagged UNCONDITIONALLY in the
+ *      message handler (classifyDeepgramVerdict) — never gated by BOLO's
+ *      rule set, confidence bands, zHR/A levels or the fusion floor.
  *
  * RULES
  *   • EVERY FINAL Deepgram word becomes a permanent transcript token —
  *     fluent words AND disfluent words (this is the PRIMARY engine).
  *   • Interim results are display-only (interimWords/interimText) — they
  *     NEVER create permanent tokens and never duplicate finalized words.
- *   • Disfluency detection runs on the RAW token FIRST (never normalized),
- *     then the raw phonetic spelling is normalized to the intended lexical
- *     word so the live transcript never shows "ssssslap"/"b-b-ball".
+ *   • AUTHORITATIVE VERDICT: if the RAW Deepgram token is itself disfluent
+ *     (filler / sound repetition / prolongation / intra-token word
+ *     repetition) it is tagged immediately. The BOLO detector runs ONLY as
+ *     a backstop for words Deepgram already normalized clean ("ssssslap" →
+ *     "slap"), then the raw phonetic spelling is normalized to the intended
+ *     lexical word so the live transcript never shows "ssssslap"/"b-b-ball".
  *   • Block detection uses Deepgram word-timing gaps gated by the BOLO
  *     RMS/isSpeaking energy gate — ordinary silence is NOT a block.
  *   • The raw API key never leaves the `deepgram-token` Edge Function; the
@@ -35,8 +53,10 @@ import {
 import {
   normalizeLexicalWord,
   DeepgramDisfluencyDetector,
+  classifyDeepgramVerdict,
   type DeepgramDisfluencyTag,
   type DeepgramDisfluencyType,
+  type DeepgramProcessedToken,
 } from "../lib/deepgramDisfluency";
 import type { AcousticEvent } from "./useAcousticAnalysis";
 
@@ -422,10 +442,25 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
               if (seenFinalRef.current.has(key)) continue;
               seenFinalRef.current.add(key);
 
-              // ── DETECTOR (spec): structured WordToken → processToken.
-              // Detection runs on the RAW Deepgram token + sequence history
-              // FIRST; normalization happens AFTER, only for the display
-              // layer. Rules A–F are evaluated by the persistent detector.
+              // ── AUTHORITATIVE DEEPGRAM VERDICT (free-speech rule) ─────
+              // The RAW token Deepgram returns IS Deepgram's own verdict on
+              // how this word was spoken. If that raw form is itself
+              // disfluent (filler / sound repetition / prolongation /
+              // intra-token word repetition), the structured tag is set
+              // IMMEDIATELY and UNCONDITIONALLY — never gated by BOLO's
+              // lexical rule set, confidence bands, zHR/A levels or the
+              // evidence-fusion visibility floor. Deepgram said it is a
+              // disfluency → it IS a disfluency → purple underline.
+              const dgVerdict = classifyDeepgramVerdict(raw);
+
+              // ── BOLO DETECTOR (backstop only) ────────────────────────
+              // Runs ONLY when Deepgram's own raw token carries no
+              // disfluency evidence (e.g. it already normalized
+              // "ssssslap"→"slap"): structured WordToken → processToken →
+              // rules A–F (word/phrase repetition, revision, block,
+              // acoustic corroboration) on sequence history. Detection runs
+              // on the RAW token FIRST; normalization happens AFTER, only
+              // for the display layer.
               const norm = normalizeLexicalWord(raw)
                 .toLowerCase()
                 .replace(/[^a-z0-9']/g, "");
@@ -450,9 +485,26 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
                 endMs
               );
 
-              const processed = detectorRef.current!.processToken(wordToken, {
-                acousticEvidence,
-              });
+              // The Deepgram verdict wins whenever present; the BOLO
+              // detector is consulted ONLY as a backstop for words
+              // Deepgram already normalized clean. (No threshold below
+              // "Deepgram itself flagged it" can suppress the tag.)
+              const processed: DeepgramProcessedToken =
+                dgVerdict != null
+                  ? {
+                      token: wordToken,
+                      disfluency: dgVerdict,
+                      rule: dgVerdict.type,
+                      evaluated: [
+                        "sound_repetition",
+                        "prolongation",
+                        "filler",
+                      ] satisfies DeepgramDisfluencyType[],
+                      acousticEvidence,
+                    }
+                  : detectorRef.current!.processToken(wordToken, {
+                      acousticEvidence,
+                    });
               const tag = processed.disfluency;
               const type = tag?.type;
 

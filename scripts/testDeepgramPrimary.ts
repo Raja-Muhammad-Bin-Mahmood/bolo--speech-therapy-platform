@@ -20,6 +20,7 @@
 import {
   DeepgramDisfluencyDetector,
   normalizeLexicalWord,
+  classifyDeepgramVerdict,
   type DeepgramWordToken,
 } from "../src/lib/deepgramDisfluency";
 import {
@@ -113,6 +114,39 @@ function check(name: string, actual: string, expected: string) {
     console.log(`   expected: ${expected}`);
     console.log(`   actual:   ${actual}`);
   }
+}
+
+// ── 0. AUTHORITATIVE Deepgram verdict (free-speech rule) ───────────────
+// The RAW Deepgram token IS Deepgram's own verdict on how the word was
+// spoken. When it is itself disfluent, the tag is returned UNCONDITIONALLY
+// — no BOLO rule gating, no confidence-band/zHR/A threshold, no fusion
+// floor. The live transcript underline is driven by this tag.
+{
+  check(
+    "authoritative: 'um' → filler tag (unconditional)",
+    classifyDeepgramVerdict("um")?.type ?? "none",
+    "filler"
+  );
+  check(
+    "authoritative: 'sssslap' → prolongation tag",
+    classifyDeepgramVerdict("sssslap")?.type ?? "none",
+    "prolongation"
+  );
+  check(
+    "authoritative: 'b-b-ball' → sound_repetition tag",
+    classifyDeepgramVerdict("b-b-ball")?.type ?? "none",
+    "sound_repetition"
+  );
+  check(
+    "authoritative: 'I I I' → word_repetition tag",
+    classifyDeepgramVerdict("I I I")?.type ?? "none",
+    "word_repetition"
+  );
+  check(
+    "authoritative: clean 'slap' → null (BOLO backstop handles it)",
+    String(classifyDeepgramVerdict("slap")),
+    "null"
+  );
 }
 
 // ── 1. Prolongation: "sssslap" / "ssssl..." ────────────────────────────

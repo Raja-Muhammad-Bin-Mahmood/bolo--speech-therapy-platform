@@ -282,6 +282,34 @@ const RULE_CONFIDENCE: Record<DeepgramDisfluencyType, number> = {
   block: 0.85,
 };
 
+/**
+ * AUTHORITATIVE DEEPGRAM VERDICT (free-speech rule).
+ *
+ * The RAW token Deepgram returns for a word IS Deepgram's own verdict on
+ * how that word was spoken. When that raw form itself exhibits disfluency —
+ * a filler ("um", "uh", "er"), a hyphenated sound repetition ("b-b-ball",
+ * "st-st-start", "ma-ma-mac"), a prolongation run ("ssssslap", "sooooo"),
+ * or an intra-token word repetition ("I I I", "the the") — this returns
+ * the structured tag IMMEDIATELY and UNCONDITIONALLY.
+ *
+ * No confidence-band / zHR / A-level / evidence-fusion visibility floor
+ * ever gates this verdict: if Deepgram's own output for the word is
+ * disfluent, the word IS a disfluency and the live transcript underlines
+ * it. The BOLO sequence detector (rules C–F) and acoustic corroboration
+ * remain only as a BACKSTOP for words Deepgram already normalized clean
+ * ("ssssslap" → "slap"), where the raw token carries no evidence.
+ */
+export function classifyDeepgramVerdict(
+  raw: string
+): DeepgramDisfluencyTag | null {
+  const verdict = classifyDeepgramWord(raw);
+  if (!verdict.isDisfluency || !verdict.disfluencyType) return null;
+  return {
+    type: verdict.disfluencyType,
+    confidence: RULE_CONFIDENCE[verdict.disfluencyType],
+  };
+}
+
 interface RecentFinal {
   norm: string;
   raw: string;
