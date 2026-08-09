@@ -8,7 +8,62 @@ export type AcousticEventType =
   | "repetition"
   | "prolongation"
   | "stutter"
-  | "stammer";
+  | "stammer"
+  /**
+   * PRESERVED SHORT-FRAGMENT CANDIDATE (Phase 1 — pre-classification).
+   * A 2-iteration voiced pattern ("woh-woh") sits below the repetition
+   * classifier's 3-onset floor (REP_MIN_ONSETS) and was previously
+   * structurally incapable of becoming ANY event. It is preserved as a
+   * low-confidence `fragment` candidate with its full run/onset/gap
+   * structure in `fragmentDetail`, so a LATER classification stage can
+   * decide "short repetition" vs "fluent speech". It is deliberately NOT
+   * a repetition/stutter: `confidence` stays below every downstream
+   * classification band and the event carries structure, not a verdict.
+   */
+  | "fragment";
+
+/** One short voiced run inside a preserved fragment. */
+export interface FragmentRun {
+  /** seconds since recording start (session clock) */
+  start: number;
+  end: number;
+  /** run duration in ms */
+  durMs: number;
+}
+
+/**
+ * Structural detail of a preserved short-fragment candidate — everything a
+ * later classifier needs to distinguish a short repetition from ordinary
+ * fluent speech. Purely additive metadata (only present when type ===
+ * "fragment"); no consumer depends on it in this phase.
+ */
+export interface FragmentDetail {
+  /** Number of separate brief voiced runs (2 in this phase). */
+  runCount: number;
+  /** Each brief voiced run with its own timing. */
+  runs: FragmentRun[];
+  /** Onset timestamps (session clock, seconds) — one per run. */
+  onsets: number[];
+  /** Onset-to-onset gaps in ms (the existing repetition classifier's metric). */
+  onsetGapsMs: number[];
+  /** End-of-run → start-of-next-run gaps in ms (physical inter-run silence). */
+  interRunGapsMs: number[];
+  /** Detector-A acoustic evidence accumulated over the fragment window. */
+  evidence: {
+    /** Peak RMS across the window (0..1). */
+    maxRms: number;
+    /** Peak ZCR across the window (0..1) — tension cue. */
+    maxZcr: number;
+    /** Mean spectral centroid across the window (Hz) — phoneme-ish shape. */
+    meanCentroid: number;
+    /** Mean spectral flatness across the window (0..1). */
+    meanFlatness: number;
+    /** A high-ZCR (tension) frame was observed — mirrors the repetition path's zcrAgree. */
+    zcrTension: boolean;
+    /** Temporal regularity proxy (0..1) — same formula as the repetition path. */
+    regularity: number;
+  };
+}
 
 export interface AcousticEvent {
   type: AcousticEventType;
@@ -20,6 +75,13 @@ export interface AcousticEvent {
   confidence: number;
   /** 0..1 — raw feature-magnitude certainty (separate evidence source) */
   acoustic: number;
+  /**
+   * Preserved-fragment structure (only when type === "fragment"). Carries
+   * run/onset/gap timing + acoustic evidence so a later classifier can
+   * judge the candidate. Additive — never read by this phase's consumers
+   * beyond carrying it through the shared merge/feed/review pipeline.
+   */
+  fragmentDetail?: FragmentDetail;
   /** Which detector lane produced this event (A = worklet/Meyda analysis,
    *  B = RMS/ZCR/ΔEnergy sensor, or BOTH after the shared merge deduped a
    *  same-type event). Used by the fusion layer for cross-detector
