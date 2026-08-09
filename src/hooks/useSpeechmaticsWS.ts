@@ -139,16 +139,17 @@ export function useSpeechmaticsWS() {
 
         // 3. Send StartRecognition message.
         //    V2 SCHEMA (validated against the official Realtime API reference):
-        //    `transcript_filtering_config` is a TOP-LEVEL StartRecognition field
-        //    (sibling of `transcription_config`) — NOT nested inside it. It
-        //    controls disfluency removal. `remove_disfluencies: false` keeps
-        //    fillers ("um", "uh") AND all raw disfluent forms verbatim — the
-        //    rawest lexical output the API provides. `enable_partials: true`
-        //    streams AddPartialTranscript (interim) results so the UI sees a
-        //    word while it's still being spoken. `conversation_config` makes
-        //    the server emit EndOfUtterance after ~0.7s of real silence.
-        //    `max_delay` stays above end_of_utterance_silence_trigger (API
-        //    requirement). No LLM, no cleanup, no normalization of results.
+        //    `transcript_filtering_config` is nested INSIDE
+        //    `transcription_config` — it is NOT a top-level StartRecognition
+        //    field. `remove_disfluencies: false` keeps fillers ("um", "uh")
+        //    AND all raw disfluent forms verbatim — the rawest lexical output
+        //    the API provides. `enable_partials: true` streams
+        //    AddPartialTranscript (interim) results so the UI sees a word
+        //    while it's still being spoken. `conversation_config` makes the
+        //    server emit EndOfUtterance after ~0.7s of real silence.
+        //    `max_delay` stays above end_of_utterance_silence_trigger.
+        //    `model` is the current field (`operating_point` is deprecated).
+        //    No LLM, no cleanup, no normalization of results.
         const config = {
           message: "StartRecognition",
           audio_format: {
@@ -158,15 +159,15 @@ export function useSpeechmaticsWS() {
           },
           transcription_config: {
             language: "en",
-            operating_point: "enhanced",
+            model: "enhanced",
             enable_partials: true,
             max_delay: 0.8,
             conversation_config: {
               end_of_utterance_silence_trigger: 0.7,
             },
-          },
-          transcript_filtering_config: {
-            remove_disfluencies: false, // keep ALL disfluencies verbatim
+            transcript_filtering_config: {
+              remove_disfluencies: false, // keep ALL disfluencies verbatim
+            },
           },
         };
         ws.send(JSON.stringify(config));
