@@ -174,10 +174,16 @@ export class DspEngine {
   private lastEmitByType: Partial<Record<string, number>> = {};
   private lastBlockRejectLog = 0;
 
+  private tuning: DspTuning;
+  private log: (line: string) => void;
+
   constructor(
-    private tuning: DspTuning,
-    private log: (line: string) => void = (l) => console.info(`[BOLO·dsp] ${l}`)
-  ) {}
+    tuning: DspTuning,
+    log: (line: string) => void = (l) => console.info(`[BOLO·dsp] ${l}`)
+  ) {
+    this.tuning = tuning;
+    this.log = log;
+  }
 
   // ─── Public API ────────────────────────────────────────────────────────
 
@@ -504,11 +510,6 @@ export class DspEngine {
     const isSpeech = frame.rms > speechGate;
 
     // Local energy reference (preceding ONSET_LOOKBACK_MS)
-    while (this.localRmsRing.length > 0) {
-      const oldestT = frame.timestampMs - t.ONSET_LOOKBACK_MS;
-      if (this.localRmsRing.length > 300) this.localRmsRing.shift();
-      break;
-    }
     this.localRmsRing.push(frame.rms);
     while (this.localRmsRing.length > Math.ceil(t.ONSET_LOOKBACK_MS / t.HOP_MS) + 2) {
       this.localRmsRing.shift();
@@ -1033,7 +1034,6 @@ export class DspEngine {
     }
     // Abandon any un-released choke (end-of-session silence)
     if (this.blockPhase === "choke") {
-      const t = this.tuning;
       const features = this.blankFeatures();
       features.durationMs = Math.round(this.chokeStartMs - this.lastSpeechMs);
       features.dropRatio = 1 - this.chokeMinRms / Math.max(this.recentSpeechRms, 1e-6);

@@ -12,8 +12,6 @@
  * NOT pitch, and must never be described as pitch.
  */
 
-import type { AudioFrame } from "./types";
-
 export const SAMPLE_RATE = 16000;
 export const FRAME_MS = 20;
 export const HOP_MS = 10;
