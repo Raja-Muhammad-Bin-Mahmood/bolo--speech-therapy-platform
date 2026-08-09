@@ -168,15 +168,15 @@ function check(name: string, actual: string, expected: string) {
   const tokens: TranscriptToken[] = [];
   const reps: string[] = [];
   for (const w of ["you", "you", "you", "know"]) {
-    const proc = det.processToken(makeWordToken(w));
-    reps.push(proc.disfluency?.type ?? "none");
-    const { tokens: next } = reconcileIncoming(tokens, makeDgToken(w, det));
+    const { token, verdict } = processOnce(w, det);
+    reps.push(verdict);
+    const { tokens: next } = reconcileIncoming(tokens, token);
     tokens.length = 0;
     tokens.push(...next);
   }
   check("you→you→you word_repetition on 2nd+3rd", reps.join(","), "none,word_repetition,word_repetition,none");
   const rendered = sortTokens(tokens).map(renderWord).join(" ");
-  check("word repetition renders clean + underlined", rendered, "[you ⟍ PURPLE UNDERLINE (word_repetition)] [you ⟍ PURPLE UNDERLINE (word_repetition)] you know");
+  check("word repetition renders clean + underlined", rendered, "you [you ⟍ PURPLE UNDERLINE (word_repetition)] [you ⟍ PURPLE UNDERLINE (word_repetition)] know");
 }
 
 // ── 5. Phrase repetition: "I want I want" ───────────────────────────────
@@ -184,8 +184,8 @@ function check(name: string, actual: string, expected: string) {
   const det = new DeepgramDisfluencyDetector();
   const types: string[] = [];
   for (const w of ["I", "want", "I", "want"]) {
-    const proc = det.processToken(makeWordToken(w));
-    types.push(proc.disfluency?.type ?? "none");
+    const { verdict } = processOnce(w, det);
+    types.push(verdict);
   }
   check("phrase repetition 'I want I want'", types.join(","), "none,none,none,phrase_repetition");
 }
@@ -205,11 +205,10 @@ function check(name: string, actual: string, expected: string) {
   // prolongation away) — but BOLO's acoustic lane independently detected a
   // prolongation overlapping this word. The detector must tag it.
   const det = new DeepgramDisfluencyDetector();
-  const proc = det.processToken(makeWordToken("slap"), {
+  const { token, verdict } = processOnce("slap", det, {
     acousticEvidence: "prolongation",
   });
-  check("clean 'slap' + acoustic prolongation → prolongation tag", proc.disfluency?.type ?? "none", "prolongation");
-  const token = makeDgToken("slap", det);
+  check("clean 'slap' + acoustic prolongation → prolongation tag", verdict, "prolongation");
   check("clean 'slap' renders slap + purple underline", renderWord(token), "[slap ⟍ PURPLE UNDERLINE (prolongation)]");
 }
 
