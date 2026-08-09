@@ -166,3 +166,274 @@ export function normalizeLexicalWord(raw: string): string {
 
   return out;
 }
+
+// ════════════════════════════════════════════════════════════════════════
+//  Structured WordToken + persistent detector (spec pipeline)
+//
+//  Deepgram response → WordToken → DisfluencyDetector.processToken →
+//  DisfluencyTag → TranscriptToken.disfluency → LIVE TRANSCRIPT renderer
+//  → purple underline.
+//
+//  The DETECTOR is a persistent, history-aware instance (one per recording
+//  session). It evaluates:
+//    A. sound_repetition — repeated onset fragments ("b-b-ball") on RAW
+//       evidence, BEFORE lexical normalization destroys it
+//    B. prolongation     — repeated characters ("ssssslap") on RAW evidence,
+//       plus BOLO acoustic/DSP corroboration when Deepgram already
+//       normalized the spelling away ("ssssslap" → "slap")
+//    C. word_repetition  — consecutive identical normalized finals
+//       ("you you you know", "I I I")
+//    D. phrase_repetition— a repeated 2–3 word sequence ("I want I want")
+//    E. revision         — abandoned/restarted word (interim vs final)
+//    F. block            — word-timing gap gated by the BOLO RMS/isSpeaking
+//       gate (a Deepgram LEXICAL block tag — NOT the acoustic DSP block
+//       event system, which is left untouched)
+//  ════════════════════════════════════════════════════════════════════════
+
+export interface DeepgramWordToken {
+  /** Displayed lexical word (punctuated when the API provides it). */
+  word: string;
+  /** Lowercased, punctuation-stripped comparison form. */
+  normalizedWord: string;
+  /** Raw API word output — detection/debugging only (never displayed). */
+  rawWord?: string;
+  /** Session-relative milliseconds (shared BOLO session clock). */
+  startTimeMs: number;
+  endTimeMs: number;
+  confidence: number;
+  source: "deepgram";
+  isFinal: true;
+}
+
+export interface DeepgramDisfluencyTag {
+  type: DeepgramDisfluencyType;
+  confidence: number;
+}
+
+export interface DeepgramProcessedToken {
+  token: DeepgramWordToken;
+  /** Structured tag when a rule matched, otherwise null. */
+  disfluency: DeepgramDisfluencyTag | null;
+  /** Rule family that produced the tag ("none" when fluent). Debug only. */
+  rule: DeepgramDisfluencyType | "none";
+}
+
+export interface DeepgramDetectorContext {
+  /**
+   * BOLO acoustic/DSP-lane evidence overlapping this token, mapped to the
+   * closest Deepgram type (a prolongation event → "prolongation", a
+   * stutter/stammer/repetition event → "sound_repetition", a block event
+   * → "block"). Used when Deepgram already normalized the phonetic stutter
+   * away ("ssssslap" → "slap") so the lexical string carries no evidence.
+   */
+  acousticEvidence?: DeepgramDisfluencyType | null;
+}
+
+export interface DeepgramDetectorOptions {
+  /** BOLO RMS/isSpeaking gate — ordinary silence is NOT a block. */
+  isSpeaking?: () => boolean;
+  /** Word-timing gap ABOVE which a block is considered (ms). */
+  blockMinGapMs?: number;
+  /** Gaps larger than this are silence/utterance breaks, never blocks (ms). */
+  blockMaxGapMs?: number;
+  /** Word-repetition window: same normalized word within this time (ms). */
+  repeatWindowMs?: number;
+  /** Phrase-repetition lookback window (ms). */
+  phraseWindowMs?: number;
+  /** Keep finalized-token history for this long (ms). */
+  historyWindowMs?: number;
+  /** Revision tolerance: interim word within this of token start (ms). */
+  revisionToleranceMs?: number;
+}
+
+const DEFAULT_DETECTOR_OPTIONS = {
+  blockMinGapMs: 450,
+  blockMaxGapMs: 2500,
+  repeatWindowMs: 1500,
+  phraseWindowMs: 4000,
+  historyWindowMs: 8000,
+  revisionToleranceMs: 350,
+} satisfies Required<
+  Omit<DeepgramDetectorOptions, "isSpeaking">
+>;
+
+const RULE_CONFIDENCE: Record<DeepgramDisfluencyType, number> = {
+  sound_repetition: 0.92,
+  prolongation: 0.9,
+  filler: 0.95,
+  word_repetition: 0.9,
+  phrase_repetition: 0.85,
+  revision: 0.8,
+  block: 0.85,
+};
+
+interface RecentFinal {
+  norm: string;
+  raw: string;
+  startMs: number;
+}
+
+export class DeepgramDisfluencyDetector {
+  private opts: Required<
+    Omit<DeepgramDetectorOptions, "isSpeaking">
+  > & { isSpeaking: () => boolean };
+  /** Recent finalized Deepgram words — sequence-level rule context. */
+  private recent: RecentFinal[] = [];
+  /** Latest interim hypothesis — revision (abandoned word) detection. */
+  private interim: { norm: string; startMs: number }[] = [];
+  /** End of the previous finalized word — block (timing gap) detection. */
+  private lastWordEndMs: number | null = null;
+
+  constructor(options: DeepgramDetectorOptions = {}) {
+    this.opts = {
+      ...DEFAULT_DETECTOR_OPTIONS,
+      ...options,
+      isSpeaking: options.isSpeaking ?? (() => true),
+    };
+  }
+
+  /** Replace the latest interim hypothesis (revision detection input). */
+  setInterim(words: { norm: string; startMs: number }[]): void {
+    this.interim = words;
+  }
+
+  /** New recording session → drop all history. */
+  reset(): void {
+    this.recent = [];
+    this.interim = [];
+    this.lastWordEndMs = null;
+  }
+
+  private tag(type: DeepgramDisfluencyType): DeepgramDisfluencyTag {
+    return { type, confidence: RULE_CONFIDENCE[type] };
+  }
+
+  // A + B (+ filler): single-token rules on RAW evidence. Detection runs
+  // on the raw form FIRST — normalization happens later, so lexical
+  // normalization never destroys "b-b-ball" / "ssssslap" evidence.
+  private classifyRaw(raw: string): DeepgramDisfluencyTag | null {
+    const verdict = classifyDeepgramWord(raw);
+    if (!verdict.isDisfluency || !verdict.disfluencyType) return null;
+    return this.tag(verdict.disfluencyType);
+  }
+
+  // C. Word repetition — consecutive identical normalized finals.
+  private wordRepetition(token: DeepgramWordToken): boolean {
+    const prev = this.recent[this.recent.length - 1];
+    if (!prev) return false;
+    return (
+      token.normalizedWord.length > 0 &&
+      prev.norm.length > 0 &&
+      prev.norm === token.normalizedWord &&
+      token.startTimeMs - prev.startMs <= this.opts.repeatWindowMs
+    );
+  }
+
+  // D. Phrase repetition — a 2–3 word sequence that occurred earlier
+  //    ("I want I want", "I have to I have to").
+  private phraseRepetition(token: DeepgramWordToken): boolean {
+    const recent = this.recent;
+    if (recent.length < 2) return false;
+    const { phraseWindowMs } = this.opts;
+    for (const span of [2, 3] as const) {
+      if (recent.length < span) continue;
+      // Current gram = last (span-1) history words + this token.
+      const gram = recent
+        .slice(recent.length - (span - 1))
+        .map((r) => r.norm)
+        .concat(token.normalizedWord);
+      // The previous occurrence must sit fully BEFORE the current gram's
+      // history window (indices [len-(span-1), len-1]).
+      const gramHistoryStart = recent.length - (span - 1);
+      const maxStart = gramHistoryStart - span;
+      if (maxStart < 0) continue;
+      for (let i = 0; i <= maxStart; i++) {
+        let match = true;
+        for (let k = 0; k < span; k++) {
+          if (recent[i + k].norm !== gram[k]) {
+            match = false;
+            break;
+          }
+        }
+        if (!match) continue;
+        const prevLastStart = recent[i + span - 1].startMs;
+        if (token.startTimeMs - prevLastStart <= phraseWindowMs) return true;
+      }
+    }
+    return false;
+  }
+
+  // E. Revision — an interim word occupied this interval with a DIFFERENT
+  //    lexical form (the speaker abandoned/restarted the word).
+  private revision(token: DeepgramWordToken): boolean {
+    const { revisionToleranceMs } = this.opts;
+    return this.interim.some(
+      (iw) =>
+        iw.norm !== token.normalizedWord &&
+        Math.abs(iw.startMs - token.startTimeMs) <= revisionToleranceMs
+    );
+  }
+
+  // F. Block — Deepgram word-timing gap gated by the BOLO RMS/isSpeaking
+  //    gate so ordinary silence is NOT a block.
+  private block(token: DeepgramWordToken): boolean {
+    if (this.lastWordEndMs == null) return false;
+    const gapMs = token.startTimeMs - this.lastWordEndMs;
+    return (
+      gapMs > this.opts.blockMinGapMs &&
+      gapMs < this.opts.blockMaxGapMs &&
+      this.opts.isSpeaking()
+    );
+  }
+
+  /**
+   * Process ONE finalized Deepgram word. Returns the token with a structured
+   * `disfluency` tag when a rule matched (this is the data the LIVE
+   * TRANSCRIPT renderer reads — the underline is driven by `disfluency !=
+   * null`, never by the Detection Feed).
+   */
+  processToken(
+    token: DeepgramWordToken,
+    ctx?: DeepgramDetectorContext
+  ): DeepgramProcessedToken {
+    const raw = token.rawWord ?? token.word;
+    let disfluency = this.classifyRaw(raw); // A + B + filler (raw evidence)
+    let rule: DeepgramDisfluencyType | "none" =
+      disfluency?.type ?? "none";
+
+    if (!disfluency && this.wordRepetition(token)) {
+      disfluency = this.tag("word_repetition"); // C
+      rule = "word_repetition";
+    }
+    if (!disfluency && this.phraseRepetition(token)) {
+      disfluency = this.tag("phrase_repetition"); // D
+      rule = "phrase_repetition";
+    }
+    if (!disfluency && this.revision(token)) {
+      disfluency = this.tag("revision"); // E
+      rule = "revision";
+    }
+    if (!disfluency && this.block(token)) {
+      disfluency = this.tag("block"); // F (timing + speaking gate)
+      rule = "block";
+    }
+    // Acoustic/DSP corroboration: Deepgram already normalized the phonetic
+    // spelling away ("ssssslap" → "slap") — the BOLO acoustic lane carries
+    // the evidence the lexical string no longer does.
+    if (!disfluency && ctx?.acousticEvidence) {
+      disfluency = this.tag(ctx.acousticEvidence);
+      rule = ctx.acousticEvidence;
+    }
+
+    // Keep EVERY final word as sequence context (fluent too).
+    this.recent = [
+      ...this.recent.filter(
+        (r) => token.startTimeMs - r.startMs <= this.opts.historyWindowMs
+      ),
+      { norm: token.normalizedWord, raw, startMs: token.startTimeMs },
+    ].slice(-60);
+    this.lastWordEndMs = token.endTimeMs;
+
+    return { token, disfluency, rule };
+  }
+}

@@ -113,10 +113,6 @@ export default function RecordingSession() {
   // ── Detection pipeline ──────────────────────────────────────────────
   const audio = useAudioCapture();
   const ws = useSpeechmaticsWS();
-  // Deepgram is the PRIMARY live transcription engine. It consumes the SAME
-  // PCM as Speechmatics (no second mic stream) and gets the shared analyser
-  // so its block detection can use the BOLO RMS isSpeaking gate.
-  const dg = useDeepgramWS({ getAnalyser: audio.getAnalyser });
   const acoustic = useAcousticAnalysis(audio.getAnalyser, isRecording);
   // RMS / ZCR / ΔEnergy lane — same shared analyser, drives stutter/stammer
   const sensor = useAnalyserSensor(audio.getAnalyser, isRecording);
@@ -129,6 +125,16 @@ export default function RecordingSession() {
     () => mergeAcousticEvents(acoustic.events, sensor.events),
     [acoustic.events, sensor.events]
   );
+
+  // Deepgram is the PRIMARY live transcription engine. It consumes the SAME
+  // PCM as Speechmatics (no second mic stream) and gets the shared analyser
+  // so its block detection can use the BOLO RMS isSpeaking gate. It also
+  // receives the shared acoustic/DSP event pool for corroboration when
+  // Deepgram already normalized a phonetic stutter away ("ssssslap"→"slap").
+  const dg = useDeepgramWS({
+    getAnalyser: audio.getAnalyser,
+    acousticEvents: allAcoustic,
+  });
 
   // ── Analysis over the PRIMARY (Deepgram) transcript ────────────────
   // Deepgram FINAL words are the source of truth for scoring/pacing; if

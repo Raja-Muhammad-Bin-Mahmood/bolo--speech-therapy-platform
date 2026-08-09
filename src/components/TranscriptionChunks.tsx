@@ -302,7 +302,13 @@ function WordSpan({ word }: { word: LineWord }) {
   // PURPLE UNDERLINE (the underline IS the disfluency marker). The raw
   // phonetic spelling ("sssslap", "b-b-ball") is NEVER shown.
   if (word.deepgram) {
-    const isDgDisfluency = word.deepgram.isDisfluency || word.deepgram.locked;
+    // The structured `disfluency` tag drives the underline (spec: the tag
+    // reaches the SAME token the LIVE TRANSCRIPT renders). The legacy
+    // isDisfluency/locked flags remain as backstops for tokens produced
+    // before the structured field existed.
+    const dgTag = word.deepgram.disfluency;
+    const isDgDisfluency =
+      dgTag != null || word.deepgram.isDisfluency || word.deepgram.locked;
     return (
       <span className="inline-flex items-center gap-1 align-middle">
         <span
@@ -311,9 +317,11 @@ function WordSpan({ word }: { word: LineWord }) {
               ? "inline-block rounded px-1 underline decoration-2 decoration-purple-400 underline-offset-4 bg-[#BD8CFF]/10 text-[#BD8CFF]/90 transition-colors duration-200"
               : "inline-block rounded px-1 text-white/85 transition-colors duration-200"
           }
-          title={isDgDisfluency
-            ? `Deepgram disfluency${word.deepgram.disfluencyType ? ` · ${word.deepgram.disfluencyType}` : ""}${word.deepgram.rawWord && word.deepgram.rawWord !== word.deepgram.word ? ` · raw: ${word.deepgram.rawWord}` : ""}`
-            : undefined}
+          title={
+            isDgDisfluency
+              ? `Deepgram disfluency · ${dgTag?.type ?? word.deepgram.disfluencyType ?? "disfluency"} (${Math.round((dgTag?.confidence ?? 0.9) * 100)}%)${word.deepgram.rawWord && word.deepgram.rawWord !== word.deepgram.word ? ` · raw: ${word.deepgram.rawWord}` : ""}`
+              : undefined
+          }
         >
           {word.deepgram.word}
         </span>

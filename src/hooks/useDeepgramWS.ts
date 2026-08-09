@@ -29,10 +29,12 @@ import { useRef, useCallback, useEffect, useState } from "react";
 import { supabase, SUPABASE_URL } from "../lib/supabase";
 import * as sessionClock from "../lib/sessionClock";
 import {
-  classifyDeepgramWord,
   normalizeLexicalWord,
+  DeepgramDisfluencyDetector,
+  type DeepgramDisfluencyTag,
   type DeepgramDisfluencyType,
 } from "../lib/deepgramDisfluency";
+import type { AcousticEvent } from "./useAcousticAnalysis";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -47,6 +49,8 @@ export interface DeepgramFinalWord {
   endTimeMs: number;
   confidence: number;
   isDisfluency: boolean;
+  /** STRUCTURED tag — the LIVE TRANSCRIPT renderer underlines on this. */
+  disfluency: DeepgramDisfluencyTag | null;
   disfluencyType?: DeepgramDisfluencyType;
 }
 
@@ -70,6 +74,13 @@ export interface DeepgramWSState {
 export interface UseDeepgramWSOptions {
   /** Shared analyser (RMS) — the BOLO isSpeaking gate for block detection. */
   getAnalyser?: () => AnalyserNode | null;
+  /**
+   * BOLO acoustic/DSP-lane events (shared pool). When Deepgram already
+   * normalized a phonetic stutter away ("ssssslap" → "slap"), the detector
+   * corroborates the disfluency from the acoustic evidence overlapping the
+   * word's time window.
+   */
+  acousticEvents?: AcousticEvent[];
 }
 
 // ─── Endpoint + config (spec: exact params) ─────────────────────────────
@@ -109,13 +120,46 @@ const SPEAK_ON_RMS = 0.02;
 const SPEAK_OFF_RMS = 0.01;
 const SPEAK_SAMPLE_MS = 120;
 
-interface RecentWord {
-  norm: string;
-  raw: string;
-  startMs: number;
-}
-
 let dgUid = 0;
+
+/**
+ * Map the closest BOLO acoustic/DSP-lane event overlapping a Deepgram word
+ * window to the nearest Deepgram disfluency type. Used ONLY when Deepgram
+ * already normalized the phonetic stutter away ("ssssslap" → "slap") so the
+ * lexical string carries no evidence — the acoustic lane is the independent
+ * physical evidence that the word was disfluent.
+ */
+function mapAcousticEvidence(
+  events: AcousticEvent[],
+  startMs: number,
+  endMs: number
+): DeepgramDisfluencyType | null {
+  let best: AcousticEvent | null = null;
+  let bestOverlapMs = 0;
+  const s = startMs / 1000;
+  const e = endMs / 1000;
+  for (const evt of events) {
+    const ov = Math.max(0, Math.min(e, evt.endTime) - Math.max(s, evt.startTime));
+    if (ov > bestOverlapMs) {
+      bestOverlapMs = ov;
+      best = evt;
+    }
+  }
+  if (!best || bestOverlapMs <= 0) return null;
+  switch (best.type) {
+    case "prolongation":
+      return "prolongation";
+    case "block":
+      return "block";
+    case "repetition":
+    case "stutter":
+    case "stammer":
+    case "fragment":
+      return "sound_repetition";
+    default:
+      return null;
+  }
+}
 
 // ─── Hook ───────────────────────────────────────────────────────────────
 
@@ -133,18 +177,35 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
   const seenFinalRef = useRef<Set<string>>(new Set());
   /** Session-relative ms at the moment Deepgram's stream started. */
   const streamStartMsRef = useRef<number | null>(null);
-  /** Rolling recent FINAL words — sequence-level repetition detection. */
-  const recentRef = useRef<RecentWord[]>([]);
-  /** Latest interim hypothesis — revision (abandoned word) detection. */
-  const interimRef = useRef<{ norm: string; startMs: number }[]>([]);
+  /**
+   * Persistent, history-aware disfluency detector (ONE per recording
+   * session). It holds the finalized-token history + interim hypothesis
+   * internally and applies rules A–F (sound repetition, prolongation, word
+   * repetition, phrase repetition, revision, block) to EVERY finalized
+   * Deepgram word. Returns a structured `disfluency` tag or null.
+   */
+  const detectorRef = useRef<DeepgramDisfluencyDetector | null>(null);
+  if (!detectorRef.current) {
+    detectorRef.current = new DeepgramDisfluencyDetector({
+      // Deepgram word-timing gap gated by the BOLO RMS isSpeaking gate —
+      // ordinary silence is NOT a block (acoustic DSP block system untouched).
+      isSpeaking: () => speakingRef.current,
+    });
+  }
   const watchdogRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastActivityRef = useRef(0);
   const SILENCE_TIMEOUT_MS = 15000;
   /** Block detection state. */
-  const lastWordEndMsRef = useRef<number | null>(null);
   const speakingRef = useRef(false);
   const speechSampleRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const rmsBufRef = useRef<Float32Array<ArrayBuffer>>(new Float32Array(0));
+  /**
+   * Live acoustic-events snapshot. The WebSocket message handler is created
+   * once at connect time, so it must read the CURRENT events through a ref
+   * (never the connect-time `options` closure).
+   */
+  const acousticEventsRef = useRef<AcousticEvent[]>([]);
+  acousticEventsRef.current = options?.acousticEvents ?? [];
 
   // ── RMS isSpeaking gate (BOLO energy gate, hysteresis) ──────────────
   const sampleSpeaking = useCallback(() => {
@@ -177,9 +238,7 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
     streamStartMsRef.current = null;
     finalsRef.current = [];
     seenFinalRef.current = new Set();
-    recentRef.current = [];
-    interimRef.current = [];
-    lastWordEndMsRef.current = null;
+    detectorRef.current?.reset();
     speakingRef.current = false;
     setState({
       status: "connecting",
@@ -286,71 +345,42 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
               if (seenFinalRef.current.has(key)) continue;
               seenFinalRef.current.add(key);
 
-              const verdict = classifyDeepgramWord(raw);
-              let type = verdict.disfluencyType;
-              const norm = normalizeLexicalWord(raw).toLowerCase().replace(/[^a-z0-9']/g, "");
+              // ── DETECTOR (spec): structured WordToken → processToken.
+              // Detection runs on the RAW Deepgram token + sequence history
+              // FIRST; normalization happens AFTER, only for the display
+              // layer. Rules A–F are evaluated by the persistent detector.
+              const norm = normalizeLexicalWord(raw)
+                .toLowerCase()
+                .replace(/[^a-z0-9']/g, "");
+              const wordToken = {
+                word: w.word ?? raw,
+                normalizedWord: norm,
+                rawWord: raw,
+                startTimeMs: startMs,
+                endTimeMs: endMs,
+                confidence: conf,
+                source: "deepgram" as const,
+                isFinal: true as const,
+              };
 
-              // ── Block: Deepgram word-timing gap gated by the BOLO
-              //    RMS/isSpeaking gate — ordinary silence is NOT a block.
-              if (
-                !type &&
-                lastWordEndMsRef.current != null &&
-                startMs - lastWordEndMsRef.current > 450 &&
-                speakingRef.current
-              ) {
-                type = "block";
-              }
-              lastWordEndMsRef.current = endMs;
+              // Acoustic/DSP corroboration: BOLO's independent physical lane
+              // may carry the evidence Deepgram's normalized spelling erased
+              // ("ssssslap" → "slap"). Map the closest overlapping event.
+              const acousticEvidence = mapAcousticEvidence(
+                acousticEventsRef.current,
+                startMs,
+                endMs
+              );
 
-              // Sequence-level detection (needs context across tokens):
-              // word repetition "I I I" (separate tokens) + phrase repetition.
-              const recent = recentRef.current;
-              const prev = recent.length > 0 ? recent[recent.length - 1] : null;
-              if (
-                !type &&
-                prev &&
-                norm.length > 0 &&
-                prev.norm === norm &&
-                startMs - prev.startMs < 1500
-              ) {
-                type = "word_repetition";
-              } else if (
-                !type &&
-                prev &&
-                norm.length > 0 &&
-                prev.norm.length > 0
-              ) {
-                // 2-gram [prev, cur] seen earlier within the last 4s = phrase repetition.
-                const gram = `${prev.norm}|${norm}`;
-                const found = recent
-                  .slice(0, -1)
-                  .some((r, i) => {
-                    const nxt = recent[i + 1];
-                    return (
-                      nxt &&
-                      `${r.norm}|${nxt.norm}` === gram &&
-                      startMs - nxt.startMs < 4000
-                    );
-                  });
-                if (found) type = "phrase_repetition";
-              }
+              const processed = detectorRef.current!.processToken(wordToken, {
+                acousticEvidence,
+              });
+              const tag = processed.disfluency;
+              const type = tag?.type;
 
-              // Revision / abandoned word: an interim word occupied this
-              // interval with a DIFFERENT lexical form (the speaker revised).
-              if (!type) {
-                const interim = interimRef.current.find(
-                  (iw) => iw.norm !== norm && Math.abs(iw.startMs - startMs) <= 350
-                );
-                if (interim) type = "revision";
-              }
-
-              // Keep every final word as sequence context (fluent too).
-              recentRef.current = [
-                ...recentRef.current.filter(
-                  (r) => startMs - r.startMs < 8000
-                ),
-                { norm, raw, startMs },
-              ].slice(-60);
+              console.debug(
+                `[DEEPGRAM] raw="${raw}" → word="${processed.token.word}" norm="${norm}" | [DETECTOR] rule=${processed.rule} type=${type ?? "none"} conf=${tag?.confidence ?? 0} | [TRANSCRIPT] isDisfluency=${tag != null} | [RENDERER] underline=${tag != null}`
+              );
 
               const final: DeepgramFinalWord = {
                 id: `dg-${Date.now().toString(36)}-${(dgUid++).toString(36)}`,
@@ -359,7 +389,8 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
                 startTimeMs: startMs,
                 endTimeMs: endMs,
                 confidence: conf,
-                isDisfluency: verdict.isDisfluency || type != null,
+                isDisfluency: tag != null,
+                disfluency: tag,
                 disfluencyType: type,
               };
               finalsRef.current = [...finalsRef.current, final];
@@ -367,7 +398,9 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
             }
           } else {
             // INTERIM → display-only ghost + revision detection. Never tokens.
-            interimRef.current = words
+            // The detector's interim hypothesis is updated here so the
+            // revision rule (E) sees the abandoned word when the final lands.
+            const interim = words
               .filter((w) => w.word && w.word.trim())
               .map((w) => ({
                 norm: normalizeLexicalWord(w.word!.trim())
@@ -375,6 +408,7 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
                   .replace(/[^a-z0-9']/g, ""),
                 startMs: Math.round(base + (w.start ?? 0) * 1000),
               }));
+            detectorRef.current?.setInterim(interim);
             setState((prev) => ({
               ...prev,
               interimWords: words

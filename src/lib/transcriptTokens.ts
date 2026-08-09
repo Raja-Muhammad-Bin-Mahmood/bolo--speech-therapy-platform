@@ -42,6 +42,15 @@ export interface TranscriptToken {
    */
   isDisfluency: boolean;
   /**
+   * STRUCTURED Deepgram disfluency tag — the object the LIVE TRANSCRIPT
+   * renderer reads to draw the purple underline. `disfluency != null`
+   * means "this word IS a disfluency" (never a Detection Feed concern).
+   */
+  disfluency?: {
+    type: string;
+    confidence: number;
+  } | null;
+  /**
    * Once a Deepgram disfluency token is reconciled it is locked —
    * a later Speechmatics token competing for the same slot is discarded.
    */
@@ -254,6 +263,9 @@ export function reconcileIncoming(
               ...existing,
               locked: t.isDisfluency || dg.isDisfluency,
               isDisfluency: t.isDisfluency || dg.isDisfluency,
+              // Structured tag must survive the merge — the renderer reads
+              // `disfluency != null` for the purple underline.
+              disfluency: existing.disfluency ?? dg.disfluency ?? null,
               disfluencyType: existing.disfluencyType ?? dg.disfluencyType,
               rawWord: existing.rawWord ?? dg.rawWord,
             }

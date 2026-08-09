@@ -100,6 +100,8 @@ export function useTranscriptReconciler(
         endTimeMs: Math.max(d.endTimeMs, d.startTimeMs + 1),
         source: "deepgram",
         isDisfluency: d.isDisfluency,
+        // STRUCTURED tag — the LIVE TRANSCRIPT renderer underlines on this.
+        disfluency: d.disfluency ?? null,
         locked: d.isDisfluency, // only disfluencies are locked
         disfluencyType: d.disfluencyType,
         confidence: d.confidence,
