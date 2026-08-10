@@ -57,6 +57,15 @@ export interface TranscriptToken {
   locked: boolean;
   disfluencyType?: string;
   confidence?: number;
+  /**
+   * First letter of the NORMALIZED word (a–z, lowercased) — derived from
+   * the normalized word, NEVER from punctuation. `null` when the word has
+   * no letters at all (e.g. "123", "…"). Populated by the token producers
+   * (TranscriptTokenIndex reads it; falls back to firstLetterOfWord()).
+   */
+  firstLetter?: string | null;
+  /** Lowercased comparison form of `word` (normWord() at creation time). */
+  normalizedWord?: string;
 }
 
 // ─── Constants (spec) ──────────────────────────────────────────────────
@@ -181,6 +190,146 @@ export function sortTokens(tokens: TranscriptToken[]): TranscriptToken[] {
   return [...tokens].sort((a, b) => a.startTimeMs - b.startTimeMs);
 }
 
+// ─── First-letter metadata + TranscriptTokenIndex ──────────────────────
+
+/**
+ * First letter of the NORMALIZED word (a–z, lowercased) — derived from the
+ * normalized word, NEVER from punctuation. `null` when the word has no
+ * letters at all ("123", "…").
+ *
+ *   "Hello" → "h"   "things" → "t"   "don't" → "d"
+ *   "123" → null    "um" → "u"
+ */
+export function firstLetterOfWord(w?: string): string | null {
+  const m = (w ?? "").toLowerCase().match(/[a-z]/);
+  return m ? m[0] : null;
+}
+
+/** Ensure a token carries its first-letter + normalized-word metadata.
+ *  Idempotent: an explicitly-set value is preserved, never recomputed. */
+export function withFirstLetterMetadata<T extends TranscriptToken>(t: T): T {
+  if (t.firstLetter !== undefined && t.normalizedWord !== undefined) return t;
+  return {
+    ...t,
+    firstLetter:
+      t.firstLetter !== undefined ? t.firstLetter : firstLetterOfWord(t.word),
+    normalizedWord: t.normalizedWord ?? normWord(t.word),
+  };
+}
+
+/**
+ * BOLO — TranscriptTokenIndex
+ *
+ * Maintains the relationship between every live transcript token's STABLE
+ * id, word, normalized word, first letter, timestamps, source and
+ * disfluency metadata. Identity is preserved by id: a word that already
+ * exists in the index is REFRESHED, never re-minted, so partial/final
+ * transcript updates keep ONE stable identity per spoken word.
+ *
+ * Pure data structure — performs NO detection and NO reclassification.
+ * Use `get(id)` to select a token by its stable id.
+ */
+export class TranscriptTokenIndex {
+  private byId = new Map<string, TranscriptToken>();
+  private ordered: TranscriptToken[] = [];
+
+  static fromTokens(tokens: TranscriptToken[]): TranscriptTokenIndex {
+    const idx = new TranscriptTokenIndex();
+    idx.rebuild(tokens);
+    return idx;
+  }
+
+  /** Rebuild from the reconciled array, preserving identity by stable id. */
+  rebuild(tokens: TranscriptToken[]): void {
+    this.byId.clear();
+    for (const t of tokens) {
+      const meta = withFirstLetterMetadata(t);
+      const existing = this.byId.get(meta.id);
+      this.byId.set(
+        meta.id,
+        existing ? { ...existing, ...meta, id: existing.id } : meta
+      );
+    }
+    this.ordered = sortTokens([...this.byId.values()]);
+  }
+
+  /** Retrieve a token by its stable id. */
+  get(id: string): TranscriptToken | undefined {
+    return this.byId.get(id);
+  }
+
+  has(id: string): boolean {
+    return this.byId.has(id);
+  }
+
+  get size(): number {
+    return this.byId.size;
+  }
+
+  /** All indexed tokens, sorted by startTimeMs (chronological order). */
+  all(): TranscriptToken[] {
+    return this.ordered;
+  }
+}
+
+// ─── LIVE UNDERLINE SAFETY RULE (visual-only gate) ─────────────────────
+
+/**
+ * Same predicate the LIVE TRANSCRIPT renderer uses for the purple
+ * underline: structured `disfluency` tag first, legacy flags as backstops.
+ */
+export function isDisfluencyClassified(t: TranscriptToken): boolean {
+  return t.disfluency != null || t.isDisfluency === true || t.locked === true;
+}
+
+function firstLetterOfToken(t: TranscriptToken): string | null {
+  return t.firstLetter !== undefined ? t.firstLetter : firstLetterOfWord(t.word);
+}
+
+function allSameFirstLetter(run: TranscriptToken[]): boolean {
+  const first = firstLetterOfToken(run[0]);
+  return run.every((t) => firstLetterOfToken(t) === first);
+}
+
+/**
+ * LIVE UNDERLINE SAFETY RULE — different-first-letter runs.
+ *
+ * Detection is untouched. This is a purely VISUAL safety gate evaluated
+ * BEFORE rendering: when 3 or more CONSECUTIVE disfluency-classified
+ * tokens in the transcript stream do NOT all share the same first letter,
+ * the purple underline is suppressed for the WHOLE run.
+ *
+ *   "things that don't really" → t / t / d / r → suppressed
+ *   "things that don't"        → t / t / d     → suppressed (3, mixed)
+ *   "ma ma ma ma"              → m / m / m / m → KEPT (same initial)
+ *   "germ ger ge german"       → g / g / g / g → KEPT
+ *   "i i i i"                  → i / i / i / i → KEPT
+ *
+ * The underlying detection events are never deleted or altered — this only
+ * decides whether the renderer draws the purple underline.
+ */
+export function suppressedUnderlineTokenIds(
+  tokens: TranscriptToken[]
+): Set<string> {
+  const suppressed = new Set<string>();
+  const sorted = sortTokens(tokens);
+  let i = 0;
+  while (i < sorted.length) {
+    if (!isDisfluencyClassified(sorted[i])) {
+      i += 1;
+      continue;
+    }
+    let j = i;
+    while (j < sorted.length && isDisfluencyClassified(sorted[j])) j += 1;
+    const run = sorted.slice(i, j);
+    if (run.length >= 3 && !allSameFirstLetter(run)) {
+      for (const t of run) suppressed.add(t.id);
+    }
+    i = j;
+  }
+  return suppressed;
+}
+
 // ─── Reconciliation ────────────────────────────────────────────────────
 
 export interface ReconcileResult {
@@ -231,6 +380,8 @@ export function reconcileIncoming(
           // source + locked so Speechmatics can never overwrite it later.
           dg.rawWord = dg.rawWord ?? candidate.rawWord ?? candidate.word;
           dg.word = dg.word || candidate.word;
+          // First-letter metadata stays derived from the merged word; the
+          // Speechmatics candidate (discarded below) carried its own copy.
         }
       }
     }

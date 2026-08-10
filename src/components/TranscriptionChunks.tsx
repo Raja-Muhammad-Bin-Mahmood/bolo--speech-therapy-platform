@@ -10,6 +10,7 @@ import { assignEventsToSpans } from "../lib/feedEvents";
 import { buildRecoveredItems } from "../lib/recoveryRender";
 import {
   suppressedByLock,
+  suppressedUnderlineTokenIds,
   type TranscriptToken,
 } from "../lib/transcriptTokens";
 import FeedChip from "./FeedChip";
@@ -168,6 +169,13 @@ interface LineWord {
   recovered?: RecoveredAnnotation | null;
   /** Reconciled Deepgram disfluency token (normalized word + marker) */
   deepgram?: TranscriptToken | null;
+  /**
+   * LIVE UNDERLINE SAFETY RULE: true when this word's purple underline was
+   * suppressed because 3+ consecutive disfluency-classified tokens did NOT
+   * share the same first letter. Computed from the reconciled token array
+   * BEFORE rendering (never after), so the first 3 underlines never flash.
+   */
+  underlineSuppressed?: boolean;
 }
 
 const TAG_STYLES: Record<DisfluencyTag, string> = {
@@ -309,16 +317,19 @@ function WordSpan({ word }: { word: LineWord }) {
     const dgTag = word.deepgram.disfluency;
     const isDgDisfluency =
       dgTag != null || word.deepgram.isDisfluency || word.deepgram.locked;
+    // LIVE UNDERLINE SAFETY RULE: the detection/classification is intact,
+    // only the VISUAL purple underline is suppressed for this token.
+    const showUnderline = isDgDisfluency && !word.underlineSuppressed;
     return (
       <span className="inline-flex items-center gap-1 align-middle">
         <span
           className={
-            isDgDisfluency
+            showUnderline
               ? "inline-block rounded px-1 underline decoration-2 decoration-purple-400 underline-offset-4 bg-[#BD8CFF]/10 text-[#BD8CFF]/90 transition-colors duration-200"
               : "inline-block rounded px-1 text-white/85 transition-colors duration-200"
           }
           title={
-            isDgDisfluency
+            showUnderline
               ? `Deepgram disfluency · ${dgTag?.type ?? word.deepgram.disfluencyType ?? "disfluency"} (${Math.round((dgTag?.confidence ?? 0.9) * 100)}%)${word.deepgram.rawWord && word.deepgram.rawWord !== word.deepgram.word ? ` · raw: ${word.deepgram.rawWord}` : ""}`
               : undefined
           }
@@ -403,6 +414,11 @@ function buildLines(
 ): { id: string; items: LineItem[] }[] {
   const lines: { id: string; items: LineItem[] }[] = [];
   let lineId = 0;
+
+  // LIVE UNDERLINE SAFETY RULE — evaluate BEFORE building any rendered
+  // items. Token IDs in this set must NOT render a purple underline. This
+  // is a purely visual gate: detection events are never deleted or altered.
+  const suppressedUnderlineIds = suppressedUnderlineTokenIds(deepgramTokens);
 
   // Reconciled Deepgram tokens — PRIMARY source (fluent + disfluent). A
   // Speechmatics partial/final word that competes for the same spoken slot
@@ -723,6 +739,8 @@ function buildLines(
         startTime: d.startTimeMs / 1000,
         deepgram: d,
         events: dgAssignments[i] ?? [],
+        // LIVE UNDERLINE SAFETY RULE — no purple underline for this token.
+        underlineSuppressed: suppressedUnderlineIds.has(d.id),
       },
     }));
 

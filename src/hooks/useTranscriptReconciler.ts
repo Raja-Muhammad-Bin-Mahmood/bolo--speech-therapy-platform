@@ -25,6 +25,7 @@ import {
   reconcileIncoming,
   sortTokens,
   normWord,
+  firstLetterOfWord,
   type TranscriptToken,
 } from "../lib/transcriptTokens";
 
@@ -105,6 +106,10 @@ export function useTranscriptReconciler(
         locked: d.isDisfluency, // only disfluencies are locked
         disfluencyType: d.disfluencyType,
         confidence: d.confidence,
+        // First-letter index metadata (TranscriptTokenIndex). Derived from
+        // the NORMALIZED word, never punctuation: "don't" → "d", "123" → null.
+        firstLetter: firstLetterOfWord(d.word),
+        normalizedWord: normWord(d.word),
       };
       const res = reconcileIncoming(tokensRef.current, incoming);
       tokensRef.current = res.tokens;
@@ -139,6 +144,9 @@ export function useTranscriptReconciler(
           isDisfluency: false,
           locked: false,
           confidence: (w as any).confidence ?? 0.9,
+          // First-letter index metadata (TranscriptTokenIndex).
+          firstLetter: firstLetterOfWord(text),
+          normalizedWord: norm,
         };
         const res = reconcileIncoming(tokensRef.current, incoming);
         tokensRef.current = res.tokens;
