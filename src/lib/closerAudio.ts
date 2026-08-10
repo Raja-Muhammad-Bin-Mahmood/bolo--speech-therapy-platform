@@ -86,6 +86,11 @@ export class AudioQueue {
     }
   }
 
+  /** Number of audio chunks currently playing or queued (for verification). */
+  depth(): number {
+    return this.active.length;
+  }
+
   /**
    * Immediately stop whatever is playing and drop everything still queued.
    * The context stays alive so the next chunk plays instantly (barge-in).

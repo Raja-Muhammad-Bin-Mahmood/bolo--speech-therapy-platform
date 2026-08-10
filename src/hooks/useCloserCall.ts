@@ -149,6 +149,9 @@ export function useCloserCall() {
   const seenFinalsRef = useRef<Set<object>>(new Set());
   const seenUserTranscriptRef = useRef<Set<string>>(new Set());
   const userPartialRef = useRef("");
+  const customerPartialRef = useRef("");
+  const lastCustomerTextRef = useRef("");
+  const lastUserTextRef = useRef("");
   const micActiveRef = useRef(false);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const softHangupCountRef = useRef(0);
@@ -188,6 +191,15 @@ export function useCloserCall() {
     setLiveState(s);
   }, []);
 
+  /** Whitespace-normalise a transcript line (for fuzzy duplicate detection). */
+  const norm = useCallback((s: string) => s.replace(/\s+/g, " ").trim(), []);
+
+  /** True when two transcript lines are the same words (case-insensitive). */
+  const normCompare = useCallback(
+    (a: string, b: string) => norm(a.toLowerCase()) === norm(b.toLowerCase()),
+    [norm]
+  );
+
   const pushLine = useCallback((role: "user" | "customer", text: string) => {
     const line: TranscriptLine = {
       role,
@@ -214,12 +226,18 @@ export function useCloserCall() {
   }, [stt.transcripts, pushLine]);
 
   // ── Gemini Live user transcription (final) → transcript lines ────────
+  // The Live hook now ACCUMULATES every interim/segment-final event into ONE
+  // user turn and calls this exactly once per complete spoken prompt. So the
+  // only dedup needed here is against the Speechmatics lane (which can final
+  // the same words and would otherwise create a duplicate line).
   const onUserFinalTranscript = useCallback(
     (text: string) => {
       const t = text.trim();
       if (!t || phaseRef.current !== "live") return;
       if (seenUserTranscriptRef.current.has(t)) return;
+      if (normCompare(t, lastUserTextRef.current)) return;
       seenUserTranscriptRef.current.add(t);
+      lastUserTextRef.current = t;
       pushLine("user", t);
     },
     [pushLine]
@@ -464,18 +482,29 @@ export function useCloserCall() {
         }, 250);
       },
       onAiText: (text) => {
-        customerTurnRef.current += text;
-        setCustomerPartial(customerTurnRef.current);
-        setCustomerSpeaking(true);
-        setLiveStateBoth("customer_speaking");
+        // Accumulate the customer's streaming reply into ONE line. The Live
+        // hook can deliver the same text twice (modelTurn text + output
+        // transcription) — dedup so the partial never doubles.
+        if (text && normCompare(text, customerPartialRef.current)) {
+          // Same words as what we already have — no-op.
+        } else {
+          customerPartialRef.current = text;
+          customerTurnRef.current = text;
+          setCustomerPartial(text);
+          setCustomerSpeaking(true);
+          setLiveStateBoth("customer_speaking");
+        }
       },
       onTurnComplete: () => {
         const text = customerTurnRef.current.trim();
         customerTurnRef.current = "";
+        customerPartialRef.current = "";
         setCustomerPartial("");
         setCustomerSpeaking(false);
         setLiveStateBoth("connected");
         if (!text) return;
+        if (normCompare(text, lastCustomerTextRef.current)) return;
+        lastCustomerTextRef.current = text;
         pushLine("customer", text);
 
         // The customer's final goodbye — unambiguous, no recovery.
@@ -495,6 +524,12 @@ export function useCloserCall() {
         }
       },
       onInterrupted: () => {
+        // The customer was cut off — drop their partial so the NEXT turn
+        // doesn't merge with the fragment that was playing when the user
+        // barged in.
+        customerTurnRef.current = "";
+        customerPartialRef.current = "";
+        setCustomerPartial("");
         setInterruptedAt(Date.now());
         setLiveStateBoth("interrupted");
         window.setTimeout(() => {
@@ -502,6 +537,16 @@ export function useCloserCall() {
             setLiveStateBoth("connected");
           }
         }, 1200);
+      },
+      onBargeIn: () => {
+        // Client-side VAD cut the customer's audio locally (Gemini 3.1 edge
+        // case: server may not emit `interrupted` when the user is already
+        // speaking as the model's turn begins). Same partial cleanup as a
+        // server interruption — the user's new speech keeps accumulating.
+        customerTurnRef.current = "";
+        customerPartialRef.current = "";
+        setCustomerPartial("");
+        setInterruptedAt(Date.now());
       },
       onUserTranscript: (text) => {
         userPartialRef.current = text;
@@ -521,6 +566,10 @@ export function useCloserCall() {
           void handleReconnect();
         }
       },
+      // Snapshot the conversation so far — used to re-hydrate the customer's
+      // memory if the Live socket drops and reconnects mid-call.
+      getHistory: () =>
+        transcriptRef.current.map((l) => ({ role: l.role, text: l.text })),
     });
   }, [mic, stt, dg, live, pushLine, setPhaseBoth, setLiveStateBoth, onUserFinalTranscript, handleReconnect]);
 
@@ -559,6 +608,9 @@ export function useCloserCall() {
     seenFinalsRef.current = new Set();
     seenUserTranscriptRef.current = new Set();
     customerTurnRef.current = "";
+    customerPartialRef.current = "";
+    lastCustomerTextRef.current = "";
+    lastUserTextRef.current = "";
     userPartialRef.current = "";
     elapsedRef.current = 0;
     softHangupCountRef.current = 0;
