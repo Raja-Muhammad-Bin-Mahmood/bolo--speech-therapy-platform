@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { GoogleGenAI, Modality } from "@google/genai";
 import { supabase, SUPABASE_URL } from "../lib/supabase";
-import { AudioQueue, float32ToPcmBlob } from "../lib/closerAudio";
+import { AudioQueue, float32ToInt16, int16ToBase64 } from "../lib/closerAudio";
 import { createVoiceActivity } from "../lib/voiceActivity";
 
 /**
@@ -263,7 +263,10 @@ export function useGeminiLive() {
 
       try {
         (sessionRef.current as any)?.sendRealtimeInput({
-          media: float32ToPcmBlob(f32),
+          audio: {
+            data: int16ToBase64(float32ToInt16(f32)),
+            mimeType: "audio/pcm;rate=16000",
+          },
         });
       } catch {
         // Never let one bad chunk kill the call.
