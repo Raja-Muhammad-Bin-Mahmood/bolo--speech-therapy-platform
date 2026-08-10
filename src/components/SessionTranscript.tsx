@@ -30,6 +30,8 @@ import { assignEventsToSpans } from "../lib/feedEvents";
 import { buildRecoveredItems } from "../lib/recoveryRender";
 import FeedChip from "./FeedChip";
 import StutterSpan from "./StutterSpan";
+import MarkerChip from "./MarkerChip";
+import { sortMarkers, type SessionMarker } from "../lib/manualAnnotations";
 
 interface SessionTranscriptProps {
   /** The SAVED live transcript token array (single source of truth). */
@@ -46,6 +48,9 @@ interface SessionTranscriptProps {
   /** ms-keys of SM words the recovery engine recovered locally first —
    *  they were hidden live and stay hidden (never duplicated). */
   hiddenKeys?: Set<string>;
+  /** Manual markers (SPACE / MARKER button) — rendered as animated MARKER
+   *  chips at their chronological positions. */
+  markers?: SessionMarker[];
   /** Safety-net max words per line. */
   maxWordsPerLine?: number;
 }
@@ -86,7 +91,8 @@ type RItem =
     }
   | { kind: "pause"; event: PauseEvent }
   | { kind: "recovered"; rec: RecoveredAnnotation }
-  | { kind: "event"; evt: FeedEvent };
+  | { kind: "event"; evt: FeedEvent }
+  | { kind: "marker"; marker: SessionMarker };
 
 function buildSessionLines(
   tokens: TranscriptToken[],
@@ -95,6 +101,7 @@ function buildSessionLines(
   events: FeedEvent[],
   recovered: RecoveredAnnotation[],
   hiddenKeys: Set<string> | undefined,
+  markers: SessionMarker[],
   maxWordsPerLine: number
 ): { id: string; items: RItem[] }[] {
   if (tokens.length === 0) return [];
@@ -214,6 +221,27 @@ function buildSessionLines(
     }
   }
 
+  // ── Manual markers inline (chronological — same as live) ──────────────
+  for (const m of sortMarkers(markers)) {
+    const mTimeSec = m.timeMs / 1000;
+    let inserted = false;
+    for (const line of lines) {
+      for (let idx = 0; idx < line.items.length; idx++) {
+        const item = line.items[idx];
+        if (item.kind !== "word") continue;
+        if (item.token.startTimeMs / 1000 >= mTimeSec) {
+          line.items.splice(idx, 0, { kind: "marker", marker: m });
+          inserted = true;
+          break;
+        }
+      }
+      if (inserted) break;
+    }
+    if (!inserted && lines.length > 0) {
+      lines[lines.length - 1].items.push({ kind: "marker", marker: m });
+    }
+  }
+
   // ── Orphan detector events inline (block before a word, etc.) ─────────
   const attachedIds = new Set(eventAssignments.flat().map((e) => e.id));
   const orphans = events
@@ -251,6 +279,7 @@ export default function SessionTranscript({
   events = [],
   recovered = [],
   hiddenKeys,
+  markers = [],
   maxWordsPerLine = 16,
 }: SessionTranscriptProps) {
   const lines = useMemo(
@@ -262,9 +291,10 @@ export default function SessionTranscript({
         events,
         recovered,
         hiddenKeys,
+        markers,
         maxWordsPerLine
       ),
-    [tokens, wordTags, pauseEvents, events, recovered, hiddenKeys, maxWordsPerLine]
+    [tokens, wordTags, pauseEvents, events, recovered, hiddenKeys, markers, maxWordsPerLine]
   );
 
   if (lines.length === 0) {
@@ -292,6 +322,10 @@ export default function SessionTranscript({
             if (item.kind === "event")
               return (
                 <InlineEventChip key={`e-${item.evt.id}`} evt={item.evt} />
+              );
+            if (item.kind === "marker")
+              return (
+                <MarkerChip key={`m-${item.marker.id}`} marker={item.marker} />
               );
             return <WordSpan key={`w-${item.token.id}`} item={item} />;
           })}

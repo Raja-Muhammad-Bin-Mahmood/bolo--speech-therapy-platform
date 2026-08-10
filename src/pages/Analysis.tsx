@@ -1,5 +1,5 @@
 import { useLocation, useNavigate } from "react-router-dom";
-import { useMemo } from "react";
+import { useMemo, useState, useEffect, useCallback } from "react";
 import { motion } from "framer-motion";
 import {
   ArrowLeft,
@@ -16,6 +16,7 @@ import {
 import Navbar from "../components/Navbar";
 import EvidenceReviewPanel from "../components/EvidenceReviewPanel";
 import SessionTranscript from "../components/SessionTranscript";
+import ManualAnnotationPanel from "../components/ManualAnnotationPanel";
 import type { SensorSession } from "../lib/sensorTypes";
 import FeedChip from "../components/FeedChip";
 import StutterSpan from "../components/StutterSpan";
@@ -28,11 +29,19 @@ import {
   buildRecoveredItems,
 } from "../lib/recoveryRender";
 import type { RecoveredAnnotation } from "../lib/recoveryTypes";
+import type { TranscriptToken } from "../lib/transcriptTokens";
 import { scoreAcousticEvents, type ScoredEvent } from "../lib/evidenceFusion";
 import type { PauseEvent } from "../lib/pauseDetector";
 import { useEvidenceTuning } from "../context/EvidenceTuningContext";
 import { visibleTagForWord } from "../lib/evidenceGating";
 import { mergeAcousticEvents } from "../lib/mergeAcousticEvents";
+import { useAuth } from "../context/AuthContext";
+import {
+  loadSessionEvents,
+  type OfficialDisfluencyEvent,
+  type SessionMarker,
+  type UserAccount,
+} from "../lib/manualAnnotations";
 
 // ─── Stat Card ──────────────────────────────────────────────────────────
 
@@ -310,6 +319,85 @@ export default function Analysis() {
     () => (Array.isArray(data?.sessionDisfluencies) ? data.sessionDisfluencies : []),
     [data]
   );
+
+  // ── MANUAL MARKERS + OFFICIAL EVENTS (user-level) ────────────────────
+  // Markers are timestamped placeholders the user reviews after the session.
+  // Official disfluency events (automatic + manual) come from the user's
+  // account and drive the manual-annotation review.
+  const { user, isLocal } = useAuth();
+  const account: UserAccount | null = useMemo(
+    () => (user ? { id: user.id, isLocal } : null),
+    [user, isLocal]
+  );
+  const sessionId: string | null = data?.sessionId ?? null;
+  const navMarkers: SessionMarker[] = useMemo(
+    () => (Array.isArray(data?.markers) ? data.markers : []),
+    [data]
+  );
+  const [markers, setMarkers] = useState<SessionMarker[]>(navMarkers);
+  useEffect(() => setMarkers(navMarkers), [navMarkers]);
+
+  // Official events for this session (auto + manual) — loaded from the
+  // user's account; manual annotations append to this list and re-render
+  // the transcript with the EXISTING disfluency styling.
+  const [officialEvents, setOfficialEvents] = useState<OfficialDisfluencyEvent[]>([]);
+  useEffect(() => {
+    if (!account || !sessionId) return;
+    let alive = true;
+    loadSessionEvents(account, sessionId)
+      .then((evts) => {
+        if (alive) setOfficialEvents(evts);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [account, sessionId]);
+
+  const handleAnnotated = useCallback(
+    (created: OfficialDisfluencyEvent[]) => {
+      setOfficialEvents((prev) => {
+        const byKey = new Map(
+          prev.map((e) => [`${e.sessionId}|${e.tokenId}|${e.source}`, e])
+        );
+        for (const e of created) byKey.set(`${e.sessionId}|${e.tokenId}|${e.source}`, e);
+        return [...byKey.values()];
+      });
+    },
+    []
+  );
+
+  // Merge official events (auto + manual) onto the transcript tokens so a
+  // manual annotation immediately renders with the EXISTING disfluency
+  // styling (amber filler chip / purple stutter-like underline).
+  const manualAnnotatedTokenIds = useMemo(
+    () => new Set(officialEvents.map((e) => e.tokenId)),
+    [officialEvents]
+  );
+  const enrichedTokens = useMemo(() => {
+    if (transcriptTokens.length === 0 || manualAnnotatedTokenIds.size === 0) {
+      return transcriptTokens;
+    }
+    return transcriptTokens.map((t: TranscriptToken) => {
+      if (!manualAnnotatedTokenIds.has(t.id)) return t;
+      const evt = officialEvents.find((e) => e.tokenId === t.id);
+      if (!evt) return t;
+      return {
+        ...t,
+        // Attach the structured disfluency tag so the existing renderer
+        // applies the purple underline / amber filler exactly as if it had
+        // been detected live.
+        disfluency: {
+          type: evt.type,
+          confidence: 1,
+        },
+        isDisfluency: true,
+        locked: true,
+        firstLetter:
+          evt.firstLetter != null ? evt.firstLetter : t.firstLetter,
+      };
+    });
+  }, [transcriptTokens, officialEvents, manualAnnotatedTokenIds]);
 
   const TAG_STYLES: Record<string, string> = {
     filler: "text-amber-300/90 bg-amber-300/10",
@@ -1003,15 +1091,19 @@ export default function Analysis() {
               </span>
             </div>
 
-            {/* The SAVED live transcript — replayed, never re-generated */}
+            {/* The SAVED live transcript — replayed, never re-generated.
+                `enrichedTokens` = saved tokens + manual annotations merged
+                in with the structured disfluency tag, so a confirmed manual
+                annotation renders with the EXISTING styling immediately. */}
             <div className="bg-white/5 rounded-xl p-4 max-h-64 overflow-y-auto leading-relaxed text-sm">
               <SessionTranscript
-                tokens={transcriptTokens}
+                tokens={enrichedTokens}
                 wordTags={sessionWordTags}
                 pauseEvents={pauseEvents}
                 events={feedEvents}
                 recovered={recoveredAnnotations}
                 hiddenKeys={transcriptHiddenKeys}
+                markers={markers}
               />
             </div>
 
@@ -1052,6 +1144,29 @@ export default function Analysis() {
                 </div>
               </div>
             )}
+          </motion.div>
+        )}
+
+        {/* ── Manual Marker Review + Annotation (post-session) ────────── */}
+        {/* The user reviews every MARKER dropped during the session and
+            selects the actual word(s) to confirm as OFFICIAL disfluencies
+            (source "manual") — the same event model as automatic detection,
+            persisted to the authenticated user's account. */}
+        {(markers.length > 0 || officialEvents.length > 0) && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.31 }}
+            className="mb-8"
+          >
+            <ManualAnnotationPanel
+              tokens={transcriptTokens}
+              markers={markers}
+              sessionId={sessionId ?? ""}
+              account={account}
+              existingEvents={officialEvents}
+              onAnnotated={handleAnnotated}
+            />
           </motion.div>
         )}
 

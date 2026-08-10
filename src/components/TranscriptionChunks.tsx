@@ -16,6 +16,8 @@ import {
 import FeedChip from "./FeedChip";
 import StutterSpan from "./StutterSpan";
 import PulseDots from "./PulseDots";
+import MarkerChip from "./MarkerChip";
+import { sortMarkers, type SessionMarker } from "../lib/manualAnnotations";
 
 interface TranscriptionChunksProps {
   transcripts: TranscriptChunk[];
@@ -52,6 +54,12 @@ interface TranscriptionChunksProps {
    * partials so the UI never flickers between "slap" and "rap".
    */
   deepgramTokens?: TranscriptToken[];
+  /**
+   * Manual markers (SPACE / MARKER button during the session) — rendered as
+   * animated MARKER chips at their chronological positions. A marker is a
+   * timestamped placeholder, NOT a disfluency.
+   */
+  markers?: SessionMarker[];
   /** Safety-net max words per line */
   maxWordsPerLine?: number;
 }
@@ -73,6 +81,7 @@ export default function TranscriptionChunks({
   duplicateKeys,
   pending = [],
   deepgramTokens = [],
+  markers = [],
   maxWordsPerLine = 16,
 }: TranscriptionChunksProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -87,6 +96,7 @@ export default function TranscriptionChunks({
     duplicateKeys,
     pending,
     deepgramTokens,
+    markers,
     maxWordsPerLine
   );
 
@@ -136,6 +146,8 @@ export default function TranscriptionChunks({
                 <PulseDots key={item.evt.id} title={`Analyzing ${item.evt.type}…`} />
               ) : item.kind === "event" ? (
                 <InlineEventChip key={item.evt.id} evt={item.evt} />
+              ) : item.kind === "marker" ? (
+                <MarkerChip key={`m-${item.marker.id}`} marker={item.marker} />
               ) : (
                 <WordSpan key={wi} word={item.word} />
               )
@@ -399,7 +411,8 @@ type LineItem =
   | { kind: "pause"; event: PauseEvent }
   | { kind: "recovered"; rec: RecoveredAnnotation }
   | { kind: "pending"; evt: PendingSpeechEvent }
-  | { kind: "event"; evt: FeedEvent };
+  | { kind: "event"; evt: FeedEvent }
+  | { kind: "marker"; marker: SessionMarker };
 
 function buildLines(
   transcripts: TranscriptChunk[],
@@ -410,6 +423,7 @@ function buildLines(
   duplicateKeys: Set<string> | undefined,
   pending: PendingSpeechEvent[],
   deepgramTokens: TranscriptToken[],
+  markers: SessionMarker[],
   maxWordsPerLine: number
 ): { id: string; items: LineItem[] }[] {
   const lines: { id: string; items: LineItem[] }[] = [];
@@ -777,6 +791,34 @@ function buildLines(
         } else {
           lines.push({ id: `line-${lineId++}`, items: [dgItem] });
         }
+      }
+    }
+  }
+
+  // ── Inject manual markers chronologically ───────────────────────
+  // SPACE / MARKER button placeholders — rendered at their session-relative
+  // timestamp position. A marker is a reminder, NOT a disfluency.
+  for (const m of sortMarkers(markers)) {
+    const mTimeSec = m.timeMs / 1000;
+    let inserted = false;
+    for (const line of lines) {
+      for (let idx = 0; idx < line.items.length; idx++) {
+        const item = line.items[idx];
+        if (item.kind !== "word") continue;
+        const wStart = (item.word as LineWord).startTime;
+        if (wStart >= mTimeSec) {
+          line.items.splice(idx, 0, { kind: "marker", marker: m });
+          inserted = true;
+          break;
+        }
+      }
+      if (inserted) break;
+    }
+    if (!inserted) {
+      // No word after the marker yet — append to the last line so the
+      // marker stays visible at the transcript cursor.
+      if (lines.length > 0) {
+        lines[lines.length - 1].items.push({ kind: "marker", marker: m });
       }
     }
   }

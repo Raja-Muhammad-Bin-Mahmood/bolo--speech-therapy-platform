@@ -25,6 +25,7 @@ import {
   AlertTriangle,
   RotateCcw,
   BarChart3,
+  Flag,
 } from "lucide-react";
 import Navbar from "../components/Navbar";
 import TopicDrum from "../components/TopicDrum";
@@ -63,6 +64,14 @@ import {
   persistSessionDisfluencies,
   type SessionDisfluencySnapshot,
 } from "../lib/sessionDisfluencies";
+import {
+  makeMarkerId,
+  persistMarkers,
+  persistEvents,
+  type OfficialDisfluencyEvent,
+  type SessionMarker,
+  type UserAccount,
+} from "../lib/manualAnnotations";
 
 type Phase = "topic" | "recording" | "processing";
 
@@ -101,7 +110,7 @@ interface TickerItem {
 
 export default function RecordingSession() {
   const navigate = useNavigate();
-  const { saveSessionData } = useAuth();
+  const { user, isLocal, saveSessionData } = useAuth();
 
   const [phase, setPhase] = useState<Phase>("topic");
   const [selectedTopic, setSelectedTopic] = useState<string | null>(null);
@@ -114,6 +123,19 @@ export default function RecordingSession() {
     stammers: number;
     pauses: number;
   } | null>(null);
+
+  // ── Manual markers (SPACE / MARKER button) ──────────────────────────
+  // Markers are timestamped placeholders ("come back and annotate this"),
+  // NOT disfluencies. They live in state during the session and are
+  // persisted to the authenticated user's account at session end.
+  const [markers, setMarkers] = useState<SessionMarker[]>([]);
+  const markersRef = useRef<SessionMarker[]>([]);
+  const sessionIdRef = useRef<string>(`session-${Date.now().toString(36)}`);
+  const userRef = useRef<UserAccount | null>(null);
+  useEffect(() => {
+    if (!user) return;
+    userRef.current = { id: user.id, isLocal };
+  }, [user, isLocal]);
 
   // ── Detection pipeline ──────────────────────────────────────────────
   const audio = useAudioCapture();
@@ -299,6 +321,66 @@ export default function RecordingSession() {
     rawWordTags
   );
 
+  // ── Insert marker at the current session time (SPACE / MARKER button) ──
+  const insertMarker = useCallback(() => {
+    if (!isRecording || finishLockRef.current) return;
+    const nowSec = audio.getStreamTime();
+    if (nowSec == null) return;
+    const timeMs = Math.max(0, Math.round(nowSec * 1000));
+    // Attach the nearest transcript token (position, not a word) when one
+    // exists around the marker time — the after-session review anchor.
+    const sorted = [...reconciler.tokens].sort(
+      (a, b) => a.startTimeMs - b.startTimeMs
+    );
+    let nearest: TranscriptToken | null = null;
+    let bestDist = Infinity;
+    for (const t of sorted) {
+      const dist = Math.abs(t.startTimeMs - timeMs);
+      if (dist < bestDist) {
+        bestDist = dist;
+        nearest = t;
+      }
+    }
+    const marker: SessionMarker = {
+      id: makeMarkerId(),
+      sessionId: sessionIdRef.current,
+      timeMs,
+      tokenId: nearest && bestDist <= 4000 ? nearest.id : null,
+      createdAt: new Date().toISOString(),
+    };
+    setMarkers((prev) => {
+      const next = [...prev, marker];
+      markersRef.current = next;
+      return next;
+    });
+  }, [isRecording, audio, reconciler.tokens]);
+
+  // ── Spacebar → insert marker (during the ACTIVE recording session only;
+  //    never interferes with typing outside the session) ───────────────
+  useEffect(() => {
+    if (!isRecording) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code !== "Space") return;
+      // Ignore when the user is typing in an input / textarea / contenteditable
+      const el = e.target as HTMLElement | null;
+      if (el) {
+        const tag = el.tagName;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          el.isContentEditable ||
+          el.closest("[contenteditable='true']")
+        ) {
+          return;
+        }
+      }
+      e.preventDefault();
+      insertMarker();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isRecording, insertMarker]);
+
   // ── Fused event feed (stutter/stammer from A + B, deduped) ─────────
   const tickerItems = useMemo<TickerItem[]>(() => {
     const items: TickerItem[] = [];
@@ -385,6 +467,10 @@ export default function RecordingSession() {
     (topic: string) => {
       setSelectedTopic(topic);
       finishLockRef.current = false;
+      // Fresh session: new session id, no markers carried over.
+      sessionIdRef.current = `session-${Date.now().toString(36)}`;
+      setMarkers([]);
+      markersRef.current = [];
       pace.reset();
       setPhase("recording");
       setIsRecording(true);
@@ -525,16 +611,52 @@ export default function RecordingSession() {
 
     // ── AFTER-SESSION DATA: persist the structured disfluency collection ──
     // Survives the live session end (localStorage) so later features (the
-    // exercise system) can consume it — nothing is lost.
+    // exercise system) can consume it — nothing is lost. The session id is
+    // shared with the marker + manual-annotation persistence so everything
+    // for one session keys on the SAME id.
+    const sessionId = sessionIdRef.current;
     try {
       persistSessionDisfluencies({
-        sessionId: `session-${Date.now().toString(36)}`,
+        sessionId,
         topic: selectedTopic,
         recordedAt: new Date().toISOString(),
         items: finalDisfluencies,
       } satisfies SessionDisfluencySnapshot);
     } catch {
       // non-critical — history persistence is best-effort
+    }
+
+    // ── USER-LEVEL PERSISTENCE (markers + official disfluency events) ──
+    // Markers and every official disfluency event (automatic from the live
+    // session, manual from post-session annotation) are stored on the
+    // authenticated user's account — never only in React state.
+    // Markers: the session's own markers, persisted to the user account.
+    const finalMarkers = markersRef.current.filter(
+      (m) => m.sessionId === sessionId
+    );
+    const account = userRef.current;
+    if (account) {
+      persistMarkers(account, finalMarkers);
+      // OFFICIAL DISFLUENCY EVENTS — source "automatic": the live-detected
+      // disfluencies from the structured collection. Manual annotations
+      // (source "manual") are added later on the analysis screen with the
+      // SAME event model and SAME persistence path.
+      const automaticEvents: OfficialDisfluencyEvent[] = finalDisfluencies.map(
+        (d) => ({
+          id: d.tokenId ? `evt_${sessionId}_${d.tokenId}` : makeMarkerId(),
+          sessionId,
+          tokenId: d.tokenId,
+          word: d.word,
+          firstLetter: d.firstLetter,
+          type: d.type,
+          timeMs: d.timeMs,
+          source: "automatic" as const,
+          utterance: d.utterance,
+          sentence: d.sentence,
+          createdAt: new Date().toISOString(),
+        })
+      );
+      persistEvents(account, automaticEvents);
     }
 
     try {
@@ -588,6 +710,11 @@ export default function RecordingSession() {
           // Structured session disfluencies (complete word + firstLetter /
           // full filler word + type + timestamp + source + sentence).
           sessionDisfluencies: finalDisfluencies,
+          // ── MANUAL MARKERS (SPACE / MARKER button) ──
+          // The session's own markers, carried to the after-session screen
+          // where the user reviews them and annotates the transcript.
+          sessionId,
+          markers: finalMarkers,
         },
       });
     }, 900);
@@ -842,6 +969,27 @@ export default function RecordingSession() {
                   <span className="text-[10px] uppercase tracking-wider text-soft-gray/50 font-medium">
                     Live Transcript
                   </span>
+                  <div className="flex items-center gap-2">
+                    {/* MARKER control — insert a marker at the current
+                        timestamp (also SPACE during recording). A marker is
+                        a placeholder to annotate later, NOT a disfluency. */}
+                    <span className="inline-flex items-center gap-1.5 text-[10px] text-cyan-300/80">
+                      <Flag className="w-3 h-3" />
+                      {markers.length} marker{markers.length === 1 ? "" : "s"}
+                    </span>
+                    <button
+                      onClick={insertMarker}
+                      disabled={!isRecording}
+                      className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-mono text-cyan-300 bg-cyan-300/10 border border-cyan-300/35 transition-all duration-200 hover:brightness-125 active:scale-[0.97] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                      title="Insert a marker at the current point (or press SPACE)"
+                    >
+                      <Flag className="w-3 h-3" />
+                      MARKER
+                      <kbd className="hidden sm:inline-flex items-center rounded bg-cyan-300/15 px-1 py-px text-[9px] text-cyan-200/90">
+                        SPACE
+                      </kbd>
+                    </button>
+                  </div>
                   {tickerItems.length > 0 && (
                     <span className="text-[10px] text-soft-gray/40">
                       colored = detected disfluency
@@ -864,6 +1012,7 @@ export default function RecordingSession() {
                   duplicateKeys={mergedDuplicateKeys}
                   deepgramTokens={reconciler.tokens}
                   pending={recovery.pending}
+                  markers={markers}
                 />
               </div>
 
