@@ -83,6 +83,89 @@ function tokenize(text: string): string[] {
   return text.split(/\s+/).filter(Boolean);
 }
 
+// ─── Tolerant matching (punctuation-insensitive + bounded fuzzy) ────────
+// The script's exact spelling (capitalization, punctuation, em dashes,
+// quotes, apostrophes) must NEVER be the reason a correctly-read word is
+// marked red. Comparisons run on a punctuation-stripped lowercase form;
+// when exact equality fails, a bounded Levenshtein check (same first
+// letter, small edit distance relative to length) accepts minor ASR
+// variation. Completely unrelated words still fail, so real reading
+// errors stay visible.
+
+function matchNorm(w: string): string {
+  return w.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  const al = a.length;
+  const bl = b.length;
+  if (!al) return bl;
+  if (!bl) return al;
+  let prev = new Array<number>(bl + 1);
+  let curr = new Array<number>(bl + 1);
+  for (let j = 0; j <= bl; j++) prev[j] = j;
+  for (let i = 1; i <= al; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= bl; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    for (let j = 0; j <= bl; j++) prev[j] = curr[j];
+  }
+  return prev[bl];
+}
+
+/** Same first letter + bounded edit distance ⇒ acceptable match. */
+function fuzzySimilar(a: string, b: string): boolean {
+  const na = matchNorm(a);
+  const nb = matchNorm(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na[0] !== nb[0]) return false; // different word — reject
+  const dist = levenshtein(na, nb);
+  const maxLen = Math.max(na.length, nb.length);
+  if (maxLen <= 3) return dist <= 1;
+  if (maxLen <= 6) return dist <= 2 && dist / maxLen <= 0.5;
+  return dist <= 2 && dist / maxLen <= 0.33;
+}
+
+/** Split on non-alphanumerics: "well-known", "step—by-step" → parts. */
+function wordSegments(w: string): string[] {
+  return w
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((s) => s.length > 0);
+}
+
+/**
+ * Script↔spoken comparison used by the matcher. Punctuation
+ * (. , ? ! : ; — - " ' ( ) etc.) is non-semantic: "Hello," matches
+ * "hello", "don't" matches "dont", "well-known" matches "well". Falls
+ * back to fuzzy similarity for minor ASR variation — but never accepts
+ * unrelated words (first letter must agree). Exported so the tolerance
+ * rules can be verified independently.
+ */
+export function scriptWordMatches(spoken: string, scriptWord: string): boolean {
+  const sp = matchNorm(spoken);
+  if (!sp) return false;
+  const sc = matchNorm(scriptWord);
+  if (!sc) return false;
+  if (sp === sc) return true;
+  // Segment-level: em dash / hyphen joined script words compare per part
+  // ("well-known" ↔ "well", "step—by" ↔ "step").
+  const spokenSegs = wordSegments(spoken);
+  const scriptSegs = wordSegments(scriptWord);
+  if (spokenSegs.length > 1 || scriptSegs.length > 1) {
+    for (const s of spokenSegs) {
+      for (const t of scriptSegs) {
+        if (s === t || fuzzySimilar(s, t)) return true;
+      }
+    }
+  }
+  return fuzzySimilar(sp, sc);
+}
+
 function isFiller(word: string): boolean {
   return FILLER_SET.has(normalize(word));
 }
@@ -272,7 +355,10 @@ export function useScriptMatcher(
       lastProcessedSpokenRef.current = fw.word;
 
       // ── Exact match at the current script token ────────
-      if (consumed < tokens.length && spoken === normalize(tokens[consumed])) {
+      if (
+        consumed < tokens.length &&
+        scriptWordMatches(fw.word, tokens[consumed])
+      ) {
         const ae = overlapsAcoustic(
           fw.startTime,
           fw.endTime,
@@ -307,7 +393,7 @@ export function useScriptMatcher(
           ahead <= LOOKAHEAD && consumed + ahead < tokens.length;
           ahead++
         ) {
-          if (spoken === normalize(tokens[consumed + ahead])) {
+          if (scriptWordMatches(fw.word, tokens[consumed + ahead])) {
             foundAhead = ahead;
             break;
           }

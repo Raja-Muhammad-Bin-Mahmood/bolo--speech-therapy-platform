@@ -78,20 +78,33 @@ export default function ScriptPager({
   );
 
   // ── Automatic page advancement (speech-driven, not scroll) ─────────────
-  // Advance when the live reading position enters the last 2 lines of the
-  // current page (or crosses the page end). The transition feels like the
-  // script continuing naturally — never like a manually scrolled feed.
+  // Advances the DISPLAYED page only — the live session (mic, Deepgram
+  // socket, transcript, detectors, script position) is owned by
+  // SessionScript and is never touched here.
+  //
+  // Two triggers, neither can starve:
+  //   1. The reading position entered the last 2 lines of the current page
+  //      → flip to the next page exactly once (the stale-position guard
+  //      below absorbs the flip until the position crosses into the new
+  //      page, so a burst of finals never flips multiple pages at once).
+  //   2. The position jumped BEYOND the current page (fast reader / matcher
+  //      catch-up) → jump directly to the page containing the position.
   useEffect(() => {
     if (!isActive || totalPages <= 1) return;
     const cur = pages[page];
     if (!cur) return;
+    // Jump: reading position already past this page (stale — never let the
+    // display lag the live position).
+    if (activeIndex >= cur.end && page < totalPages - 1) {
+      const targetPage = Math.min(totalPages - 1, page + 1);
+      const t = setTimeout(() => setPage((p) => Math.max(p, targetPage)), 40);
+      return () => clearTimeout(t);
+    }
+    // Flip: position in the last 2 lines of the current page.
     const threshold = Math.max(cur.start, cur.end - WORDS_PER_LINE * 2);
     if (activeIndex >= threshold && activeIndex < cur.end && page < totalPages - 1) {
       const t = setTimeout(() => setPage((p) => Math.min(totalPages - 1, p + 1)), 260);
       return () => clearTimeout(t);
-    }
-    if (activeIndex >= cur.end && page < totalPages - 1) {
-      setPage((p) => Math.min(totalPages - 1, p + 1));
     }
   }, [isActive, activeIndex, page, pages, totalPages]);
 
