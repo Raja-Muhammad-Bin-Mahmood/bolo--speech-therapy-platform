@@ -41,7 +41,9 @@
  *   • Block detection uses Deepgram word-timing gaps gated by the BOLO
  *     RMS/isSpeaking energy gate — ordinary silence is NOT a block.
  *   • The raw API key never leaves the `deepgram-token` Edge Function; the
- *     browser receives a short-lived temporary key via the WebSocket URL.
+ *     browser receives a short-lived temporary API key (scope `member`, TTL
+ *     600s) via the Sec-WebSocket-Protocol subprotocol ("token", <temp key>)
+ *     — the ONLY header browsers may set during a WebSocket handshake.
  */
 import { useRef, useCallback, useEffect, useState } from "react";
 import { supabase, SUPABASE_URL } from "../lib/supabase";
@@ -408,9 +410,15 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
       ws.onopen = () => {
         readyRef.current = true; // audio may flow immediately (no handshake)
         setState((prev) => ({ ...prev, status: "connected", error: null }));
+        // ── AUTH PROOF (acceptance §2) ────────────────────────────────
+        // `ws.protocol` is the Sec-WebSocket-Protocol subprotocol the SERVER
+        // actually negotiated. Deepgram echoes back "token" when it accepted
+        // the handshake auth — anything else (or "") means the temp JWT was
+        // NOT accepted and the socket will die or never transcribe.
         console.info(
           `[DG·WS] connection OPENED | url=wss://api.deepgram.com/v1/listen?${dgQuery} | ` +
-            `auth=Sec-WebSocket-Protocol`
+            `auth=Sec-WebSocket-Protocol | ` +
+            `negotiatedSubprotocol=${JSON.stringify(ws.protocol)}`
         );
         lastActivityRef.current = Date.now();
         if (watchdogRef.current) clearInterval(watchdogRef.current);
@@ -462,6 +470,18 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
               error: msg.err_msg || msg.message || "Deepgram API error",
             }));
             return;
+          }
+          if (msg.type === "Results") {
+            // ── RAW RESPONSE TRACE (acceptance §5) ─────────────────────
+            // Log the RAW Deepgram frame EXACTLY as received — BEFORE any
+            // normalization, filtering, confidence guards, word dedup, or
+            // disfluency detection. This is the ground truth: whatever the
+            // server returned is preserved verbatim in the runtime log.
+            console.info(
+              `[DG·RAW] is_final=${String(msg.is_final ?? "?")} ` +
+                `words=${(msg.channel?.alternatives?.[0]?.words ?? []).length} ` +
+                `raw=${JSON.stringify(msg)}`
+            );
           }
           if (msg.type !== "Results") return;
 
