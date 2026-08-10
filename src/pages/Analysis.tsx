@@ -12,6 +12,7 @@ import {
   Gauge,
   Radio,
   Activity,
+  BookOpen,
 } from "lucide-react";
 import Navbar from "../components/Navbar";
 import EvidenceReviewPanel from "../components/EvidenceReviewPanel";
@@ -336,6 +337,20 @@ export default function Analysis() {
   );
   const [markers, setMarkers] = useState<SessionMarker[]>(navMarkers);
   useEffect(() => setMarkers(navMarkers), [navMarkers]);
+
+  // ── SCRIPT MODE review payload (intact script + per-word annotations) ──
+  // The original script is preserved EXACTLY — the purple disfluency
+  // styling is applied to the specific script words that were detected,
+  // never replacing the text or printing raw Deepgram stutter spelling.
+  const scriptReview = data?.script as
+    | {
+        title: string;
+        text: string;
+        tokens: string[];
+        details: { state: string; disfluency: string | null }[];
+      }
+    | undefined;
+  const isScriptMode = data?.mode === "script";
 
   // Official events for this session (auto + manual) — loaded from the
   // user's account; manual annotations append to this list and re-render
@@ -1055,6 +1070,82 @@ export default function Analysis() {
                   );
                 })}
             </div>
+          </motion.div>
+        )}
+
+        {/* ── SCRIPT MODE review — the intact script with its purple
+               disfluency annotations (same classification as the live
+               pager). The script text is preserved EXACTLY. ──────────── */}
+        {isScriptMode && scriptReview && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.31 }}
+            className="glass rounded-2xl p-5 mb-8 border border-neon-purple/10"
+          >
+            <div className="flex items-center gap-2 mb-3">
+              <BookOpen className="w-4 h-4 text-neon-purple" />
+              <h3 className="font-heading text-sm font-semibold text-white">
+                Script Review — {scriptReview.title}
+              </h3>
+              <span className="ml-auto text-[10px] text-soft-gray/50">
+                original script · purple = detected on this word
+              </span>
+            </div>
+
+            {/* Legend */}
+            <div className="flex flex-wrap gap-1.5 mb-3">
+              <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full text-[#BD8CFF]/90 bg-[#BD8CFF]/10">
+                <span className="w-2 h-2 rounded-sm bg-[#BD8CFF]/70" />
+                detected disfluency
+              </span>
+              <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full text-emerald-300/80 bg-emerald-400/10">
+                <span className="w-2 h-2 rounded-sm bg-emerald-300/70" />
+                well said
+              </span>
+              <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full text-soft-gray/60 bg-white/5">
+                target sounds stay highlighted
+              </span>
+            </div>
+
+            {/* The ORIGINAL script — every word rendered as-is; annotations
+                are applied per script-token index and NEVER modify the
+                text. Only the detected word gets the purple styling. */}
+            <div className="bg-white/5 rounded-xl p-4 max-h-72 overflow-y-auto leading-[2.2] text-base font-light">
+              {scriptReview.tokens.map((word, i) => {
+                const detail = scriptReview.details[i];
+                const isDisfluent =
+                  detail?.disfluency && detail.disfluency !== "filler";
+                const isMatched = detail?.state === "matched";
+                const cls = isDisfluent
+                  ? "underline decoration-2 decoration-purple-400 underline-offset-4 bg-[#BD8CFF]/10 text-[#BD8CFF]/90"
+                  : isMatched
+                    ? "text-[#4ADE80]/85"
+                    : "text-white/75";
+                return (
+                  <span
+                    key={`${i}-${word}`}
+                    className={`inline-block rounded px-0.5 transition-colors duration-200 cursor-help ${cls}`}
+                    title={
+                      isDisfluent
+                        ? `Detected disfluency · ${detail.disfluency} (on this script word)`
+                        : isMatched
+                          ? "Well said ✓"
+                          : "Not read or skipped"
+                    }
+                  >
+                    {word}
+                  </span>
+                );
+              })}
+            </div>
+
+            <p className="text-[10px] text-soft-gray/40 mt-3">
+              The script is shown exactly as written — the purple words are
+              the specific script tokens the live detection flagged. You can
+              still review the full transcript and use the annotation
+              workflow below.
+            </p>
           </motion.div>
         )}
 

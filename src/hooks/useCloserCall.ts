@@ -1,6 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAudioCapture } from "./useAudioCapture";
 import { useSpeechmaticsWS } from "./useSpeechmaticsWS";
+import { useAcousticAnalysis } from "./useAcousticAnalysis";
+import { useAnalyserSensor } from "./useAnalyserSensor";
+import { useDeepgramWS } from "./useDeepgramWS";
+import { useTranscriptReconciler } from "./useTranscriptReconciler";
+import { useSessionAnalysis } from "./useSessionAnalysis";
+import { useSessionDisfluencies } from "./useSessionDisfluencies";
+import { useEventEngine } from "./useEventEngine";
+import { usePaceEngine } from "./usePaceEngine";
 import { useGeminiLive } from "./useGeminiLive";
 import { pickMood, pickName, pickPersona } from "../data/closerCatalog";
 import { playHangupTone } from "../lib/closerAudio";
@@ -10,7 +18,25 @@ import {
   REPORT_RESPONSE_SCHEMA,
 } from "../lib/closerPrompts";
 import { fallbackReport, normalizeReport } from "../lib/salesReport";
+import { mergeAcousticEvents } from "../lib/mergeAcousticEvents";
+import { buildDgFinalChunks, mergeFinalChunks } from "../lib/finalChunks";
+import { buildAnalysisPayload } from "../lib/analysisPayload";
+import {
+  persistSessionDisfluencies,
+  type SessionDisfluencySnapshot,
+} from "../lib/sessionDisfluencies";
+import {
+  makeMarkerId,
+  persistMarkers,
+  persistEvents,
+  type OfficialDisfluencyEvent,
+  type SessionMarker,
+  type UserAccount,
+} from "../lib/manualAnnotations";
 import { SUPABASE_URL } from "../lib/supabase";
+import { useAuth } from "../context/AuthContext";
+import type { TranscriptToken } from "../lib/transcriptTokens";
+import { diagBanner } from "../lib/diagnosticLog";
 import type {
   CallContext,
   CallOutcome,
@@ -46,14 +72,56 @@ const SOFT_HANGUP_RE =
  * The whole Closer Mode state machine: roulette → ringing → live call →
  * ended + report. Owns mic, Speechmatics STT (user's side) and the Gemini
  * Live customer (audio + transcriptions).
+ *
+ * HIDDEN FREE-SPEECH DETECTION: while the call is live, the SAME detection
+ * pipeline Free Speech runs is ALSO running invisibly in the background —
+ * Deepgram transcription, disfluency/stutter/filler detection, timing/audio
+ * evidence, the same purple disfluency logic and the same saved
+ * event/token structure. The call UI stays clean (no purple markings, no
+ * detection feed, no disfluency counters). When the call ends, the
+ * collected detection data produces the SAME Free Speech-style /analysis
+ * experience (scores, tagged words, purple annotations, transcript,
+ * manual-review workflow) — nothing was shown during the call, everything
+ * is analyzed after.
  */
 export function useCloserCall() {
   const mic = useAudioCapture();
   const stt = useSpeechmaticsWS();
   const live = useGeminiLive();
+  const { user, isLocal, saveSessionData } = useAuth();
 
+  // ── HIDDEN FREE-SPEECH DETECTION PIPELINE (same as Free Speech) ────────
+  // Runs whenever the call is live. The UI NEVER renders any of it — the
+  // data is collected silently and handed to the after-session analysis.
+  const [isLive, setIsLive] = useState(false);
+  const acoustic = useAcousticAnalysis(mic.getAnalyser, isLive);
+  const sensor = useAnalyserSensor(mic.getAnalyser, isLive);
+  const allAcoustic = mergeAcousticEvents(acoustic.events, sensor.events);
+  const dg = useDeepgramWS({
+    getAnalyser: mic.getAnalyser,
+    getSampleRate: mic.getSampleRate,
+    acousticEvents: allAcoustic,
+  });
+  const dgFinalChunks = buildDgFinalChunks(dg.finals);
+  const mergedFinalChunks = mergeFinalChunks(dgFinalChunks, stt.transcripts);
+  const analysis = useSessionAnalysis(mergedFinalChunks, allAcoustic);
+  const reconciler = useTranscriptReconciler({
+    active: isLive,
+    transcripts: stt.transcripts,
+    deepgramFinals: dg.finals,
+  });
+  const recovery = useEventEngine({
+    active: isLive && stt.status === "connected",
+    getStreamTime: mic.getStreamTime,
+    setOnPcm: mic.setOnPcm,
+    transcripts: stt.transcripts,
+    events: allAcoustic,
+  });
+  const disfluencyCollector = useSessionDisfluencies(reconciler.tokens, analysis.wordTags);
+  const pace = usePaceEngine();
+
+  // ── Live call state ────────────────────────────────────────────────────
   const [phase, setPhase] = useState<CallPhase>("idle");
-  /** Explicit live-call sub-state (per spec §23). */
   const [liveState, setLiveState] = useState<LiveCallState>("idle");
   const [context, setContext] = useState<CallContext | null>(null);
   const [elapsed, setElapsed] = useState(0);
@@ -83,11 +151,32 @@ export function useCloserCall() {
   const userPartialRef = useRef("");
   const micActiveRef = useRef(false);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Soft leave-attempts the customer made but the salesperson recovered from.
   const softHangupCountRef = useRef(0);
-  // Ongoing reconnect bookkeeping (transient socket drops are NOT hang-ups).
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptRef = useRef(0);
+
+  // Hidden pipeline refs — captured at call end BEFORE the reconciler clears.
+  const finalTokensRef = useRef<TranscriptToken[]>([]);
+  const finalHiddenKeysRef = useRef<string[]>([]);
+  const sessionIdRef = useRef<string>(`closer-${Date.now().toString(36)}`);
+  const markersRef = useRef<SessionMarker[]>([]);
+  const userRef = useRef<UserAccount | null>(null);
+  useEffect(() => {
+    if (!user) return;
+    userRef.current = { id: user.id, isLocal };
+  }, [user, isLocal]);
+
+  // Keep the hidden pipeline's final token array mirrored while live.
+  const mergedDuplicateKeys = useMemo(
+    () => new Set([...recovery.duplicateKeys, ...reconciler.hiddenSpeechmaticsKeys]),
+    [recovery.duplicateKeys, reconciler.hiddenSpeechmaticsKeys]
+  );
+  useEffect(() => {
+    if (isLive) {
+      finalTokensRef.current = reconciler.tokens;
+      finalHiddenKeysRef.current = Array.from(mergedDuplicateKeys);
+    }
+  }, [isLive, reconciler.tokens, mergedDuplicateKeys]);
 
   const setPhaseBoth = useCallback((p: CallPhase) => {
     phaseRef.current = p;
@@ -194,17 +283,118 @@ export function useCloserCall() {
       setUserPartial("");
       mic.stop();
       stt.disconnect();
+      dg.disconnect();
       live.close();
       playHangupTone();
       setLiveStateBoth("ended");
       setPhaseBoth("ended");
       void generateReport(reason);
+
+      // ── HIDDEN FREE-SPEECH DATA → after-session analysis ─────────────
+      // The SAME data Free Speech collects is captured BEFORE the pipeline
+      // resets, persisted the same way, and the same /analysis experience
+      // is produced after the call ends.
+      const ctx = contextRef.current;
+      if (ctx) {
+        captureSpeechData(ctx);
+      }
     },
-    [mic, stt, live, generateReport, setPhaseBoth, setLiveStateBoth]
+    [mic, stt, dg, live, generateReport, setPhaseBoth, setLiveStateBoth]
   );
 
   const endCallRef = useRef(endCall);
   endCallRef.current = endCall;
+
+  // ── Capture the hidden speech data → persist → store the analysis
+  //    payload in a ref so CloserMode can route to /analysis. ────────────
+  const speechPayloadRef = useRef<any>(null);
+  const captureSpeechData = useCallback(
+    (ctx: CallContext) => {
+      try {
+        const smSnapshot = stt.snapshotTranscripts();
+        const finalTranscripts =
+          mergedFinalChunks.length > 0 ? mergedFinalChunks : smSnapshot;
+        const finalAcoustic = acoustic.getEvents();
+        const sensorEvents = sensor.getEvents();
+        const all = mergeAcousticEvents(finalAcoustic, sensorEvents);
+        const paceReport = pace.finalize();
+        const finalTokens = finalTokensRef.current;
+        const finalHiddenKeys = finalHiddenKeysRef.current;
+        const finalDisfluencies = disfluencyCollector.snapshot();
+        const recoverySnapshot = recovery.annotations;
+        const sessionId = sessionIdRef.current;
+        const finalMarkers = markersRef.current;
+
+        const payload = buildAnalysisPayload({
+          sessionId,
+          topic: `Closer Call — ${ctx.product} (${ctx.customerName})`,
+          mode: "closer",
+          finalTranscripts,
+          acousticEvents: finalAcoustic,
+          sensorEvents,
+          allAcoustic: all,
+          recoveryAnnotations: recoverySnapshot,
+          finalTokens: finalTokens as any[],
+          finalHiddenKeys,
+          finalDisfluencies,
+          markers: finalMarkers,
+          paceReport,
+        });
+        speechPayloadRef.current = payload;
+
+        diagBanner("CLOSER SESSION END — hidden speech analysis", {
+          product: ctx.product,
+          ts: new Date().toISOString(),
+          words: finalTranscripts.reduce((n, c) => n + (c.isFinal ? c.words.length : 0), 0),
+          mergedEvents: all.map((e) => `${e.type}@${e.startTime.toFixed(2)}`),
+          savedTranscriptTokens: finalTokens.length,
+          savedDisfluencies: finalDisfluencies.map((d) => `${d.type}:"${d.word}"@${d.timeMs}ms`),
+          score: payload.overallScore,
+        });
+
+        try {
+          persistSessionDisfluencies({
+            sessionId,
+            topic: `Closer Call — ${ctx.product} (${ctx.customerName})`,
+            recordedAt: new Date().toISOString(),
+            items: finalDisfluencies,
+          } satisfies SessionDisfluencySnapshot);
+        } catch {
+          // non-critical — history persistence is best-effort
+        }
+
+        const account = userRef.current;
+        if (account) {
+          persistMarkers(account, finalMarkers);
+          const automaticEvents: OfficialDisfluencyEvent[] = finalDisfluencies.map(
+            (d) => ({
+              id: d.tokenId ? `evt_${sessionId}_${d.tokenId}` : makeMarkerId(),
+              sessionId,
+              tokenId: d.tokenId,
+              word: d.word,
+              firstLetter: d.firstLetter,
+              type: d.type,
+              timeMs: d.timeMs,
+              source: "automatic" as const,
+              utterance: d.utterance,
+              sentence: d.sentence,
+              createdAt: new Date().toISOString(),
+            })
+          );
+          persistEvents(account, automaticEvents);
+        }
+
+        try {
+          saveSessionData(payload.overallScore);
+        } catch {
+          // non-critical — history persistence is best-effort
+        }
+      } catch {
+        // Speech analysis is best-effort — the sales report still shows.
+      }
+    },
+    [stt, mergedFinalChunks, acoustic, sensor, pace, disfluencyCollector, recovery.annotations, saveSessionData]
+  );
 
   // ── Hang-up decision (final intent only, with a recovery window) ──────
   const scheduleHangup = useCallback((delayMs = 700) => {
@@ -244,10 +434,12 @@ export function useCloserCall() {
     setPhaseBoth("connecting");
     setLiveStateBoth("connecting");
 
-    // One mic stream feeds both lanes: Speechmatics (user transcript)
-    // and Gemini Live (customer hears the user + barge-in VAD).
+    // One mic stream feeds ALL lanes: Speechmatics (user transcript),
+    // Deepgram (hidden disfluency detection) and Gemini Live (customer
+    // hears the user + barge-in VAD).
     mic.setOnAudioData((chunk) => {
       stt.sendAudio(chunk);
+      dg.sendAudio(chunk);
       live.sendPcm(chunk);
     });
 
@@ -255,6 +447,8 @@ export function useCloserCall() {
     window.setTimeout(() => setMicMissing(!micActiveRef.current), 450);
 
     stt.connect();
+    dg.connect();
+    setIsLive(true);
 
     live.start(buildCustomerSystemPrompt(ctx), {
       onOpen: () => {
@@ -284,34 +478,25 @@ export function useCloserCall() {
         if (!text) return;
         pushLine("customer", text);
 
-        // The customer's final goodbye — unambiguous, no recovery. Only
-        // matches explicit farewell/hang-up lines (NOT "I've got to go",
-        // "I'm busy", "email me" — those are recovery opportunities the
-        // prompt guarantees, so they never hard-end the call).
+        // The customer's final goodbye — unambiguous, no recovery.
         if (FINAL_HANGUP_RE.test(text)) {
           scheduleHangup();
           return;
         }
 
-        // Soft leave-attempt (e.g. "I've got to go", "I'm really busy"):
-        // give the salesperson a chance to recover. Only escalate to a real
-        // hang-up if the customer keeps pushing to leave across multiple
-        // turns and the salesperson never wins them back.
+        // Soft leave-attempt — give the salesperson a chance to recover.
         if (SOFT_HANGUP_RE.test(text)) {
           softHangupCountRef.current += 1;
           if (softHangupCountRef.current >= 3) {
             scheduleHangup();
           }
         } else {
-          // A normal response means the call is still on — reset the counter
-          // so occasional "I'm busy" remarks don't accumulate forever.
           softHangupCountRef.current = 0;
         }
       },
       onInterrupted: () => {
         setInterruptedAt(Date.now());
         setLiveStateBoth("interrupted");
-        // Reset to connected shortly after so the next turn is clean.
         window.setTimeout(() => {
           if (phaseRef.current === "live" && !endedRef.current) {
             setLiveStateBoth("connected");
@@ -331,14 +516,13 @@ export function useCloserCall() {
       },
       onClose: () => {
         // Unexpected socket close mid-call is almost always a transient
-        // network blip — NOT the customer hanging up. Give the Live session
-        // a chance to reconnect before ever ending the call.
+        // network blip — NOT the customer hanging up.
         if (phaseRef.current === "live" && !endedRef.current) {
           void handleReconnect();
         }
       },
     });
-  }, [mic, stt, live, pushLine, setPhaseBoth, setLiveStateBoth, onUserFinalTranscript, handleReconnect]);
+  }, [mic, stt, dg, live, pushLine, setPhaseBoth, setLiveStateBoth, onUserFinalTranscript, handleReconnect]);
 
   // ── Flow actions ──────────────────────────────────────────────────────
   const beginRoulette = useCallback(() => {
@@ -355,6 +539,10 @@ export function useCloserCall() {
       };
       contextRef.current = ctx;
       setContext(ctx);
+      sessionIdRef.current = `closer-${Date.now().toString(36)}`;
+      markersRef.current = [];
+      finalTokensRef.current = [];
+      finalHiddenKeysRef.current = [];
       setPhaseBoth("ringing");
       setLiveStateBoth("ringing");
       // Random 2–5s of ringing before the customer answers.
@@ -393,6 +581,7 @@ export function useCloserCall() {
     setCustomerPartial("");
     setUserPartial("");
     setCustomerSpeaking(false);
+    speechPayloadRef.current = null;
     setLiveStateBoth("idle");
     setPhaseBoth("idle");
   }, [setPhaseBoth, setLiveStateBoth]);
@@ -429,6 +618,7 @@ export function useCloserCall() {
     report,
     reportLoading,
     reportError,
+    speechPayload: speechPayloadRef.current,
     beginRoulette,
     onRouletteLand,
     endCallByUser,

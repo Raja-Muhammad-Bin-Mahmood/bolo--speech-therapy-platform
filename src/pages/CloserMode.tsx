@@ -1,6 +1,6 @@
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { PhoneCall, ChevronRight, ChevronLeft, Package } from "lucide-react";
+import { PhoneCall, ChevronRight, ChevronLeft, Package, BarChart3 } from "lucide-react";
 import Navbar from "../components/Navbar";
 import LiquidBackground from "../components/LiquidBackground";
 import ProductRoulette from "../components/ProductRoulette";
@@ -10,6 +10,7 @@ import { useCloserCall } from "../hooks/useCloserCall";
 
 export default function CloserMode() {
   const call = useCloserCall();
+  const navigate = useNavigate();
 
   return (
     <div className="min-h-screen relative overflow-hidden">
@@ -142,6 +143,39 @@ export default function CloserMode() {
                 }}
               />
             )}
+
+            {/* Speech analysis entry — the SAME Free Speech analysis
+                experience, available after the call ends (nothing was shown
+                during the call; the hidden pipeline collected it). */}
+            {call.phase === "ended" &&
+              call.context &&
+              call.speechPayload && (
+                <motion.div
+                  initial={{ opacity: 0, y: 16 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.4, delay: 0.1 }}
+                  className="glass rounded-2xl p-5 mt-5 border border-neon-purple/10 text-center"
+                >
+                  <BarChart3 className="w-5 h-5 text-neon-purple mx-auto mb-2" />
+                  <p className="font-heading text-sm font-semibold text-white">
+                    Your Speech Analysis
+                  </p>
+                  <p className="text-xs text-soft-gray/60 mt-1 max-w-sm mx-auto">
+                    While you were on the call, BOLO ran the same disfluency
+                    detection as Free Practice in the background. Review your
+                    stutters, fillers, transcript and purple annotations now.
+                  </p>
+                  <button
+                    onClick={() =>
+                      navigate("/analysis", { state: call.speechPayload })
+                    }
+                    className="mt-4 inline-flex items-center gap-2 bg-primary hover:bg-primary-hover text-white text-sm font-medium px-6 py-2.5 rounded-full transition-all duration-200 active:scale-[0.97] neon-glow cursor-pointer"
+                  >
+                    View Full Analysis
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </motion.div>
+              )}
           </AnimatePresence>
         </main>
       </div>
