@@ -52,18 +52,6 @@ export class AudioQueue {
   private nextTime = 0;
   /** Currently scheduled/playing buffer sources — tracked so flush() can stop them. */
   private active: AudioBufferSourceNode[] = [];
-  /** True while flush() is stopping sources — suppresses the drain callback. */
-  private flushing = false;
-  /** Invoked once the queue drains naturally (the last chunk finished playing). */
-  private onDrain: (() => void) | null = null;
-
-  /**
-   * Register a callback fired when every scheduled chunk has finished playing
-   * (the customer's reply ended on its own — NOT via flush()).
-   */
-  setOnDrain(cb: () => void): void {
-    this.onDrain = cb;
-  }
 
   private ensureCtx(): AudioContext {
     if (!this.ctx) {
@@ -92,14 +80,6 @@ export class AudioQueue {
       src.onended = () => {
         const i = this.active.indexOf(src);
         if (i >= 0) this.active.splice(i, 1);
-        // Natural playback end (not flush): when the queue is empty, the
-        // customer's reply is fully done — notify the caller so it can clear
-        // its "customer playing" flag (which otherwise stays armed forever
-        // and makes the FIRST loud sub-chunk of every later user turn look
-        // like a barge-in).
-        if (this.active.length === 0 && !this.flushing) {
-          this.onDrain?.();
-        }
       };
     } catch {
       // Skip a corrupt chunk — never let audio kill the call.
@@ -116,7 +96,6 @@ export class AudioQueue {
    * The context stays alive so the next chunk plays instantly (barge-in).
    */
   flush(): void {
-    this.flushing = true;
     for (const src of this.active) {
       try {
         src.stop();
@@ -126,7 +105,6 @@ export class AudioQueue {
     }
     this.active = [];
     this.nextTime = this.ctx?.currentTime ?? 0;
-    this.flushing = false;
   }
 
   /** Full teardown (end of call). */

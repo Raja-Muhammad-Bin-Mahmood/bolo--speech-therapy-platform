@@ -56,18 +56,6 @@ import { createVoiceActivity } from "../lib/voiceActivity";
  *    with no memory — the conversation so far is re-hydrated via
  *    `sendClientContent({ turns, turnComplete: false })` so the customer
  *    doesn't forget earlier turns.
- *
- * 6. EXPLICIT TURN-END (multi-turn reliability). The server's automatic VAD
- *    is the authority for turn boundaries, but on some model/config combos
- *    (e.g. `gemini-3.1-flash-live-preview` + END_SENSITIVITY_LOW) the server
- *    fails to commit end-of-speech for turns AFTER the first — so the model
- *    never generates a reply. To un-stick this, when the server finalizes
- *    the user's speech (`inputTranscription.finished`) we ALSO send an
- *    explicit `sendClientContent({ turnComplete: true })` — a harmless no-op
- *    if server VAD already ended the turn, a fix if it is stuck. A
- *    client-side silence fallback (voice-activity gate on the mic stream)
- *    sends the same signal if the server's finished-transcription event is
- *    itself missed.
  */
 const LIVE_MODEL = "gemini-3.1-flash-live-preview";
 const LIVE_VOICE = "Puck";
@@ -86,19 +74,6 @@ const LIVE_AUDIO_CHUNK_SAMPLES = 640;
  * activity arrives.
  */
 const USER_TURN_COMMIT_MS = 1600;
-
-/**
- * Silence window (ms) that must elapse after the user's speech for the
- * client-side turn-end fallback to fire. Longer than the server's own
- * `silenceDurationMs` (900) so it only acts when the server VAD is stuck.
- */
-const TURN_END_SILENCE_MS = 1500;
-
-/**
- * How much of the user's speech must have finished before the silence timer
- * is allowed to fire (avoids ending the turn during a natural pause).
- */
-const TURN_END_SPOKE_MIN_MS = 600;
 
 export type LiveStatus = "idle" | "connecting" | "live" | "error" | "closed";
 
@@ -177,13 +152,6 @@ export function useGeminiLive() {
   const vadRef = useRef(createVoiceActivity());
   // True while customer audio is actively playing (armed for barge-in).
   const playingRef = useRef(false);
-  // Turn-end silence VAD: a dedicated detector so it never shares state with
-  // the barge-in gate. Tracks when the user's speech last occurred so the
-  // client-side turn-end fallback can fire after a quiet gap.
-  const turnVadRef = useRef(createVoiceActivity());
-  const lastSpeechAtRef = useRef(0);
-  const spokeMsRef = useRef(0);
-  const turnEndTimerRef = useRef<number | null>(null);
 
   // ── User-turn accumulation (ONE spoken prompt = ONE user turn) ────────
   const userTurnTextRef = useRef("");
@@ -213,79 +181,6 @@ export function useGeminiLive() {
     lastFlushAtRef.current = Date.now();
     lastFlushSourceRef.current = source;
   }, []);
-
-  /**
-   * Explicitly end the user's turn server-side. With automatic VAD this is a
-   * harmless no-op when the server already detected end-of-speech; when the
-   * server VAD is stuck (a real multi-turn failure mode on some model/config
-   * combos) it forces the model to generate its reply.
-   */
-  const sendTurnComplete = useCallback(() => {
-    try {
-      (sessionRef.current as any)?.sendClientContent?.({ turnComplete: true });
-    } catch {
-      // Best-effort — the server VAD may have already ended the turn.
-    }
-  }, []);
-
-  /**
-   * Client-side turn-end fallback. Armed the moment the user's speech starts
-   * (per the dedicated turn VAD) and fires after TURN_END_SILENCE_MS of quiet
-   * — unless a server `inputTranscription.finished` (or model activity)
-   * already ended the turn. This un-sticks conversations where the server
-   * both fails to commit VAD end-of-speech AND misses its own
-   * finished-transcription event.
-   */
-  const armTurnEndFallback = useCallback(() => {
-    if (turnEndTimerRef.current !== null) clearTimeout(turnEndTimerRef.current);
-    turnEndTimerRef.current = window.setTimeout(() => {
-      turnEndTimerRef.current = null;
-      const now = Date.now();
-      // Only fire if the user actually spoke for a meaningful amount and has
-      // been silent since — never in the middle of speech.
-      if (spokeMsRef.current < TURN_END_SPOKE_MIN_MS) return;
-      if (now - lastSpeechAtRef.current < TURN_END_SILENCE_MS - 100) return;
-      // Clear the accumulator so this doesn't re-arm on every quiet frame and
-      // spam turnComplete while the server is fully stuck. The next spoken
-      // prompt re-arms it naturally.
-      spokeMsRef.current = 0;
-      sendTurnComplete();
-    }, TURN_END_SILENCE_MS);
-  }, [sendTurnComplete]);
-
-  /** Cancel the client-side turn-end fallback (new speech / model activity). */
-  const cancelTurnEndFallback = useCallback(() => {
-    if (turnEndTimerRef.current !== null) {
-      clearTimeout(turnEndTimerRef.current);
-      turnEndTimerRef.current = null;
-    }
-  }, []);
-
-  /**
-   * Feed one mic sub-chunk to the turn VAD and track speech/silence timing.
-   * Also cancels the turn-end fallback the instant the user speaks again.
-   */
-  const feedTurnVad = useCallback(
-    (f32: Float32Array) => {
-      const prev = turnVadRef.current.isSpeaking();
-      const rising = turnVadRef.current.feed(f32);
-      const now = Date.now();
-      if (rising) {
-        // Fresh speech onset — reset the "spoke" accumulator window.
-        spokeMsRef.current = 0;
-        lastSpeechAtRef.current = now;
-        cancelTurnEndFallback();
-      } else if (prev && turnVadRef.current.isSpeaking()) {
-        // Still speaking — extend the spoken window and slide the last-speech mark.
-        spokeMsRef.current += now - lastSpeechAtRef.current;
-        lastSpeechAtRef.current = now;
-      } else if (!turnVadRef.current.isSpeaking() && spokeMsRef.current >= TURN_END_SPOKE_MIN_MS) {
-        // Speech just ended (or is in a natural pause) — arm the fallback once.
-        if (turnEndTimerRef.current === null) armTurnEndFallback();
-      }
-    },
-    [armTurnEndFallback, cancelTurnEndFallback]
-  );
 
   // ── User-turn aggregation state machine ───────────────────────────────
   /**
@@ -353,7 +248,6 @@ export function useGeminiLive() {
         // User started speaking over the customer — stop playback NOW and
         // tell the caller. The user's ongoing speech keeps accumulating.
         cancelUserCommitTimer();
-        cancelTurnEndFallback();
         flushAudio("server");
         handlersRef.current?.onInterrupted();
       }
@@ -363,16 +257,7 @@ export function useGeminiLive() {
       for (const p of parts) {
         if (p.text) text += p.text;
         if (p.inlineData?.data) {
-          if (!queueRef.current) {
-            queueRef.current = new AudioQueue();
-            // Natural playback end → the customer finished speaking → clear
-            // the barge-in arm. Without this, playingRef stays true forever
-            // and the FIRST loud sub-chunk of every later user turn looks
-            // like a barge-in (a spurious flush of silence).
-            queueRef.current.setOnDrain(() => {
-              playingRef.current = false;
-            });
-          }
+          if (!queueRef.current) queueRef.current = new AudioQueue();
           playingRef.current = true;
           queueRef.current.enqueue(p.inlineData.data);
         }
@@ -391,12 +276,6 @@ export function useGeminiLive() {
           // buffer. NOT committed yet: the user may keep talking.
           appendUserSegment(sc.inputTranscription.text);
           armUserCommitTimer();
-          // Explicitly end the turn server-side. The server VAD is the
-          // authority, but on some model/config combos it fails to commit
-          // end-of-speech for turns after the first — this un-sticks it so
-          // the model always generates its reply. Harmless no-op otherwise.
-          sendTurnComplete();
-          cancelTurnEndFallback();
         } else {
           // Interim within an ongoing turn — live partial bubble only.
           cancelUserCommitTimer();
@@ -410,14 +289,12 @@ export function useGeminiLive() {
       if (sc.outputTranscription?.text) {
         // Customer text from transcription (finalized speech).
         commitUserTurn();
-        cancelTurnEndFallback();
         handlersRef.current?.onAiText(sc.outputTranscription.text);
       }
 
       if (sc.turnComplete) {
         // Flush any user text that was finalised but never answered.
         commitUserTurn();
-        cancelTurnEndFallback();
         handlersRef.current?.onTurnComplete();
       }
     },
@@ -427,8 +304,6 @@ export function useGeminiLive() {
       appendUserSegment,
       armUserCommitTimer,
       commitUserTurn,
-      sendTurnComplete,
-      cancelTurnEndFallback,
     ]
   );
 
@@ -618,9 +493,6 @@ export function useGeminiLive() {
           flushAudio("local");
           handlersRef.current?.onBargeIn();
         }
-        // Turn-end fallback: track the user's speech/silence so we can send
-        // an explicit turnComplete if the server VAD is stuck.
-        feedTurnVad(sub);
         try {
           (sessionRef.current as any)?.sendRealtimeInput({
             audio: {
@@ -633,7 +505,7 @@ export function useGeminiLive() {
         }
       }
     },
-    [flushAudio, feedTurnVad]
+    [flushAudio]
   );
 
   // Keep the latest sendPcm available to the dev test bridge.
@@ -653,13 +525,9 @@ export function useGeminiLive() {
     vadRef.current.reset();
     playingRef.current = false;
     cancelUserCommitTimer();
-    cancelTurnEndFallback();
-    turnVadRef.current.reset();
-    lastSpeechAtRef.current = 0;
-    spokeMsRef.current = 0;
     userTurnTextRef.current = "";
     setLiveStatus("closed");
-  }, [cancelUserCommitTimer, cancelTurnEndFallback]);
+  }, [cancelUserCommitTimer]);
 
   /**
    * Reconnect a Live session that dropped mid-call (transient network blip).
