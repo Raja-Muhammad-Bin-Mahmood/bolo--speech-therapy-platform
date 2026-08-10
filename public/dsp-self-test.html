@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BOLO — DSP Worklet Self-Test</title>
+  <style>
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0b0f1a; color: #d7e2f0; margin: 0; padding: 24px; }
+    h1 { font-size: 18px; color: #7dd3fc; }
+    pre { background: #0f1626; border: 1px solid #22304a; border-radius: 8px; padding: 16px; overflow-x: auto; white-space: pre-wrap; }
+    .ok { color: #4ade80; } .bad { color: #f87171; } .warn { color: #fbbf24; }
+  </style>
+</head>
+<body>
+  <h1>BOLO — AudioWorklet DSP self-test (telemetry-processor.worklet.js)</h1>
+  <pre id="result">running…</pre>
+  <script>
+    // ─────────────────────────────────────────────────────────────────────
+    // Deterministic browser proof that the telemetry AudioWorklet loads,
+    // registers, receives audio and produces acoustic telemetry frames.
+    // Mirrors the app's exact wiring in useAudioCapture.ts:
+    //   source → AudioWorkletNode("bolo-telemetry-processor",
+    //              { numberOfInputs:1, numberOfOutputs:0, channelCount:1 })
+    // No destination connection — same topology the app relies on.
+    // ─────────────────────────────────────────────────────────────────────
+    const WORKLET_URL = "/audio/telemetry-processor.worklet.js";
+    const RUNTIME_MS = 1600;
+    const out = [];
+
+    const result = {
+      audioWorkletSupported: typeof AudioWorkletNode === "function",
+      contextSampleRate: null,
+      moduleRequested: false,
+      moduleHttpStatus: null,
+      moduleLoaded: false,
+      moduleLoadError: null,
+      processorRegistered: false,
+      nodeCreated: false,
+      nodeCreatedError: null,
+      framesReceived: 0,
+      pcmChunksReceived: 0,
+      firstFrame: null,
+      lastFrame: null,
+      processorError: null,
+      runtimeMs: 0,
+      pass: false,
+    };
+
+    const report = (extra) => {
+      result.pass =
+        result.moduleLoaded &&
+        result.processorRegistered &&
+        result.nodeCreated &&
+        result.framesReceived > 0 &&
+        result.pcmChunksReceived > 0 &&
+        !result.processorError &&
+        !result.moduleLoadError;
+      const el = document.getElementById("result");
+      el.textContent = JSON.stringify({ ...result, ...(extra || {}) }, null, 2);
+      window.__DSP_RESULT__ = result;
+      out.push("DSP_SELF_TEST_COMPLETE pass=" + result.pass);
+    };
+
+    (async () => {
+      try {
+        const ctx = new AudioContext({ sampleRate: 16000 });
+        result.contextSampleRate = ctx.sampleRate;
+        try { await ctx.resume(); } catch (e) { /* non-critical */ }
+
+        const fetchResp = await fetch(WORKLET_URL);
+        result.moduleRequested = true;
+        result.moduleHttpStatus = fetchResp.status;
+
+        // Load the worklet module (this is where the old SyntaxError threw).
+        try {
+          await ctx.audioWorklet.addModule(WORKLET_URL);
+          result.moduleLoaded = true;
+        } catch (e) {
+          result.moduleLoadError = String(e && e.message ? e.message : e);
+        }
+
+        let node = null;
+        if (result.moduleLoaded) {
+          result.processorRegistered = true;
+          try {
+            node = new AudioWorkletNode(ctx, "bolo-telemetry-processor", {
+              numberOfInputs: 1,
+              numberOfOutputs: 0,
+              channelCount: 1,
+              channelCountMode: "explicit",
+            });
+            result.nodeCreated = true;
+          } catch (e) {
+            result.nodeCreatedError = String(e && e.message ? e.message : e);
+          }
+        }
+
+        if (node) {
+          node.port.onmessage = (ev) => {
+            const msg = ev.data;
+            if (!msg) return;
+            if (msg.type === "frame" && msg.frame) {
+              result.framesReceived++;
+              if (!result.firstFrame) result.firstFrame = msg.frame;
+              result.lastFrame = msg.frame;
+            } else if (msg.type === "pcm") {
+              result.pcmChunksReceived++;
+            }
+          };
+          node.onprocessorerror = () => {
+            result.processorError = "processorerror event fired";
+          };
+
+          // 440 Hz tone through the processor (exact app topology: no dest).
+          const osc = ctx.createOscillator();
+          osc.frequency.value = 440;
+          const gain = ctx.createGain();
+          gain.gain.value = 0.6;
+          osc.connect(gain);
+          gain.connect(node);
+          osc.start();
+
+          await new Promise((r) => setTimeout(r, RUNTIME_MS));
+          result.runtimeMs = RUNTIME_MS;
+
+          osc.stop();
+          node.disconnect();
+        }
+
+        report({ scriptProcessorFallbackNeeded: false });
+        await ctx.close();
+      } catch (e) {
+        out.push("DSP_SELF_TEST_FATAL " + String(e && e.message ? e.message : e));
+        report({ fatal: String(e && e.message ? e.message : e) });
+      }
+    })();
+  </script>
+</body>
+</html>

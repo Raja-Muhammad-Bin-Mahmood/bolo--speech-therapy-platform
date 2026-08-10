@@ -72,7 +72,10 @@ for (let i = 0; i < FFT_SIZE; i++) {
 }
 
 // ─── FFT (radix-2, in-place) ──────────────────────────────────────────────
-function fft(re: Float32Array, im: Float32Array): void {
+// NOTE: worklet files are parsed by the browser as plain ES modules — no
+// TypeScript annotations are allowed here (a previous `re: Float32Array`
+// signature caused a SyntaxError and silently disabled the whole DSP lane).
+function fft(re, im) {
   const n = re.length;
   // Bit-reversal permutation
   for (let i = 1, j = 0; i < n; i++) {
