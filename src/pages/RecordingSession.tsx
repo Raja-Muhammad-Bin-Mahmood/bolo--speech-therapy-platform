@@ -132,6 +132,7 @@ export default function RecordingSession() {
   // Deepgram already normalized a phonetic stutter away ("ssssslap"→"slap").
   const dg = useDeepgramWS({
     getAnalyser: audio.getAnalyser,
+    getSampleRate: audio.getSampleRate,
     acousticEvents: allAcoustic,
   });
 

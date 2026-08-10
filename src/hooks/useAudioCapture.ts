@@ -2,6 +2,10 @@ import { useRef, useCallback, useEffect, useState } from "react";
 import type { StutterCandidate, TimelineFrame } from "../lib/stutterTypes";
 import { TimelineEngine } from "../lib/timelineEngine";
 import * as sessionClock from "../lib/sessionClock";
+import {
+  resolveMicProfile,
+  getMicConstraints,
+} from "../lib/micConstraints";
 
 interface AudioCaptureState {
   level: number; // 0–1 normalized RMS
@@ -43,6 +47,8 @@ export function useAudioCapture() {
 
   const streamRef = useRef<MediaStream | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
+  /** ACTUAL AudioContext sample rate (verified — may differ from requested). */
+  const sampleRateRef = useRef<number | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
 
@@ -86,11 +92,48 @@ export function useAudioCapture() {
       // this single timeline.
       sessionClock.start();
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // ── Microphone constraint profile (TEST A / TEST B comparison) ──
+      // Browser defaults (noiseSuppression=true, autoGainControl=true)
+      // attenuate sustained fricatives ("ssssslap") BEFORE they reach the
+      // ASR or the DSP lane. Default = analysis profile (echo cancellation
+      // stays ON for TTS/coach rejection; noise suppression + AGC OFF).
+      // Select the comparison profile with ?mic=default in the URL.
+      const micProfile = resolveMicProfile();
+      const micConstraints = getMicConstraints(micProfile);
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: micConstraints,
+      });
       streamRef.current = stream;
 
+      // ── AUDIO FORMAT VERIFICATION (spec §1) ─────────────────────────
+      // Log what the browser ACTUALLY applied (not what we asked for) so a
+      // sample-rate/processing mismatch is visible at runtime.
+      const track = stream.getAudioTracks()[0];
+      const actual = track?.getSettings?.() ?? {};
+      console.info(
+        `[DG·AUDIO] mic profile=${micProfile} | requested=${JSON.stringify(micConstraints)} | ` +
+          `actual track=${JSON.stringify({
+            sampleRate: actual.sampleRate,
+            channelCount: actual.channelCount,
+            echoCancellation: actual.echoCancellation,
+            noiseSuppression: actual.noiseSuppression,
+            autoGainControl: actual.autoGainControl,
+          })}`
+      );
+
+      // AudioContext at 16 kHz — but CONFIRM the real rate. If the browser
+      // cannot produce 16 kHz (some devices only do 48 kHz) the context
+      // silently uses its default; the PCM sent to Deepgram MUST match the
+      // declared sample_rate, so the actual rate is captured and exposed
+      // (useDeepgramWS declares it in the query string).
       const ctx = new AudioContext({ sampleRate: 16000 });
       ctxRef.current = ctx;
+      sampleRateRef.current = ctx.sampleRate;
+      console.info(
+        `[DG·AUDIO] AudioContext requested=16000 actual=${ctx.sampleRate} ` +
+          `(contextState=${ctx.state})`
+      );
 
       // Resume (context created outside user gesture after async gap)
       try {
@@ -298,6 +341,11 @@ export function useAudioCapture() {
 
   const getAnalyser = useCallback(() => analyserRef.current, []);
 
+  /** ACTUAL AudioContext sample rate (the rate of the PCM sent to ASR). */
+  const getSampleRate = useCallback((): number | null => {
+    return sampleRateRef.current;
+  }, []);
+
   const getStutterCandidates = useCallback((): StutterCandidate[] => {
     return candidatesRef.current.map((c) => ({ ...c }));
   }, []);
@@ -331,6 +379,7 @@ export function useAudioCapture() {
 
     streamRef.current = null;
     ctxRef.current = null;
+    sampleRateRef.current = null;
     sourceRef.current = null;
     analyserRef.current = null;
     workletNodeRef.current = null;
@@ -369,6 +418,7 @@ export function useAudioCapture() {
     getStreamTime,
     getAsrT0,
     getAnalyser,
+    getSampleRate,
     getStutterCandidates,
     getTimelineEngine,
     getTimelineEvents,

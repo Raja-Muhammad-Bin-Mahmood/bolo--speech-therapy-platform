@@ -99,6 +99,13 @@ export interface UseDeepgramWSOptions {
   /** Shared analyser (RMS) — the BOLO isSpeaking gate for block detection. */
   getAnalyser?: () => AnalyserNode | null;
   /**
+   * ACTUAL AudioContext sample rate — the rate of the PCM sent to Deepgram.
+   * Used to declare `sample_rate` in the connection query so the declared
+   * format always matches the transmitted bytes (spec §1). Falls back to
+   * 16000 when not provided.
+   */
+  getSampleRate?: () => number | null;
+  /**
    * BOLO acoustic/DSP-lane events (shared pool). When Deepgram already
    * normalized a phonetic stutter away ("ssssslap" → "slap"), the detector
    * corroborates the disfluency from the acoustic evidence overlapping the
@@ -111,20 +118,28 @@ export interface UseDeepgramWSOptions {
 
 const DG_WS_URL = "wss://api.deepgram.com/v1/listen";
 
-const DG_QUERY = [
-  "model=nova-2",
-  "language=en-US",
-  "smart_format=true",
-  "filler_words=true",
-  "interim_results=true",
-  "punctuate=true",
-  "vad_events=true",
-  "no_delay=true",
-  "utterance_end_ms=1200",
-  "encoding=linear16",
-  "sample_rate=16000",
-  "channels=1",
-].join("&");
+/**
+ * Sanitized config actually used for the connection (spec §4). `token` is
+ * appended SEPARATELY (never in this list — it must not be logged).
+ * `sample_rate` is derived from the real AudioContext at connect time (spec
+ * §1: the declared rate MUST describe the actual PCM).
+ */
+function buildDgQuery(sampleRate: number): string {
+  return [
+    "model=nova-2",
+    "language=en-US",
+    "smart_format=true",
+    "filler_words=true",
+    "interim_results=true",
+    "punctuate=true",
+    "vad_events=true",
+    "no_delay=true",
+    "utterance_end_ms=1200",
+    "encoding=linear16",
+    `sample_rate=${sampleRate}`,
+    "channels=1",
+  ].join("&");
+}
 
 /** Float32 PCM (-1..1) → PCM16 little-endian bytes for Deepgram. */
 function toPcm16(buffer: Float32Array): ArrayBuffer {
@@ -236,6 +251,8 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
     interimText: "",
   });
   const wsRef = useRef<WebSocket | null>(null);
+  /** Actual PCM sample rate declared in the live connection (spec §1). */
+  const actualSampleRateRef = useRef<number>(16000);
   const readyRef = useRef(false);
   const finalsRef = useRef<DeepgramFinalWord[]>([]);
   const seenFinalRef = useRef<Set<string>>(new Set());
@@ -358,14 +375,43 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
       const { token } = await res.json();
       if (!token) throw new Error("No Deepgram temp key in response");
 
-      const ws = new WebSocket(
-        `${DG_WS_URL}?${DG_QUERY}&token=${encodeURIComponent(token)}`
-      );
+      // ── REAL sample rate (spec §1) — the declared rate MUST match the
+      // actual PCM. Derived from the live AudioContext; fallback 16000.
+      const actualSampleRate =
+        options?.getSampleRate?.() ?? 16000;
+      actualSampleRateRef.current = actualSampleRate;
+      const dgQuery = buildDgQuery(actualSampleRate);
+
+      // ── AUTHENTICATION (verified, spec §3) ──────────────────────────
+      // Browser WebSockets CANNOT set an Authorization header, and Deepgram
+      // does NOT accept a `?token=` query parameter (returns HTTP 401 —
+      // verified against the live API). The documented browser-safe
+      // mechanism is the Sec-WebSocket-Protocol header with the temp key as
+      // the subprotocol ("token", <key>) — the ONLY header browsers are
+      // allowed to set during the handshake. The temp key NEVER appears in
+      // the URL, logs, or UI.
+      const ws = new WebSocket(`${DG_WS_URL}?${dgQuery}`, [
+        "token",
+        token,
+      ]);
       wsRef.current = ws;
+
+      // ── RUNTIME CONFIG TRACE (spec §4) — sanitized, token NEVER logged.
+      console.info(
+        `[DG·CFG] model=nova-2 language=en-US smart_format=true filler_words=true ` +
+          `interim_results=true punctuate=true vad_events=true no_delay=true ` +
+          `utterance_end_ms=1200 encoding=linear16 sample_rate=${actualSampleRate} ` +
+          `channels=1 | auth=Sec-WebSocket-Protocol subprotocol "token" ` +
+          `(temp key redacted, len=${String(token).length})`
+      );
 
       ws.onopen = () => {
         readyRef.current = true; // audio may flow immediately (no handshake)
         setState((prev) => ({ ...prev, status: "connected", error: null }));
+        console.info(
+          `[DG·WS] connection OPENED | url=wss://api.deepgram.com/v1/listen?${dgQuery} | ` +
+            `auth=Sec-WebSocket-Protocol`
+        );
         lastActivityRef.current = Date.now();
         if (watchdogRef.current) clearInterval(watchdogRef.current);
         watchdogRef.current = setInterval(() => {
@@ -393,7 +439,18 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
           if (!msg || typeof msg !== "object") return;
           lastActivityRef.current = Date.now();
 
-          if (msg.type === "Metadata") return;
+          if (msg.type === "Metadata") {
+            // Spec §5: capture model metadata from the CONNECTED connection
+            // (never assume from source). Sanitized — no key material.
+            console.info(
+              `[DG·META] request_id=${msg.request_id ?? "?"} ` +
+                `model=${msg.model_info?.name ?? "?"} ` +
+                `sample_rate=${msg.sample_rate ?? "?"} ` +
+                `channels=${msg.channels ?? "?"} ` +
+                `duration=${msg.duration ?? "?"}`
+            );
+            return;
+          }
           if (msg.type === "SpeechStarted" || msg.type === "SpeechEnded" || msg.type === "UtteranceEnd") {
             return;
           }
@@ -585,7 +642,14 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
         }));
       };
 
-      ws.onclose = () => {
+      ws.onclose = (ev: CloseEvent) => {
+        // Spec §3: log the close reason — distinguishes clean session end
+        // (1000) from a rejected handshake (1006 = no close frame, typically
+        // an HTTP-level auth/param rejection) and server-side closes.
+        console.info(
+          `[DG·WS] CLOSED code=${ev.code} reason="${ev.reason || ""}" ` +
+            `clean=${ev.wasClean}`
+        );
         if (watchdogRef.current) {
           clearInterval(watchdogRef.current);
           watchdogRef.current = null;
@@ -621,6 +685,19 @@ export function useDeepgramWS(options?: UseDeepgramWSOptions) {
     if (streamStartMsRef.current == null) {
       const now = sessionClockNow();
       streamStartMsRef.current = now != null ? now * 1000 : 0;
+      // ── TRANSPORT FORMAT TRACE (spec §1 + §8) — ONE line per session:
+      // what is actually being transmitted (format, rate, channels, and a
+      // sanity amplitude of the first chunk so a dead/zeroed mic is visible).
+      let peak = 0;
+      for (let i = 0; i < buffer.length; i++) {
+        const a = Math.abs(buffer[i]);
+        if (a > peak) peak = a;
+      }
+      console.info(
+        `[DG·AUDIO] transmitted=PCM16 little-endian (linear16) | ` +
+          `sample_rate=${actualSampleRateRef.current ?? "?"} | channels=1 | ` +
+          `chunkBytes=${buffer.length * 2} | firstChunkPeak=${peak.toFixed(4)}`
+      );
     }
     ws.send(toPcm16(buffer));
   }, []);
