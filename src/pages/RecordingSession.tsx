@@ -41,6 +41,8 @@ import { useSpeechmaticsWS } from "../hooks/useSpeechmaticsWS";
 import type { TranscriptChunk } from "../hooks/useSpeechmaticsWS";
 import { useDeepgramWS } from "../hooks/useDeepgramWS";
 import { useTranscriptReconciler } from "../hooks/useTranscriptReconciler";
+import { useSessionDisfluencies } from "../hooks/useSessionDisfluencies";
+import type { TranscriptToken } from "../lib/transcriptTokens";
 import {
   useAcousticAnalysis,
   type AcousticEventType,
@@ -57,6 +59,10 @@ import { useAuth } from "../context/AuthContext";
 import { toFeedEvents } from "../lib/feedEvents";
 import { mergeAcousticEvents } from "../lib/mergeAcousticEvents";
 import { diagBanner } from "../lib/diagnosticLog";
+import {
+  persistSessionDisfluencies,
+  type SessionDisfluencySnapshot,
+} from "../lib/sessionDisfluencies";
 
 type Phase = "topic" | "recording" | "processing";
 
@@ -247,6 +253,21 @@ export default function RecordingSession() {
     return merged;
   }, [recoveryDuplicateKeys, reconciler.hiddenSpeechmaticsKeys]);
 
+  // ── FINAL LIVE TRANSCRIPT SNAPSHOT (single source of truth) ──────────
+  // Mirrors the reconciled token array into a ref while recording so
+  // `finishSession` can capture the EXACT array that powered the live
+  // transcript the moment the session ends — BEFORE the reconciler clears
+  // it (it resets the moment `active` flips false). The after-session
+  // screen is a RENDERING of this saved array, never a new transcript.
+  const finalTokensRef = useRef<TranscriptToken[]>([]);
+  const finalHiddenKeysRef = useRef<string[]>([]);
+  useEffect(() => {
+    if (isRecording) {
+      finalTokensRef.current = reconciler.tokens;
+      finalHiddenKeysRef.current = Array.from(mergedDuplicateKeys);
+    }
+  }, [isRecording, reconciler.tokens, mergedDuplicateKeys]);
+
   // Existing detector events in the Detection Feed vocabulary — the same
   // list the Detection Feed renders, mapped onto finalized transcript words.
   const feedEvents = useMemo(
@@ -265,6 +286,18 @@ export default function RecordingSession() {
   // minSingleSourceScore / 2-run-0.80 gating, no confidence-band/zHR/A
   // suppression). Every detector-tagged word renders with its tag.
   const rawWordTags = useMemo(() => analysis.wordTags, [analysis.wordTags]);
+
+  // ── Structured session disfluency data (AFTER-SESSION DATA contract) ──
+  // Grows DURING the live session from the SAME reconciled token array that
+  // powers the live transcript (single source of truth). Every disfluency
+  // the live view showed is saved here with its complete word + firstLetter
+  // (stutter-like) or the ENTIRE filler word (fillers are NEVER reduced to
+  // a first letter). `snapshot()` captures the final collection at session
+  // end — BEFORE the reconciler clears — so nothing is lost.
+  const disfluencyCollector = useSessionDisfluencies(
+    reconciler.tokens,
+    rawWordTags
+  );
 
   // ── Fused event feed (stutter/stammer from A + B, deduped) ─────────
   const tickerItems = useMemo<TickerItem[]>(() => {
@@ -449,6 +482,18 @@ export default function RecordingSession() {
     // ── Final recovery snapshot: carry annotations to the review screen ──
     const recoverySnapshot = recovery.annotations;
 
+    // ── FINAL LIVE TRANSCRIPT + DISFLUENCY SNAPSHOT (single source of truth) ──
+    // The after-session transcript is a RENDERING of this SAVED token array —
+    // the EXACT array that powered the live transcript (same words, ordering,
+    // disfluency tags, firstLetter metadata, timestamps, sentence grouping).
+    // Captured BEFORE the reconciler clears so nothing is lost.
+    const finalTokens = finalTokensRef.current;
+    const finalHiddenKeys = finalHiddenKeysRef.current;
+    // Structured session disfluency data: every disfluency the live view
+    // showed — complete word + firstLetter (stutter-like) or the ENTIRE
+    // filler word (fillers are NEVER reduced to a first letter).
+    const finalDisfluencies = disfluencyCollector.snapshot();
+
     const stutters = finalScore.stutters;
     const stammers = finalScore.stammers;
     const disfluentWords = taggedWords.filter((w) => w.tag).length;
@@ -469,10 +514,28 @@ export default function RecordingSession() {
       mergedEvents: allAcoustic.map((e) => `${e.type}${e.corroborated ? "*" : ""}@${e.startTime.toFixed(2)}`),
       pauseEvents: pauseEvents.map((p) => `${p.type} ${p.durationMs}ms@${p.startTime.toFixed(2)}`),
       recoveryAnnotations: recoverySnapshot.map((r) => `${r.type}:"${r.recoveredText}"@${r.startTime.toFixed(2)}`),
+      savedTranscriptTokens: finalTokens.length,
+      savedDisfluencies: finalDisfluencies.map(
+        (d) => `${d.type}:"${d.word}"(firstLetter=${d.firstLetter ?? "—"})@${d.timeMs}ms`
+      ),
       stutters,
       stammers,
       score: finalScore.score,
     });
+
+    // ── AFTER-SESSION DATA: persist the structured disfluency collection ──
+    // Survives the live session end (localStorage) so later features (the
+    // exercise system) can consume it — nothing is lost.
+    try {
+      persistSessionDisfluencies({
+        sessionId: `session-${Date.now().toString(36)}`,
+        topic: selectedTopic,
+        recordedAt: new Date().toISOString(),
+        items: finalDisfluencies,
+      } satisfies SessionDisfluencySnapshot);
+    } catch {
+      // non-critical — history persistence is best-effort
+    }
 
     try {
       saveSessionData(finalScore.score);
@@ -516,10 +579,19 @@ export default function RecordingSession() {
           sensorEvents,
           // ── Recovery annotations (Stage 3) for the annotated review ──
           recoveredAnnotations: recoverySnapshot,
+          // ── AFTER-SESSION TRANSCRIPT (single source of truth) ──
+          // The SAVED live transcript token array — the after-session screen
+          // renders THIS, never a newly generated transcript.
+          transcriptTokens: finalTokens,
+          transcriptHiddenKeys: finalHiddenKeys,
+          // ── AFTER-SESSION DISFLUENCY DATA ──
+          // Structured session disfluencies (complete word + firstLetter /
+          // full filler word + type + timestamp + source + sentence).
+          sessionDisfluencies: finalDisfluencies,
         },
       });
     }, 900);
-  }, [ws, acoustic, sensor, pace, selectedTopic, navigate, saveSessionData, recovery.annotations, mergedFinalChunks]);
+  }, [ws, acoustic, sensor, pace, selectedTopic, navigate, saveSessionData, recovery.annotations, mergedFinalChunks, disfluencyCollector]);
 
   const handleStopRecording = useCallback(() => {
     audio.stop();

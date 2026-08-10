@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import Navbar from "../components/Navbar";
 import EvidenceReviewPanel from "../components/EvidenceReviewPanel";
+import SessionTranscript from "../components/SessionTranscript";
 import type { SensorSession } from "../lib/sensorTypes";
 import FeedChip from "../components/FeedChip";
 import StutterSpan from "../components/StutterSpan";
@@ -271,6 +272,42 @@ export default function Analysis() {
   // ── Stage 3: recovery annotations (carried on the session) ──────────
   const recoveredAnnotations: RecoveredAnnotation[] = useMemo(
     () => (Array.isArray(data?.recoveredAnnotations) ? data.recoveredAnnotations : []),
+    [data]
+  );
+
+  // ── AFTER-SESSION TRANSCRIPT (single source of truth) ────────────────
+  // The SAVED live transcript token array — the EXACT array that powered
+  // the live transcript. The after-session screen renders THIS; it is NOT a
+  // newly generated transcript. Same words, ordering, disfluency tags,
+  // firstLetter metadata, timestamps and sentence grouping as the live view.
+  const transcriptTokens = useMemo(
+    () => (Array.isArray(data?.transcriptTokens) ? data.transcriptTokens : []),
+    [data]
+  );
+  const transcriptHiddenKeys = useMemo(
+    () =>
+      Array.isArray(data?.transcriptHiddenKeys)
+        ? new Set<string>(data.transcriptHiddenKeys as string[])
+        : new Set<string>(),
+    [data]
+  );
+  // Word-tags map (SM words the live transcript colored — fillers → yellow).
+  const sessionWordTags = useMemo(() => {
+    const m = new Map<string, string>();
+    const raw: unknown = data?.wordTags;
+    if (Array.isArray(raw)) {
+      for (const entry of raw as [string, string][]) {
+        if (Array.isArray(entry) && entry.length >= 2) {
+          m.set(String(entry[0]), String(entry[1]));
+        }
+      }
+    }
+    return m;
+  }, [data]);
+
+  // ── AFTER-SESSION DISFLUENCY DATA (structured, never lost) ──────────
+  const sessionDisfluencies = useMemo(
+    () => (Array.isArray(data?.sessionDisfluencies) ? data.sessionDisfluencies : []),
     [data]
   );
 
@@ -930,6 +967,91 @@ export default function Analysis() {
                   );
                 })}
             </div>
+          </motion.div>
+        )}
+
+        {/* ── AFTER-SESSION TRANSCRIPT (single source of truth) ──────── */}
+        {transcriptTokens.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.31 }}
+            className="glass rounded-2xl p-5 mb-8 border border-neon-purple/10"
+          >
+            <div className="flex items-center gap-2 mb-3">
+              <MessageSquare className="w-4 h-4 text-neon-purple" />
+              <h3 className="font-heading text-sm font-semibold text-white">
+                Your Transcript
+              </h3>
+              <span className="ml-auto text-[10px] text-soft-gray/50">
+                {transcriptTokens.length} tokens · same as live
+              </span>
+            </div>
+
+            {/* Legend */}
+            <div className="flex flex-wrap gap-1.5 mb-3">
+              <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full text-amber-300/90 bg-amber-300/10">
+                <span className="w-2 h-2 rounded-sm bg-amber-300/70" />
+                filler (yellow)
+              </span>
+              <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full text-[#BD8CFF]/90 bg-[#BD8CFF]/10">
+                <span className="w-2 h-2 rounded-sm bg-[#BD8CFF]/70" />
+                stutter / block / prolongation
+              </span>
+              <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full text-soft-gray/60 bg-white/5">
+                badges = pauses · feed chips = detected events
+              </span>
+            </div>
+
+            {/* The SAVED live transcript — replayed, never re-generated */}
+            <div className="bg-white/5 rounded-xl p-4 max-h-64 overflow-y-auto leading-relaxed text-sm">
+              <SessionTranscript
+                tokens={transcriptTokens}
+                wordTags={sessionWordTags}
+                pauseEvents={pauseEvents}
+                events={feedEvents}
+                recovered={recoveredAnnotations}
+                hiddenKeys={transcriptHiddenKeys}
+              />
+            </div>
+
+            {/* Structured disfluency data — saved, never lost */}
+            {sessionDisfluencies.length > 0 && (
+              <div className="mt-3 pt-3 border-t border-white/5">
+                <p className="text-[10px] text-soft-gray/40 mb-2">
+                  {sessionDisfluencies.length} disfluencies saved as structured
+                  data (full word · first letter for stutter-like · full filler
+                  word · type · timestamp · sentence).
+                </p>
+                <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
+                  {sessionDisfluencies.map((d: any, i: number) => (
+                    <span
+                      key={d.tokenId ?? i}
+                      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-mono"
+                      style={{
+                        color: d.type === "filler" ? "#FCD34D" : "#BD8CFF",
+                        backgroundColor:
+                          d.type === "filler"
+                            ? "rgba(252,211,77,0.08)"
+                            : "rgba(189,140,255,0.08)",
+                        border: `1px solid ${
+                          d.type === "filler"
+                            ? "rgba(252,211,77,0.25)"
+                            : "rgba(189,140,255,0.25)"
+                        }`,
+                      }}
+                      title={`${d.type} · ${d.source} · ${d.timeMs}ms · sentence ${d.utterance}: ${d.sentence}`}
+                    >
+                      <span className="opacity-70">{d.type}</span>
+                      <span className="font-semibold">"{d.word}"</span>
+                      {d.firstLetter != null && (
+                        <span className="opacity-50">/{d.firstLetter}/</span>
+                      )}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
           </motion.div>
         )}
 
