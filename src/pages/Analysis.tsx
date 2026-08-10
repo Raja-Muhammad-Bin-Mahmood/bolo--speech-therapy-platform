@@ -13,6 +13,8 @@ import {
   Radio,
   Activity,
   BookOpen,
+  Type,
+  Sparkles,
 } from "lucide-react";
 import Navbar from "../components/Navbar";
 import EvidenceReviewPanel from "../components/EvidenceReviewPanel";
@@ -39,6 +41,7 @@ import { mergeAcousticEvents } from "../lib/mergeAcousticEvents";
 import { useAuth } from "../context/AuthContext";
 import {
   loadSessionEvents,
+  getOnsetLetterHistory,
   type OfficialDisfluencyEvent,
   type SessionMarker,
   type UserAccount,
@@ -381,6 +384,30 @@ export default function Analysis() {
     },
     []
   );
+
+  // ── COMMON ONSETS (account-level onset-letter data) ───────────────────
+  // The SAME saved records that drive the manual-annotation review — loaded
+  // for the personalized-exercise entry point. Nothing is re-detected.
+  const [onsetHistory, setOnsetHistory] = useState<
+    { letter: string; count: number }[]
+  >([]);
+  useEffect(() => {
+    if (!account) return;
+    let alive = true;
+    getOnsetLetterHistory(account)
+      .then((rows) => {
+        if (alive) setOnsetHistory(rows);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [account]);
+
+  // Originating mode — free (default, Free Speech doesn't set a mode field),
+  // "script" or "closer". Carried to the training system so completions are
+  // attributed to the session that produced them.
+  const sessionMode: string = data?.mode ?? "free";
 
   // Merge official events (auto + manual) onto the transcript tokens so a
   // manual annotation immediately renders with the EXISTING disfluency
@@ -1072,6 +1099,76 @@ export default function Analysis() {
             </div>
           </motion.div>
         )}
+
+        {/* ── COMMON ONSETS → PERSONALIZED EXERCISES ──────────────────
+               Built from the user's EXISTING saved onset-letter data (the
+               same records as the manual-annotation review). The button
+               opens the universal training system — available after Free
+               Speech, Script Mode AND Closer Mode. */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.3 }}
+          className="glass rounded-2xl p-5 mb-8 border border-neon-purple/10"
+        >
+          <div className="flex items-center gap-2 mb-3">
+            <Type className="w-4 h-4 text-neon-purple" />
+            <h3 className="font-heading text-sm font-semibold text-white">
+              Common Onsets
+            </h3>
+            <span className="ml-auto text-[10px] text-soft-gray/50">
+              from your saved sessions
+            </span>
+          </div>
+
+          {onsetHistory.length > 0 ? (
+            <div className="flex flex-wrap gap-2 mb-5">
+              {onsetHistory.slice(0, 6).map((o) => (
+                <span
+                  key={o.letter}
+                  className="inline-flex items-center gap-2 rounded-xl px-3 py-2 bg-white/5 border border-neon-purple/20"
+                >
+                  <span className="font-heading text-lg font-bold text-neon-purple">
+                    {o.letter.toUpperCase()}
+                  </span>
+                  <span className="text-[10px] text-soft-gray/60">
+                    {o.count} occurrence{o.count === 1 ? "" : "s"}
+                  </span>
+                </span>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-soft-gray/60 mb-5">
+              BOLO builds your onset profile as you complete speech sessions —
+              your most frequent starting sounds will appear here.
+            </p>
+          )}
+
+          <button
+            onClick={() =>
+              navigate("/training", {
+                state: {
+                  mode: sessionMode,
+                  sessionId,
+                  wpm,
+                  paceZone,
+                  paceConsistency: paceReport?.pacingConsistency ?? null,
+                  pauses: pauseStats,
+                  onsets: onsetHistory,
+                  fillers: fillerWords,
+                },
+              })
+            }
+            className="w-full inline-flex items-center justify-center gap-2 font-heading font-semibold text-white bg-gradient-to-r from-electric-violet to-neon-purple hover:brightness-110 px-6 py-4 rounded-2xl transition-all duration-200 active:scale-[0.97] neon-glow cursor-pointer"
+          >
+            GET PERSONALIZED EXERCISES
+            <Sparkles className="w-4 h-4" />
+          </button>
+          <p className="text-center text-[10px] text-soft-gray/50 mt-2.5">
+            BOLO matches your recorded onsets, fillers and pace to a curated
+            exercise library — no AI-generated drills, just targeted practice.
+          </p>
+        </motion.div>
 
         {/* ── SCRIPT MODE review — the intact script with its purple
                disfluency annotations (same classification as the live

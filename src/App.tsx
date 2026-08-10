@@ -7,6 +7,7 @@ import RecordingSession from "./pages/RecordingSession";
 import SessionScript from "./pages/SessionScript";
 import CloserMode from "./pages/CloserMode";
 import Analysis from "./pages/Analysis";
+import Training from "./pages/Training";
 import PageTransition from "./components/PageTransition";
 import DevTuningPanel from "./components/DevTuningPanel";
 
@@ -23,6 +24,7 @@ export default function App() {
               <Route path="/session/script" element={<SessionScript />} />
               <Route path="/closer" element={<CloserMode />} />
               <Route path="/analysis" element={<Analysis />} />
+              <Route path="/training" element={<Training />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </PageTransition>
